@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <ctime>
+#include <cstring>
+#include <string>
+#include <vector>
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
 extern "C" {
@@ -15,22 +18,86 @@ extern "C" {
 
 static volatile bool exiting = false;
 
+struct writer_state {
+	FILE *file = nullptr;
+	std::vector<char> buffer;
+	unsigned long long consumed_events = 0;
+	unsigned long long consumed_bytes = 0;
+	unsigned long long written_bytes = 0;
+	unsigned long long last_consumed_events = 0;
+	unsigned long long last_consumed_bytes = 0;
+	unsigned long long last_written_bytes = 0;
+	std::chrono::steady_clock::time_point last_stats;
+};
+
 static void handle_signal(int)
 {
 	exiting = true;
 }
 
-// ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
-static int handle_event(void *, void *data, size_t)
+static int flush_events(writer_state *state)
 {
-	const auto *e = static_cast<const event *>(data);
-	char ts[32];
-	time_t now = time(nullptr);
-	struct tm *tm = localtime(&now);
+	if (state->buffer.empty())
+		return 0;
 
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-	printf("%s record_request: comm=%s pid=%d tid=%d query_sql_len=%lld query_sql=%s\n",
-	       ts, e->comm, e->pid, e->tid, e->query_sql_len, e->query_sql);
+	size_t written = fwrite(state->buffer.data(), 1, state->buffer.size(), state->file);
+	if (written != state->buffer.size()) {
+		fprintf(stderr, "Failed to write event data: %s\n", strerror(errno));
+		return -1;
+	}
+	state->written_bytes += written;
+	state->buffer.clear();
+	return 0;
+}
+
+static int write_file_header(FILE *file)
+{
+	audit_file_header header = {};
+	memcpy(header.magic, AUDIT_FILE_MAGIC, sizeof(AUDIT_FILE_MAGIC));
+	header.version = AUDIT_FILE_VERSION;
+	header.header_size = sizeof(header);
+	header.event_size = sizeof(event);
+
+	if (fwrite(&header, sizeof(header), 1, file) != 1) {
+		fprintf(stderr, "Failed to write file header: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+static void print_stats(writer_state *state)
+{
+	auto now = std::chrono::steady_clock::now();
+	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - state->last_stats);
+	if (elapsed.count() < 1)
+		return;
+
+	unsigned long long events = state->consumed_events - state->last_consumed_events;
+	unsigned long long consumed = state->consumed_bytes - state->last_consumed_bytes;
+	unsigned long long written = state->written_bytes - state->last_written_bytes;
+	printf("stats: consume_events=%llu/s consume_bytes=%llu/s write_bytes=%llu/s\n",
+	       events / elapsed.count(), consumed / elapsed.count(), written / elapsed.count());
+
+	state->last_consumed_events = state->consumed_events;
+	state->last_consumed_bytes = state->consumed_bytes;
+	state->last_written_bytes = state->written_bytes;
+	state->last_stats = now;
+}
+
+// ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
+static int handle_event(void *ctx, void *data, size_t size)
+{
+	auto *state = static_cast<writer_state *>(ctx);
+	if (size != sizeof(event))
+		return 0;
+
+	const char *raw = static_cast<const char *>(data);
+	state->buffer.insert(state->buffer.end(), raw, raw + size);
+	state->consumed_events++;
+	state->consumed_bytes += size;
+
+	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
+		return -1;
 	return 0;
 }
 
@@ -49,26 +116,41 @@ static unsigned long long parse_offset(const char *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc != 3) {
-		fprintf(stderr, "Usage: %s <target-path> <offset>\n", argv[0]);
+	if (argc < 3 || argc > 4) {
+		fprintf(stderr, "Usage: %s <target-path> <offset> [output-file]\n", argv[0]);
 		return 1;
 	}
 
 	const char *target = argv[1];
 	unsigned long long offset = parse_offset(argv[2]);
+	const char *output_file = argc == 4 ? argv[3] : "audit_events.dat";
 	uprobe_bpf *skel = nullptr;
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
+	writer_state state;
 	int err = 0;
 
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
+	state.file = fopen(output_file, "wb");
+	if (!state.file) {
+		fprintf(stderr, "Failed to open output file %s: %s\n", output_file, strerror(errno));
+		return 1;
+	}
+	state.buffer.reserve(AUDIT_FLUSH_THRESHOLD + sizeof(event));
+	state.last_stats = std::chrono::steady_clock::now();
+	if (write_file_header(state.file) < 0) {
+		err = 1;
+		goto cleanup;
+	}
+
 	// 打开、加载并通过 verifier 校验 BPF 程序。
 	skel = uprobe_bpf__open_and_load();
 	if (!skel) {
 		fprintf(stderr, "Failed to open and load BPF skeleton\n");
-		return 1;
+		err = 1;
+		goto cleanup;
 	}
 	// pid = -1 表示对所有进程生效；target + offset 指定被 hook 的用户态函数入口。
 	link = bpf_program__attach_uprobe(skel->progs.handle_uprobe, false, -1, target, offset);
@@ -80,14 +162,14 @@ int main(int argc, char **argv)
 
 	// 绑定 BPF ringbuf map，用户态通过 poll 读取内核提交的事件。
 	// 注册handle_event事件回调函数
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, nullptr, nullptr);
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &state, nullptr);
 	if (!rb) {
 		err = -1;
 		fprintf(stderr, "Failed to create ring buffer\n");
 		goto cleanup;
 	}
 
-	printf("uprobe attach success: %s+0x%llx\n", target, offset);
+	printf("uprobe attach success: %s+0x%llx output=%s\n", target, offset, output_file);
 
 	while (!exiting) {
 		// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
@@ -100,12 +182,16 @@ int main(int argc, char **argv)
 			fprintf(stderr, "Error polling ring buffer: %d\n", err);
 			break;
 		}
+		print_stats(&state);
 	}
 
 cleanup:
+	flush_events(&state);
+	if (state.file)
+		fclose(state.file);
 	// 销毁 bpf_link 会自动 detach uprobe；destroy skeleton 会释放 BPF 程序和 map。
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);
-	return err < 0 ? -err : 0;
+	return err < 0 ? -err : err;
 }

@@ -53,6 +53,9 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
 .PHONY: all
 all: $(BINDIR)/$(APP)
 
+.PHONY: tools
+tools: $(BINDIR)/read_events
+
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
@@ -96,6 +99,10 @@ $(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(LIBBPF_OBJ) | $(OUTPUT) $(BINDIR)
 event-size: $(BINDIR)/event_size
 
 $(BINDIR)/event_size: $(TEST_DIR)/event_size.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
+
+$(BINDIR)/read_events: $(TOOLS_DIR)/read_events.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 

@@ -11,6 +11,19 @@
 #define MAX_SQL_LEN 1024
 #define MAX_PARAMS_VALUE_LEN 1024
 
+#define AUDIT_FILE_MAGIC "OBAUDT1"
+#define AUDIT_FILE_MAGIC_SIZE 8
+#define AUDIT_FILE_VERSION 1
+#define AUDIT_FLUSH_THRESHOLD (64 * 1024)
+
+struct audit_file_header {
+	char magic[AUDIT_FILE_MAGIC_SIZE];
+	unsigned int version;
+	unsigned int header_size;
+	unsigned int event_size;
+	unsigned int reserved;
+};
+
 enum ObPhyPlanType
 {
   OB_PHY_PLAN_UNINITIALIZED = 0,
@@ -43,6 +56,10 @@ struct ob_trace_id_raw {
 };
 
 struct event {
+	unsigned long long event_seq; // 全局递增序号，用于发现丢记录和后续分片关联
+	unsigned long long parent_event_seq; // 后续分片事件关联的主事件序号，当前主事件为0
+	unsigned long long next_fragment_seq; // 后续分片事件序号，当前暂未生成分片事件
+
 	int pid;
 	int tid;
 	char comm[TASK_COMM_LEN];
