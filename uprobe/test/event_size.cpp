@@ -34,6 +34,8 @@ int main()
 	PRINT_FIELD(event, stmt_type);
 	PRINT_FIELD(event, plan_type);
 	PRINT_FIELD(event, trans_status);
+	PRINT_FIELD(event, fragment_flags);
+	PRINT_FIELD(event, next_fragment_field);
 	PRINT_FIELD(event, user_name);
 	PRINT_FIELD(event, proxy_user_name);
 	PRINT_FIELD(event, tenant_name);

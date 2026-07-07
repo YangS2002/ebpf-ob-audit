@@ -8,8 +8,8 @@
 #define MAX_DB_NAME_LEN 128
 #define MAX_SQL_ID_LEN 33 // 32 + 1 
 #define MAX_TRACE_ID_LEN 128
-#define MAX_SQL_LEN 512
-#define MAX_PARAMS_VALUE_LEN 512
+#define MAX_SQL_LEN 1024
+#define MAX_PARAMS_VALUE_LEN 1024
 
 enum ObPhyPlanType
 {
@@ -27,6 +27,17 @@ enum ObTransStatus
   IMPLICIT_TRANS = 2,
   COMMIT_TRANS = 3,
 };
+enum fragment_field {
+	FRAG_FIELD_NONE = 0,
+	FRAG_FIELD_QUERY_SQL = 1,
+	FRAG_FIELD_PARAMS_VALUE = 2,
+};
+
+enum fragment_flags {
+	FRAG_QUERY_SQL_TRUNCATED = 1 << 0,
+	FRAG_PARAMS_VALUE_TRUNCATED = 1 << 1,
+};
+
 struct ob_trace_id_raw {
     unsigned long long uval[4];
 };
@@ -69,6 +80,9 @@ struct event {
 	int stmt_type; // enum:int_t 32 需要用户态解析，
 	enum ObPhyPlanType plan_type; // 
 	enum ObTransStatus trans_status;//
+	
+	unsigned int fragment_flags;
+	unsigned int next_fragment_field;
 
 	char user_name[MAX_NAME_LEN];//
 	char proxy_user_name[MAX_NAME_LEN];//  虚拟表字段名：PROXY_USER

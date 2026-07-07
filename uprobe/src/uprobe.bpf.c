@@ -43,6 +43,12 @@ int handle_uprobe(struct pt_regs *ctx)
 	e->pid = id >> 32;
 	e->tid = (u32)id;
 	e->query_sql_len = sql_len;
+	e->fragment_flags = 0;
+	e->next_fragment_field = FRAG_FIELD_NONE;
+	if (sql_len >= MAX_SQL_LEN) {
+		e->fragment_flags |= FRAG_QUERY_SQL_TRUNCATED;
+		e->next_fragment_field = FRAG_FIELD_QUERY_SQL;
+	}
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 	bpf_probe_read_user_str(e->query_sql, sizeof(e->query_sql), sql);
 
