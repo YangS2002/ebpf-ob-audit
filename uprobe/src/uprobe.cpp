@@ -29,8 +29,8 @@ static int handle_event(void *, void *data, size_t)
 	struct tm *tm = localtime(&now);
 
 	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-	printf("%s record_request: comm=%s pid=%d tid=%d sql_len=%lld sql=%s\n",
-	       ts, e->comm, e->pid, e->tid, e->sql_len, e->sql);
+	printf("%s record_request: comm=%s pid=%d tid=%d query_sql_len=%lld query_sql=%s\n",
+	       ts, e->comm, e->pid, e->tid, e->query_sql_len, e->query_sql);
 	return 0;
 }
 

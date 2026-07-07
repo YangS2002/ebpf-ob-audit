@@ -42,9 +42,9 @@ int handle_uprobe(struct pt_regs *ctx)
 	id = bpf_get_current_pid_tgid();
 	e->pid = id >> 32;
 	e->tid = (u32)id;
-	e->sql_len = sql_len;
+	e->query_sql_len = sql_len;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
-	bpf_probe_read_user_str(e->sql, sizeof(e->sql), sql);
+	bpf_probe_read_user_str(e->query_sql, sizeof(e->query_sql), sql);
 
 	// 提交缓冲区
 	bpf_ringbuf_submit(e, 0);

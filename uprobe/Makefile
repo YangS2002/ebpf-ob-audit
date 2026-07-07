@@ -1,27 +1,30 @@
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 OUTPUT := .output
+SRC_DIR := src
+TEST_DIR := test
+TOOLS_DIR := tools
+BINDIR := bin
+APP := uprobe
+
 CLANG ?= clang
 LLVM_STRIP ?= llvm-strip
+CXX ?= g++
+
 LIBBPF_SRC := $(abspath ../libbpf/src)
 BPFTOOL_SRC := $(abspath ../bpftool/src)
 LIBBPF_OBJ := $(abspath $(OUTPUT)/libbpf.a)
 BPFTOOL_OUTPUT ?= $(abspath $(OUTPUT)/bpftool)
 BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
-				 | sed 's/aarch64/arm64/' \
-				 | sed 's/ppc64le/powerpc/' \
-				 | sed 's/mips.*/mips/' \
-				 | sed 's/arm.*/arm/' \
-				 | sed 's/riscv64/riscv/')
+					 | sed 's/aarch64/arm64/' \
+					 | sed 's/ppc64le/powerpc/' \
+					 | sed 's/mips.*/mips/' \
+					 | sed 's/arm.*/arm/' \
+					 | sed 's/riscv64/riscv/')
 VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
-INCLUDES := -I$(OUTPUT) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
-CXX ?= g++
-CFLAGS := -g -Wall
+INCLUDES := -I$(OUTPUT) -I$(SRC_DIR) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CXXFLAGS := -g -Wall -std=c++17
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
-
-BINDIR := bin
-APP = uprobe
 
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
@@ -70,7 +73,7 @@ $(BPFTOOL): | $(BPFTOOL_OUTPUT)
 	$(call msg,BPFTOOL,$@)
 	$(Q)$(MAKE) ARCH= CROSS_COMPILE= OUTPUT=$(BPFTOOL_OUTPUT)/ -C $(BPFTOOL_SRC) bootstrap
 
-$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT)
+$(OUTPUT)/%.bpf.o: $(SRC_DIR)/%.bpf.c $(LIBBPF_OBJ) $(wildcard $(SRC_DIR)/*.h) $(VMLINUX) | $(OUTPUT)
 	$(call msg,BPF,$@)
 	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
 	$(Q)$(LLVM_STRIP) -g $@
@@ -81,13 +84,20 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
 
 $(OUTPUT)/$(APP).o: $(OUTPUT)/$(APP).skel.h
 
-$(OUTPUT)/%.o: %.cpp $(wildcard %.h) | $(OUTPUT)
+$(OUTPUT)/%.o: $(SRC_DIR)/%.cpp $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(INCLUDES) -c $(filter %.cpp,$^) -o $@
 
 $(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(LIBBPF_OBJ) | $(OUTPUT) $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) -lelf -lz -o $@
+
+.PHONY: event-size
+event-size: $(BINDIR)/event_size
+
+$(BINDIR)/event_size: $(TEST_DIR)/event_size.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 
 .DELETE_ON_ERROR:
 .SECONDARY:
