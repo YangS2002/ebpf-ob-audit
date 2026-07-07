@@ -1,2 +1,8 @@
 .direnv
+.bash_history
 /build
+openspec
+uprobe/.output
+uprobe/bin
+help
+log
