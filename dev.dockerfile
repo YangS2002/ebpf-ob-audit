@@ -8,6 +8,7 @@ RUN apt-get update -y && \
       libelf1 libelf-dev zlib1g-dev \
       make git clang llvm pkg-config build-essential && \
     apt-get install -y --no-install-recommends ca-certificates	&& \
+    apt-get install -y libgtest-dev pkg-config cmake && \
 	  update-ca-certificates	&& \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

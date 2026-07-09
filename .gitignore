@@ -7,3 +7,8 @@ uprobe/bin
 help
 log
 *.csv
+audit_events.dat
+*.csv
+uprobe/*.old
+uprobe/test/audit_e2e.conf
+uprobe/test/*.adt
