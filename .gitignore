@@ -6,3 +6,4 @@ uprobe/.output
 uprobe/bin
 help
 log
+*.csv
