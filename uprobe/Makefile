@@ -24,6 +24,8 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 INCLUDES := -I$(OUTPUT) -I$(SRC_DIR) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CXXFLAGS := -g -Wall -std=c++17
+GTEST_CXXFLAGS ?= $(shell pkg-config --cflags gtest 2>/dev/null)
+GTEST_LDLIBS ?= $(shell pkg-config --libs gtest_main gtest 2>/dev/null || printf -- '-lgtest_main -lgtest -pthread')
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
@@ -54,7 +56,7 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
 all: $(BINDIR)/$(APP)
 
 .PHONY: tools
-tools: $(BINDIR)/read_events
+tools: $(BINDIR)/read_events $(BINDIR)/adt_to_csv $(BINDIR)/check_audit_sql
 
 .PHONY: clean
 clean:
@@ -98,11 +100,26 @@ $(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(LIBBPF_OBJ) | $(OUTPUT) $(BINDIR)
 .PHONY: event-size
 event-size: $(BINDIR)/event_size
 
+.PHONY: gtest-audit-e2e
+gtest-audit-e2e: $(BINDIR)/audit_e2e_test
+
 $(BINDIR)/event_size: $(TEST_DIR)/event_size.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 
+$(BINDIR)/audit_e2e_test: $(TEST_DIR)/audit_e2e_main.cpp $(TEST_DIR)/audit_e2e_common.cpp $(TEST_DIR)/audit_e2e_test.cpp $(TEST_DIR)/audit_e2e_common.h $(SRC_DIR)/uprobe.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) -I$(SRC_DIR) -I$(TEST_DIR) $(TEST_DIR)/audit_e2e_main.cpp $(TEST_DIR)/audit_e2e_common.cpp $(TEST_DIR)/audit_e2e_test.cpp $(GTEST_LDLIBS) -o $@
+
 $(BINDIR)/read_events: $(TOOLS_DIR)/read_events.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
+
+$(BINDIR)/adt_to_csv: $(TOOLS_DIR)/adt_to_csv.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
+
+$(BINDIR)/check_audit_sql: $(TOOLS_DIR)/check_audit_sql.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 

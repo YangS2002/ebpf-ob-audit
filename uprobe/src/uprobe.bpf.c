@@ -46,6 +46,7 @@ struct {
 	__uint(max_entries, 256 * 1024); // 
 } rb SEC(".maps");
 
+// 序列号，bpf无法定义全局变量，只能通过map来实现全局变量
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -108,6 +109,7 @@ int handle_uprobe(struct pt_regs *ctx)
 	u64 *seq_value;
 	u64 id;
 
+	// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
 	audit_record = (const void *)PT_REGS_PARM2(ctx);
 	if (!audit_record)
 		return 0;
@@ -129,12 +131,13 @@ int handle_uprobe(struct pt_regs *ctx)
 	id = bpf_get_current_pid_tgid();
 	zero = bpf_map_lookup_elem(&zero_event, &key);
 	if (zero)
-		bpf_probe_read_kernel(e, sizeof(*e), zero);
+		bpf_probe_read_kernel(e, sizeof(*e), zero); // 将e的内存空间置0，内核态不能调用memset
 	e->pid = id >> 32;
 	e->tid = (u32)id;
 	seq_value = bpf_map_lookup_elem(&seq, &key);
 	if (seq_value)
 		e->event_seq = __sync_fetch_and_add(seq_value, 1) + 1;
+	// sql 分帧，暂时没做完
 	e->query_sql_len = sql_len;
 	e->fragment_flags = 0;
 	e->next_fragment_field = FRAG_FIELD_NONE;

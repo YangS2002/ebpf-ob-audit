@@ -6,3 +6,8 @@ uprobe/.output
 uprobe/bin
 help
 log
+audit_events.dat
+*.csv
+uprobe/*.old
+uprobe/test/audit_e2e.conf
+uprobe/test/*.adt
