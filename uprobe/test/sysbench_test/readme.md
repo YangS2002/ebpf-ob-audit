@@ -48,6 +48,7 @@ sysbench uprobe/test/sysbench_print_sql.lua \
 # 在sysbench_audit_workload.sql中写测试用例
 
 # 运行ebpf程序
+./uprobe/bin/uprobe /home/yangshuo17/observer/bin/observer  0x000000000bf18950
 # 批量执行sql
-mysql -h 7.27.43.145 -P2881 -uroot@ebpf_tenant -p'' --skip-ssl -Dtest < uprobe/test/sysbench_test/sysbench_audit_workload.sql
-./uprobe/bin/check_audit_sql audit_manu.dat uprobe/test/sysbench_test/sysbench_audit_workload.sql
+mysql -h 7.27.43.145 -P2881 -uroot@ebpf_tenant -p'' --skip-ssl -Dtest < uprobe/test/sysbench_test/sysbench_generated.sql
+./uprobe/bin/check_audit_sql audit_manu.dat uprobe/test/sysbench_test/sysbench_generated.sql

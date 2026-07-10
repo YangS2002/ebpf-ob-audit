@@ -4,41 +4,6 @@
 #include <bpf/bpf_tracing.h>
 #include "uprobe.h"
 
-#define OB_AUDIT_STATUS_OFF 4
-#define OB_AUDIT_TRACE_ID_OFF 8
-#define OB_AUDIT_REQUEST_ID_OFF 40
-#define OB_AUDIT_SESSION_ID_OFF 56
-#define OB_AUDIT_PROXY_SESSION_ID_OFF 64
-#define OB_AUDIT_TENANT_ID_OFF 176
-#define OB_AUDIT_EFFECTIVE_TENANT_ID_OFF 184
-#define OB_AUDIT_TENANT_NAME_PTR_OFF 192
-#define OB_AUDIT_TENANT_NAME_LEN_OFF 200
-#define OB_AUDIT_USER_ID_OFF 208
-#define OB_AUDIT_USER_NAME_PTR_OFF 216
-#define OB_AUDIT_USER_NAME_LEN_OFF 224
-#define OB_AUDIT_PROXY_USER_NAME_PTR_OFF 240
-#define OB_AUDIT_PROXY_USER_NAME_LEN_OFF 248
-#define OB_AUDIT_DB_ID_OFF 264
-#define OB_AUDIT_DB_NAME_PTR_OFF 272
-#define OB_AUDIT_DB_NAME_LEN_OFF 280
-#define OB_AUDIT_SQL_ID_OFF 288
-#define OB_AUDIT_SQL_PTR_OFF 328
-#define OB_AUDIT_SQL_LEN_OFF 336
-#define OB_AUDIT_AFFECTED_ROWS_OFF 360
-#define OB_AUDIT_RETURN_ROWS_OFF 368
-#define OB_AUDIT_PLAN_TYPE_OFF 408
-#define OB_AUDIT_EXEC_TIMESTAMP_OFF 432
-#define OB_AUDIT_TRANS_ID_OFF 1320
-#define OB_AUDIT_PARAMS_VALUE_LEN_OFF 1352
-#define OB_AUDIT_PARAMS_VALUE_PTR_OFF 1360
-#define OB_AUDIT_STMT_TYPE_OFF 1684
-#define OB_AUDIT_TRANS_STATUS_OFF 1720
-
-#define OB_EXEC_RECEIVE_TS_OFF 0
-#define OB_EXEC_PROCESS_TS_OFF 8
-#define OB_EXEC_EXECUTOR_END_TS_OFF 88
-#define OB_EXEC_MULTI_STMT_START_TS_OFF 128
-
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 struct {
@@ -114,19 +79,25 @@ int handle_uprobe(struct pt_regs *ctx)
 	if (!audit_record)
 		return 0;
 
-	// 读取审计记录中的SQL语句和长度
-	if (bpf_probe_read_user(&sql, sizeof(sql), (const char *)audit_record + OB_AUDIT_SQL_PTR_OFF))
-		return 0;
-	if (bpf_probe_read_user(&sql_len, sizeof(sql_len), (const char *)audit_record + OB_AUDIT_SQL_LEN_OFF))
-		return 0;
-	if (!sql || sql_len <= 0)
-		return 0;
-
 	// 缓冲区预留，!e表示缓冲区满，当前审计记录会丢失
 	// 检查是否还有一个entry的空间，一个entry就是一个event结构体的大小
 	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (!e)
 		return 0;
+
+	// 读取审计记录中的SQL语句和长度
+	if (bpf_probe_read_user(&sql, sizeof(sql), (const char *)audit_record + OB_AUDIT_SQL_PTR_OFF)) {
+		bpf_ringbuf_discard(e, 0);
+		return 0;
+	}
+	if (bpf_probe_read_user(&sql_len, sizeof(sql_len), (const char *)audit_record + OB_AUDIT_SQL_LEN_OFF)) {
+		bpf_ringbuf_discard(e, 0);
+		return 0;
+	}
+	if (!sql || sql_len <= 0) {
+		bpf_ringbuf_discard(e, 0);
+		return 0;
+	}
 
 	id = bpf_get_current_pid_tgid();
 	zero = bpf_map_lookup_elem(&zero_event, &key);
@@ -145,7 +116,6 @@ int handle_uprobe(struct pt_regs *ctx)
 		e->fragment_flags |= FRAG_QUERY_SQL_TRUNCATED;
 		e->next_fragment_field = FRAG_FIELD_QUERY_SQL;
 	}
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
 	if (bpf_probe_read_user_str(e->query_sql, sizeof(e->query_sql), sql) < 0) {
 		bpf_ringbuf_discard(e, 0);
 		return 0;

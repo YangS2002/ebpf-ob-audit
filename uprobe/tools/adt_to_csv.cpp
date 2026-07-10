@@ -139,15 +139,13 @@ static void write_csv_string(FILE *out, const char *s)
 
 static void write_csv_header(FILE *out)
 {
-	fprintf(out, "event_seq,parent_event_seq,next_fragment_seq,pid,tid,comm,user_id,tenant_id,effective_tenant_id,session_id,proxy_session_id,db_id,affected_rows,return_rows,transaction_hash,request_id,ret_code,request_timestamp,elapsed_time,execute_time,query_sql_len,params_value_len,stmt_type,plan_type,trans_status,fragment_flags,next_fragment_field,user_name,proxy_user_name,tenant_name,user_client_ip,client_ip,db_name,sql_id,trace_id_0,trace_id_1,trace_id_2,trace_id_3,query_sql,params_value\n");
+	fprintf(out, "event_seq,parent_event_seq,next_fragment_seq,pid,tid,user_id,tenant_id,effective_tenant_id,session_id,proxy_session_id,db_id,affected_rows,return_rows,transaction_hash,request_id,ret_code,request_timestamp,elapsed_time,execute_time,query_sql_len,params_value_len,stmt_type,plan_type,trans_status,fragment_flags,next_fragment_field,user_name,proxy_user_name,tenant_name,user_client_ip,client_ip,db_name,sql_id,trace_id_0,trace_id_1,trace_id_2,trace_id_3,query_sql,params_value\n");
 }
 
 static void write_event_csv(FILE *out, const event &e)
 {
-	fprintf(out, "%llu,%llu,%llu,%d,%d,",
-		e.event_seq, e.parent_event_seq, e.next_fragment_seq, e.pid, e.tid);
-	write_csv_string(out, e.comm);
-	fprintf(out, ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%lld,%lld,%lld,%lld,%lld,%d,%d,%d,%u,%u,",
+	fprintf(out, "%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%lld,%lld,%lld,%lld,%lld,%d,%d,%d,%u,%u,",
+		e.event_seq, e.parent_event_seq, e.next_fragment_seq, e.pid, e.tid,
 		e.user_id, e.tenant_id, e.effective_tenant_id, e.session_id, e.proxy_session_id,
 		e.db_id, e.affected_rows, e.return_rows, e.transaction_hash, e.request_id,
 		e.ret_code, e.request_timestamp, e.elapsed_time, e.execute_time,

@@ -23,7 +23,7 @@ struct captured_sql {
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s <event.adt> <expected.sql>\n", prog);
+	fprintf(stderr, "Usage: %s <event.adt> <expected.sql> [--print-matched]\n", prog);
 }
 
 static std::string normalize_sql(const std::string &value)
@@ -128,6 +128,11 @@ static std::string canonical_sql(const std::string &value)
 	out = remove_all(out, ";");
 	out = remove_all(out, " ");
 	return out;
+}
+
+static bool is_exact_match(const std::string &expected, const std::string &captured)
+{
+	return !expected.empty() && expected == captured;
 }
 
 static std::string load_file_text(const char *path)
@@ -245,6 +250,10 @@ static bool read_header(FILE *file)
 		fprintf(stderr, "Unsupported file version: %u\n", header.version);
 		return false;
 	}
+	if (header.header_size != sizeof(header)) {
+		fprintf(stderr, "Invalid header size: %u expected=%zu\n", header.header_size, sizeof(header));
+		return false;
+	}
 	if (header.event_size != sizeof(event)) {
 		fprintf(stderr, "Invalid event size: %u expected=%zu\n", header.event_size, sizeof(event));
 		return false;
@@ -252,11 +261,27 @@ static bool read_header(FILE *file)
 	return true;
 }
 
+static void append_captured_event(std::vector<captured_sql> *captured, const event &e)
+{
+	std::string sql(e.query_sql);
+	std::string canonical = canonical_sql(sql);
+	if (!canonical.empty())
+		captured->push_back({e.event_seq, normalize_sql(sql), canonical});
+}
+
 int main(int argc, char **argv)
 {
-	if (argc != 3) {
+	if (argc != 3 && argc != 4) {
 		usage(argv[0]);
 		return 1;
+	}
+	bool print_matched = false;
+	if (argc == 4) {
+		if (strcmp(argv[3], "--print-matched") != 0) {
+			usage(argv[0]);
+			return 1;
+		}
+		print_matched = true;
 	}
 
 	std::vector<expected_sql> expected = load_expected_sqls(argv[2]);
@@ -280,10 +305,7 @@ int main(int argc, char **argv)
 	event e = {};
 	while (fread(&e, sizeof(e), 1, file) == 1) {
 		total_events++;
-		std::string sql(e.query_sql);
-		std::string canonical = canonical_sql(sql);
-		if (!canonical.empty())
-			captured.push_back({e.event_seq, normalize_sql(sql), canonical});
+		append_captured_event(&captured, e);
 	}
 	fclose(file);
 
@@ -292,8 +314,7 @@ int main(int argc, char **argv)
 	for (const auto &sql : expected) {
 		bool found = false;
 		for (const auto &captured_sql : captured) {
-			if (captured_sql.canonical.find(sql.canonical) != std::string::npos ||
-			    sql.canonical.find(captured_sql.canonical) != std::string::npos) {
+			if (is_exact_match(sql.canonical, captured_sql.canonical)) {
 				found = true;
 				matched.push_back({sql, captured_sql});
 				break;
@@ -306,7 +327,7 @@ int main(int argc, char **argv)
 	fprintf(stderr, "events=%llu expected_sql=%zu captured_sql=%zu matched=%zu missing=%zu\n",
 		total_events, expected.size(), captured.size(), matched.size(), missing.size());
 
-	if (!matched.empty()) {
+	if (print_matched && !matched.empty()) {
 		fprintf(stderr, "Matched SQL statements:\n");
 		for (const auto &item : matched) {
 			fprintf(stderr, "[%llu] event_seq=%llu expected=%s\n", item.first.index,

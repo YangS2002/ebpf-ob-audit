@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <cerrno>
-#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <vector>
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
@@ -24,10 +22,6 @@ struct writer_state {
 	unsigned long long consumed_events = 0;
 	unsigned long long consumed_bytes = 0;
 	unsigned long long written_bytes = 0;
-	unsigned long long last_consumed_events = 0;
-	unsigned long long last_consumed_bytes = 0;
-	unsigned long long last_written_bytes = 0;
-	std::chrono::steady_clock::time_point last_stats;
 };
 
 static void handle_signal(int)
@@ -63,25 +57,6 @@ static int write_file_header(FILE *file)
 		return -1;
 	}
 	return 0;
-}
-
-static void print_stats(writer_state *state)
-{
-	auto now = std::chrono::steady_clock::now();
-	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - state->last_stats);
-	if (elapsed.count() < 1)
-		return;
-
-	unsigned long long events = state->consumed_events - state->last_consumed_events;
-	unsigned long long consumed = state->consumed_bytes - state->last_consumed_bytes;
-	unsigned long long written = state->written_bytes - state->last_written_bytes;
-	printf("stats: consume_events=%llu/s consume_bytes=%llu/s write_bytes=%llu/s\n",
-	       events / elapsed.count(), consumed / elapsed.count(), written / elapsed.count());
-
-	state->last_consumed_events = state->consumed_events;
-	state->last_consumed_bytes = state->consumed_bytes;
-	state->last_written_bytes = state->written_bytes;
-	state->last_stats = now;
 }
 
 // ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
@@ -139,7 +114,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	state.buffer.reserve(AUDIT_FLUSH_THRESHOLD + sizeof(event));
-	state.last_stats = std::chrono::steady_clock::now();
 	if (write_file_header(state.file) < 0) {
 		err = 1;
 		goto cleanup;
@@ -182,14 +156,12 @@ int main(int argc, char **argv)
 			fprintf(stderr, "Error polling ring buffer: %d\n", err);
 			break;
 		}
-		print_stats(&state);
 	}
 
 cleanup:
 	flush_events(&state);
 	if (state.file)
 		fclose(state.file);
-	// 销毁 bpf_link 会自动 detach uprobe；destroy skeleton 会释放 BPF 程序和 map。
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);

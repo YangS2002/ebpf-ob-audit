@@ -32,9 +32,9 @@ static bool read_header(FILE *file, audit_file_header *header)
 
 static void print_event(const event &e)
 {
-	printf("seq=%llu parent=%llu next=%llu pid=%d tid=%d comm=%s tenant_id=%llu user_id=%llu session_id=%llu request_id=%llu ret_code=%d stmt_type=%d plan_type=%d trans_status=%d request_ts=%lld elapsed=%lld affected_rows=%llu return_rows=%llu db_id=%llu db=%s user=%s tenant=%s sql_id=%s sql_len=%lld params_len=%lld flags=0x%x next_field=%u trace_id=%llx:%llx:%llx:%llx sql=%s params=%s\n",
+	printf("seq=%llu parent=%llu next=%llu pid=%d tid=%d tenant_id=%llu user_id=%llu session_id=%llu request_id=%llu ret_code=%d stmt_type=%d plan_type=%d trans_status=%d request_ts=%lld elapsed=%lld affected_rows=%llu return_rows=%llu db_id=%llu db=%s user=%s tenant=%s sql_id=%s sql_len=%lld params_len=%lld flags=0x%x next_field=%u trace_id=%llx:%llx:%llx:%llx sql=%s params=%s\n",
 	       e.event_seq, e.parent_event_seq, e.next_fragment_seq,
-	       e.pid, e.tid, e.comm,
+	       e.pid, e.tid,
 	       e.tenant_id, e.user_id, e.session_id, e.request_id,
 	       e.ret_code, e.stmt_type, e.plan_type, e.trans_status,
 	       e.request_timestamp, e.elapsed_time,
