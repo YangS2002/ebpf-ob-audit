@@ -26,8 +26,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "uprobe.h"
+#include "audit_format.h"
 
 enum class Mode {
 	ALL,
@@ -121,17 +123,90 @@ static bool parse_options(int argc, char **argv, Options *opts)
 	return false;
 }
 
-static void write_csv_string(FILE *out, const char *s)
+static std::string bounded_string(const char *data, size_t max_len)
+{
+	size_t len = 0;
+	while (len < max_len && data[len] != '\0')
+		len++;
+	return std::string(data, len);
+}
+
+static int append_dec_u8(char *dst, int pos, unsigned char v)
+{
+	if (v >= 100) {
+		dst[pos++] = '0' + v / 100;
+		dst[pos++] = '0' + (v / 10) % 10;
+		dst[pos++] = '0' + v % 10;
+	} else if (v >= 10) {
+		dst[pos++] = '0' + v / 10;
+		dst[pos++] = '0' + v % 10;
+	} else {
+		dst[pos++] = '0' + v;
+	}
+	return pos;
+}
+
+static std::string format_ob_addr(const char *data, size_t max_len)
+{
+	if (max_len < OB_ADDR_SIZE)
+		return "";
+	int version = 0;
+	unsigned int ip = 0;
+	memcpy(&version, data + OB_ADDR_VERSION_OFF, sizeof(version));
+	if (version != 4)
+		return "";
+	memcpy(&ip, data + OB_ADDR_IP_OFF, sizeof(ip));
+	if (ip == 0)
+		return "";
+	char buf[16] = {};
+	int pos = 0;
+	pos = append_dec_u8(buf, pos, (ip >> 24) & 0xff);
+	buf[pos++] = '.';
+	pos = append_dec_u8(buf, pos, (ip >> 16) & 0xff);
+	buf[pos++] = '.';
+	pos = append_dec_u8(buf, pos, (ip >> 8) & 0xff);
+	buf[pos++] = '.';
+	pos = append_dec_u8(buf, pos, ip & 0xff);
+	buf[pos] = '\0';
+	return std::string(buf);
+}
+
+static std::string format_trace_id(const ob_trace_id_raw &trace_id)
+{
+	char buf[128] = {};
+	unsigned long long u0 = trace_id.uval[0];
+	unsigned int bytes_no_ip = (unsigned int)(u0 >> 32);
+	bool is_ipv6 = ((bytes_no_ip >> 17) & 0x1) != 0;
+	if (!is_ipv6) {
+		snprintf(buf, sizeof(buf), "Y%llX-%016llX-%llX-%llX",
+			trace_id.uval[0], trace_id.uval[1], trace_id.uval[2], trace_id.uval[3]);
+	} else {
+		snprintf(buf, sizeof(buf), "Y%X-%016llX-%llX-%llX",
+			bytes_no_ip, trace_id.uval[1], trace_id.uval[2], trace_id.uval[3]);
+	}
+	return std::string(buf);
+}
+
+static size_t clamp_field_len(long long len, size_t max_len)
+{
+	if (len <= 0)
+		return 0;
+	if ((unsigned long long)len > max_len)
+		return max_len;
+	return (size_t)len;
+}
+
+static void write_csv_string(FILE *out, const std::string &s)
 {
 	fputc('"', out);
-	for (const char *p = s; *p; p++) {
-		if (*p == '"') {
+	for (char c : s) {
+		if (c == '"') {
 			fputc('"', out);
 			fputc('"', out);
-		} else if (*p == '\n' || *p == '\r' || *p == '\t') {
+		} else if (c == '\n' || c == '\r' || c == '\t') {
 			fputc(' ', out);
 		} else {
-			fputc(*p, out);
+			fputc(c, out);
 		}
 	}
 	fputc('"', out);
@@ -139,36 +214,42 @@ static void write_csv_string(FILE *out, const char *s)
 
 static void write_csv_header(FILE *out)
 {
-	fprintf(out, "event_seq,parent_event_seq,next_fragment_seq,pid,tid,user_id,tenant_id,effective_tenant_id,session_id,proxy_session_id,db_id,affected_rows,return_rows,transaction_hash,request_id,ret_code,request_timestamp,elapsed_time,execute_time,query_sql_len,params_value_len,stmt_type,plan_type,trans_status,fragment_flags,next_fragment_field,user_name,proxy_user_name,tenant_name,user_client_ip,client_ip,db_name,sql_id,trace_id_0,trace_id_1,trace_id_2,trace_id_3,query_sql,params_value\n");
+	fprintf(out, "event_seq,parent_event_seq,next_fragment_seq,pid,tid,user_id,tenant_id,effective_tenant_id,session_id,proxy_session_id,db_id,affected_rows,return_rows,transaction_hash,request_id,ret_code,request_timestamp,elapsed_time,execute_time,query_sql_len,params_value_len,stmt_type,stmt_type_name,plan_type,plan_type_name,trans_status,trans_status_name,fragment_flags,next_fragment_field,user_name,proxy_user_name,tenant_name,user_client_ip,client_ip,db_name,sql_id,trace_id,query_sql,params_value\n");
 }
 
 static void write_event_csv(FILE *out, const event &e)
 {
-	fprintf(out, "%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%lld,%lld,%lld,%lld,%lld,%d,%d,%d,%u,%u,",
+	fprintf(out, "%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%lld,%lld,%lld,%lld,%lld,%d,",
 		e.event_seq, e.parent_event_seq, e.next_fragment_seq, e.pid, e.tid,
 		e.user_id, e.tenant_id, e.effective_tenant_id, e.session_id, e.proxy_session_id,
 		e.db_id, e.affected_rows, e.return_rows, e.transaction_hash, e.request_id,
 		e.ret_code, e.request_timestamp, e.elapsed_time, e.execute_time,
-		e.query_sql_len, e.params_value_len, e.stmt_type, e.plan_type, e.trans_status,
-		e.fragment_flags, e.next_fragment_field);
-	write_csv_string(out, e.user_name);
+		e.query_sql_len, e.params_value_len, e.stmt_type);
+	write_csv_string(out, stmt_type_to_string(e.stmt_type));
+	fprintf(out, ",%d,", e.plan_type);
+	write_csv_string(out, plan_type_to_string(e.plan_type));
+	fprintf(out, ",%d,", e.trans_status);
+	write_csv_string(out, trans_status_to_string(e.trans_status));
+	fprintf(out, ",%u,%u,", e.fragment_flags, e.next_fragment_field);
+	write_csv_string(out, bounded_string(e.user_name, sizeof(e.user_name)));
 	fputc(',', out);
-	write_csv_string(out, e.proxy_user_name);
+	write_csv_string(out, bounded_string(e.proxy_user_name, sizeof(e.proxy_user_name)));
 	fputc(',', out);
-	write_csv_string(out, e.tenant_name);
+	write_csv_string(out, bounded_string(e.tenant_name, sizeof(e.tenant_name)));
 	fputc(',', out);
-	write_csv_string(out, e.user_client_ip);
+	write_csv_string(out, format_ob_addr(e.user_client_ip, sizeof(e.user_client_ip)));
 	fputc(',', out);
-	write_csv_string(out, e.client_ip);
+	write_csv_string(out, format_ob_addr(e.client_ip, sizeof(e.client_ip)));
 	fputc(',', out);
-	write_csv_string(out, e.db_name);
+	write_csv_string(out, bounded_string(e.db_name, sizeof(e.db_name)));
 	fputc(',', out);
-	write_csv_string(out, e.sql_id);
-	fprintf(out, ",%llu,%llu,%llu,%llu,",
-		e.trace_id.uval[0], e.trace_id.uval[1], e.trace_id.uval[2], e.trace_id.uval[3]);
-	write_csv_string(out, e.query_sql);
+	write_csv_string(out, bounded_string(e.sql_id, sizeof(e.sql_id)));
 	fputc(',', out);
-	write_csv_string(out, e.params_value);
+	write_csv_string(out, format_trace_id(e.trace_id));
+	fputc(',', out);
+	write_csv_string(out, std::string(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql))));
+	fputc(',', out);
+	write_csv_string(out, std::string(e.params_value, clamp_field_len(e.params_value_len, sizeof(e.params_value))));
 	fputc('\n', out);
 }
 

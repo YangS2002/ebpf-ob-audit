@@ -40,3 +40,4 @@ CREATE DATABASE IF NOT EXISTS ebpf_audit_gtest;
 
 /* EBPF_SYSBENCH_FINAL_COUNT */ SELECT COUNT(*) FROM ebpf_audit_gtest.sbtest1;
 /* EBPF_SYSBENCH_FINAL_CHECK */ SELECT id, k, c FROM ebpf_audit_gtest.sbtest1 ORDER BY id;
+

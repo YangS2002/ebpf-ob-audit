@@ -41,11 +41,12 @@ static __always_inline int read_i32(const void *base, unsigned long off, int *ds
 	return bpf_probe_read_user(dst, sizeof(*dst), (const char *)base + off);
 }
 
-static __always_inline void read_user_string_field(const void *base, unsigned long ptr_off, unsigned long len_off,
-						  char *dst, int dst_size)
+static __always_inline void read_user_string_64_field(const void *base, unsigned long ptr_off, unsigned long len_off,
+						     char *dst)
 {
 	const char *ptr = NULL;
 	long long len = 0;
+	int n = 0;
 
 	if (bpf_probe_read_user(&ptr, sizeof(ptr), (const char *)base + ptr_off))
 		return;
@@ -53,7 +54,46 @@ static __always_inline void read_user_string_field(const void *base, unsigned lo
 		return;
 	if (!ptr || len <= 0)
 		return;
-	bpf_probe_read_user_str(dst, dst_size, ptr);
+	if (len > MAX_NAME_LEN - 1)
+		len = MAX_NAME_LEN - 1;
+	// bpf_probe_read_user 的 size 参数必须被 verifier 证明有常量上界。
+	// 不能使用通用 dst_size 参数，否则 verifier 会报 R2 unbounded memory access。
+	// 这里用 64 字节字段专用函数，并用常量 mask 保证 n <= 63。
+	n = (int)len;
+	n &= MAX_NAME_LEN - 1;
+	if (n <= 0)
+		return;
+	bpf_probe_read_user(dst, n, ptr);
+}
+
+static __always_inline void read_user_string_128_field(const void *base, unsigned long ptr_off, unsigned long len_off,
+						      char *dst)
+{
+	const char *ptr = NULL;
+	long long len = 0;
+	int n = 0;
+
+	if (bpf_probe_read_user(&ptr, sizeof(ptr), (const char *)base + ptr_off))
+		return;
+	if (bpf_probe_read_user(&len, sizeof(len), (const char *)base + len_off))
+		return;
+	if (!ptr || len <= 0)
+		return;
+	if (len > MAX_DB_NAME_LEN - 1)
+		len = MAX_DB_NAME_LEN - 1;
+	// 同上：128 字节字段专用函数，让 verifier 能证明 read size <= 127。
+	n = (int)len;
+	n &= MAX_DB_NAME_LEN - 1;
+	if (n <= 0)
+		return;
+	bpf_probe_read_user(dst, n, ptr);
+}
+
+static __always_inline void read_addr_field(const void *base, unsigned long addr_off, char *dst, int dst_size)
+{
+	if (dst_size < OB_ADDR_SIZE)
+		return;
+	bpf_probe_read_user(dst, OB_ADDR_SIZE, (const char *)base + addr_off);
 }
 
 SEC("uprobe")
@@ -67,9 +107,11 @@ int handle_uprobe(struct pt_regs *ctx)
 	long long sql_len = 0;
 	long long params_value_len = 0;
 	long long receive_ts = 0;
-	long long process_ts = 0;
+	long long process_executor_ts = 0;
 	long long executor_end_ts = 0;
 	long long multistmt_start_ts = 0;
+	long long elapsed_t = 0;
+	long long executor_t = 0;
 	u32 key = 0;
 	u64 *seq_value;
 	u64 id;
@@ -152,27 +194,35 @@ int handle_uprobe(struct pt_regs *ctx)
 	bpf_probe_read_user(e->sql_id, sizeof(e->sql_id), (const char *)audit_record + OB_AUDIT_SQL_ID_OFF);
 
 	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_RECEIVE_TS_OFF, &receive_ts);
-	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_PROCESS_TS_OFF, &process_ts);
+	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_PROCESS_EXECUTOR_TS_OFF, &process_executor_ts);
 	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_EXECUTOR_END_TS_OFF, &executor_end_ts);
 	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_MULTI_STMT_START_TS_OFF, &multistmt_start_ts);
+	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_ELAPSED_T_OFF, &elapsed_t);
+	read_i64(audit_record, OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_EXECUTOR_T_OFF, &executor_t);
 	e->request_timestamp = receive_ts;
-	if (executor_end_ts > 0) {
+	e->elapsed_time = elapsed_t;
+	e->execute_time = executor_t;
+	if (e->elapsed_time <= 0 && executor_end_ts > 0) {
 		if (multistmt_start_ts > 0)
 			e->elapsed_time = executor_end_ts - multistmt_start_ts;
 		else if (receive_ts > 0)
 			e->elapsed_time = executor_end_ts - receive_ts;
-		if (process_ts > 0)
-			e->execute_time = executor_end_ts - process_ts;
 	}
+	if (e->execute_time <= 0 && executor_end_ts > 0 && process_executor_ts > 0)
+		e->execute_time = executor_end_ts - process_executor_ts;
 
-	read_user_string_field(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF, OB_AUDIT_TENANT_NAME_LEN_OFF,
-			       e->tenant_name, sizeof(e->tenant_name));
-	read_user_string_field(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF,
-			       e->user_name, sizeof(e->user_name));
-	read_user_string_field(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF, OB_AUDIT_PROXY_USER_NAME_LEN_OFF,
-			       e->proxy_user_name, sizeof(e->proxy_user_name));
-	read_user_string_field(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF,
-			       e->db_name, sizeof(e->db_name));
+	read_user_string_64_field(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF, OB_AUDIT_TENANT_NAME_LEN_OFF,
+				  e->tenant_name);
+	read_user_string_64_field(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF,
+				  e->user_name);
+	read_user_string_64_field(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF, OB_AUDIT_PROXY_USER_NAME_LEN_OFF,
+				  e->proxy_user_name);
+	read_user_string_128_field(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF,
+				   e->db_name);
+	read_addr_field(audit_record, OB_AUDIT_USER_CLIENT_ADDR_OFF,
+			e->user_client_ip, sizeof(e->user_client_ip));
+	read_addr_field(audit_record, OB_AUDIT_CLIENT_ADDR_OFF,
+			e->client_ip, sizeof(e->client_ip));
 
 	// 提交缓冲区
 	bpf_ringbuf_submit(e, 0);
