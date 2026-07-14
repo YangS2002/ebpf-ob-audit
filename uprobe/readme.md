@@ -54,3 +54,6 @@ docker run --rm -it --privileged \
   -v /sys/kernel/debug:/sys/kernel/debug \
   ebpf-ob-audit
 ```
+
+# 2. 导出GV$OB_SQL_AUDIT
+mysql -h7.27.43.145 -P2881 -uroot@sys -A --batch --raw -e "SELECT * from oceanbase.GV\$OB_SQL_AUDIT where db_name ='ebpf_audit_db_a1' or db_name='ebpf_audit_db_a2'" -p >audit.tsv 

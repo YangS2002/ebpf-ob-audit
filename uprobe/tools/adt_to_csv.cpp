@@ -31,6 +31,38 @@
 #include "uprobe.h"
 #include "audit_format.h"
 
+struct CsvField {
+	const char *name;
+	void (*write)(FILE *out, const event &e);
+};
+
+static void write_csv_header(FILE *out);
+static void write_event_csv(FILE *out, const event &e);
+
+#define DEFINE_U64_FIELD_WRITER(writer_name, member) \
+static void writer_name(FILE *out, const event &e) \
+{ \
+	fprintf(out, "%llu", e.member); \
+}
+
+#define DEFINE_I64_FIELD_WRITER(writer_name, member) \
+static void writer_name(FILE *out, const event &e) \
+{ \
+	fprintf(out, "%lld", e.member); \
+}
+
+#define DEFINE_I32_FIELD_WRITER(writer_name, member) \
+static void writer_name(FILE *out, const event &e) \
+{ \
+	fprintf(out, "%d", e.member); \
+}
+
+#define DEFINE_U32_FIELD_WRITER(writer_name, member) \
+static void writer_name(FILE *out, const event &e) \
+{ \
+	fprintf(out, "%u", e.member); \
+}
+
 enum class Mode {
 	ALL,
 	HEAD,
@@ -212,44 +244,157 @@ static void write_csv_string(FILE *out, const std::string &s)
 	fputc('"', out);
 }
 
+DEFINE_U64_FIELD_WRITER(write_event_seq, event_seq)
+DEFINE_U64_FIELD_WRITER(write_parent_event_seq, parent_event_seq)
+DEFINE_U64_FIELD_WRITER(write_next_fragment_seq, next_fragment_seq)
+DEFINE_I32_FIELD_WRITER(write_pid, pid)
+DEFINE_I32_FIELD_WRITER(write_tid, tid)
+DEFINE_U64_FIELD_WRITER(write_user_id, user_id)
+DEFINE_U64_FIELD_WRITER(write_tenant_id, tenant_id)
+DEFINE_U64_FIELD_WRITER(write_effective_tenant_id, effective_tenant_id)
+DEFINE_U64_FIELD_WRITER(write_session_id, session_id)
+DEFINE_U64_FIELD_WRITER(write_proxy_session_id, proxy_session_id)
+DEFINE_U64_FIELD_WRITER(write_db_id, db_id)
+DEFINE_U64_FIELD_WRITER(write_affected_rows, affected_rows)
+DEFINE_U64_FIELD_WRITER(write_return_rows, return_rows)
+DEFINE_U64_FIELD_WRITER(write_transaction_hash, transaction_hash)
+DEFINE_U64_FIELD_WRITER(write_request_id, request_id)
+DEFINE_I32_FIELD_WRITER(write_ret_code, ret_code)
+DEFINE_I64_FIELD_WRITER(write_request_timestamp, request_timestamp)
+DEFINE_I64_FIELD_WRITER(write_elapsed_time, elapsed_time)
+DEFINE_I64_FIELD_WRITER(write_execute_time, execute_time)
+DEFINE_I64_FIELD_WRITER(write_query_sql_len, query_sql_len)
+DEFINE_I64_FIELD_WRITER(write_params_value_len, params_value_len)
+DEFINE_I32_FIELD_WRITER(write_stmt_type, stmt_type)
+DEFINE_I32_FIELD_WRITER(write_plan_type, plan_type)
+DEFINE_I32_FIELD_WRITER(write_trans_status, trans_status)
+DEFINE_U32_FIELD_WRITER(write_fragment_flags, fragment_flags)
+DEFINE_U32_FIELD_WRITER(write_next_fragment_field, next_fragment_field)
+
+static void write_stmt_type_name(FILE *out, const event &e)
+{
+	write_csv_string(out, stmt_type_to_string(e.stmt_type));
+}
+
+static void write_plan_type_name(FILE *out, const event &e)
+{
+	write_csv_string(out, plan_type_to_string(e.plan_type));
+}
+
+static void write_trans_status_name(FILE *out, const event &e)
+{
+	write_csv_string(out, trans_status_to_string(e.trans_status));
+}
+
+static void write_user_name(FILE *out, const event &e)
+{
+	write_csv_string(out, bounded_string(e.user_name, sizeof(e.user_name)));
+}
+
+static void write_proxy_user_name(FILE *out, const event &e)
+{
+	write_csv_string(out, bounded_string(e.proxy_user_name, sizeof(e.proxy_user_name)));
+}
+
+static void write_tenant_name(FILE *out, const event &e)
+{
+	write_csv_string(out, bounded_string(e.tenant_name, sizeof(e.tenant_name)));
+}
+
+static void write_user_client_ip(FILE *out, const event &e)
+{
+	write_csv_string(out, format_ob_addr(e.user_client_ip, sizeof(e.user_client_ip)));
+}
+
+static void write_client_ip(FILE *out, const event &e)
+{
+	write_csv_string(out, format_ob_addr(e.client_ip, sizeof(e.client_ip)));
+}
+
+static void write_db_name(FILE *out, const event &e)
+{
+	write_csv_string(out, bounded_string(e.db_name, sizeof(e.db_name)));
+}
+
+static void write_sql_id(FILE *out, const event &e)
+{
+	write_csv_string(out, bounded_string(e.sql_id, sizeof(e.sql_id)));
+}
+
+static void write_trace_id(FILE *out, const event &e)
+{
+	write_csv_string(out, format_trace_id(e.trace_id));
+}
+
+static void write_query_sql(FILE *out, const event &e)
+{
+	write_csv_string(out, std::string(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql))));
+}
+
+static void write_params_value(FILE *out, const event &e)
+{
+	write_csv_string(out, std::string(e.params_value, clamp_field_len(e.params_value_len, sizeof(e.params_value))));
+}
+
+static const CsvField CSV_FIELDS[] = {
+	{"event_seq", write_event_seq},
+	{"parent_event_seq", write_parent_event_seq},
+	{"next_fragment_seq", write_next_fragment_seq},
+	{"pid", write_pid},
+	{"tid", write_tid},
+	{"user_id", write_user_id},
+	{"tenant_id", write_tenant_id},
+	{"effective_tenant_id", write_effective_tenant_id},
+	{"session_id", write_session_id},
+	{"proxy_session_id", write_proxy_session_id},
+	{"db_id", write_db_id},
+	{"affected_rows", write_affected_rows},
+	{"return_rows", write_return_rows},
+	{"transaction_hash", write_transaction_hash},
+	{"request_id", write_request_id},
+	{"ret_code", write_ret_code},
+	{"request_timestamp", write_request_timestamp},
+	{"elapsed_time", write_elapsed_time},
+	{"execute_time", write_execute_time},
+	{"query_sql_len", write_query_sql_len},
+	{"params_value_len", write_params_value_len},
+	{"stmt_type", write_stmt_type},
+	{"stmt_type_name", write_stmt_type_name},
+	{"plan_type", write_plan_type},
+	{"plan_type_name", write_plan_type_name},
+	{"trans_status", write_trans_status},
+	{"trans_status_name", write_trans_status_name},
+	{"fragment_flags", write_fragment_flags},
+	{"next_fragment_field", write_next_fragment_field},
+	{"user_name", write_user_name},
+	{"proxy_user_name", write_proxy_user_name},
+	{"tenant_name", write_tenant_name},
+	{"user_client_ip", write_user_client_ip},
+	{"client_ip", write_client_ip},
+	{"db_name", write_db_name},
+	{"sql_id", write_sql_id},
+	{"trace_id", write_trace_id},
+	{"query_sql", write_query_sql},
+	{"params_value", write_params_value},
+};
+
 static void write_csv_header(FILE *out)
 {
-	fprintf(out, "event_seq,parent_event_seq,next_fragment_seq,pid,tid,user_id,tenant_id,effective_tenant_id,session_id,proxy_session_id,db_id,affected_rows,return_rows,transaction_hash,request_id,ret_code,request_timestamp,elapsed_time,execute_time,query_sql_len,params_value_len,stmt_type,stmt_type_name,plan_type,plan_type_name,trans_status,trans_status_name,fragment_flags,next_fragment_field,user_name,proxy_user_name,tenant_name,user_client_ip,client_ip,db_name,sql_id,trace_id,query_sql,params_value\n");
+	for (size_t i = 0; i < sizeof(CSV_FIELDS) / sizeof(CSV_FIELDS[0]); i++) {
+		if (i > 0)
+			fputc(',', out);
+		fputs(CSV_FIELDS[i].name, out);
+	}
+	fputc('\n', out);
 }
 
 static void write_event_csv(FILE *out, const event &e)
 {
-	fprintf(out, "%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%lld,%lld,%lld,%lld,%lld,%d,",
-		e.event_seq, e.parent_event_seq, e.next_fragment_seq, e.pid, e.tid,
-		e.user_id, e.tenant_id, e.effective_tenant_id, e.session_id, e.proxy_session_id,
-		e.db_id, e.affected_rows, e.return_rows, e.transaction_hash, e.request_id,
-		e.ret_code, e.request_timestamp, e.elapsed_time, e.execute_time,
-		e.query_sql_len, e.params_value_len, e.stmt_type);
-	write_csv_string(out, stmt_type_to_string(e.stmt_type));
-	fprintf(out, ",%d,", e.plan_type);
-	write_csv_string(out, plan_type_to_string(e.plan_type));
-	fprintf(out, ",%d,", e.trans_status);
-	write_csv_string(out, trans_status_to_string(e.trans_status));
-	fprintf(out, ",%u,%u,", e.fragment_flags, e.next_fragment_field);
-	write_csv_string(out, bounded_string(e.user_name, sizeof(e.user_name)));
-	fputc(',', out);
-	write_csv_string(out, bounded_string(e.proxy_user_name, sizeof(e.proxy_user_name)));
-	fputc(',', out);
-	write_csv_string(out, bounded_string(e.tenant_name, sizeof(e.tenant_name)));
-	fputc(',', out);
-	write_csv_string(out, format_ob_addr(e.user_client_ip, sizeof(e.user_client_ip)));
-	fputc(',', out);
-	write_csv_string(out, format_ob_addr(e.client_ip, sizeof(e.client_ip)));
-	fputc(',', out);
-	write_csv_string(out, bounded_string(e.db_name, sizeof(e.db_name)));
-	fputc(',', out);
-	write_csv_string(out, bounded_string(e.sql_id, sizeof(e.sql_id)));
-	fputc(',', out);
-	write_csv_string(out, format_trace_id(e.trace_id));
-	fputc(',', out);
-	write_csv_string(out, std::string(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql))));
-	fputc(',', out);
-	write_csv_string(out, std::string(e.params_value, clamp_field_len(e.params_value_len, sizeof(e.params_value))));
+	for (size_t i = 0; i < sizeof(CSV_FIELDS) / sizeof(CSV_FIELDS[0]); i++) {
+		if (i > 0)
+			fputc(',', out);
+		CSV_FIELDS[i].write(out, e);
+	}
 	fputc('\n', out);
 }
 
