@@ -41,6 +41,11 @@ static __always_inline int read_i32(const void *base, unsigned long off, int *ds
 	return bpf_probe_read_user(dst, sizeof(*dst), (const char *)base + off);
 }
 
+static __always_inline int read_bool(const void *base, unsigned long off, bool *dst)
+{
+	return bpf_probe_read_user(dst, sizeof(*dst), (const char *)base + off);
+}
+
 static __always_inline void read_user_string_64_field(const void *base, unsigned long ptr_off, unsigned long len_off,
 						     char *dst)
 {
@@ -112,6 +117,7 @@ int handle_uprobe(struct pt_regs *ctx)
 	long long multistmt_start_ts = 0;
 	long long elapsed_t = 0;
 	long long executor_t = 0;
+	bool is_inner_sql = false;
 	u32 key = 0;
 	u64 *seq_value;
 	u64 id;
@@ -119,6 +125,10 @@ int handle_uprobe(struct pt_regs *ctx)
 	// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
 	audit_record = (const void *)PT_REGS_PARM2(ctx);
 	if (!audit_record)
+		return 0;
+
+	read_bool(audit_record, OB_AUDIT_IS_INNER_SQL_OFF, &is_inner_sql);
+	if (is_inner_sql)
 		return 0;
 
 	// 缓冲区预留，!e表示缓冲区满，当前审计记录会丢失
@@ -144,7 +154,9 @@ int handle_uprobe(struct pt_regs *ctx)
 	id = bpf_get_current_pid_tgid();
 	zero = bpf_map_lookup_elem(&zero_event, &key);
 	if (zero)
-		bpf_probe_read_kernel(e, sizeof(*e), zero); // 将e的内存空间置0，内核态不能调用memset
+		// 将e的内存空间置0，内核态不能调用memset
+		// 这里会有一次大量写入。
+		bpf_probe_read_kernel(e, sizeof(*e), zero); 
 	e->pid = id >> 32;
 	e->tid = (u32)id;
 	seq_value = bpf_map_lookup_elem(&seq, &key);

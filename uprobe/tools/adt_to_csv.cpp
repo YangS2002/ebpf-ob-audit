@@ -97,7 +97,7 @@ static bool read_header(FILE *file, audit_file_header *header)
 		return false;
 	}
 	if (header->version != AUDIT_FILE_VERSION) {
-		fprintf(stderr, "Unsupported file version: %u\n", header->version);
+		fprintf(stderr, "Unsupported file version: %u expected=%u\n", header->version, AUDIT_FILE_VERSION);
 		return false;
 	}
 	if (header->header_size != sizeof(*header)) {
