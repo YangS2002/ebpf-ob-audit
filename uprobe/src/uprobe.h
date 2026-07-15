@@ -78,8 +78,9 @@
 
 #define AUDIT_FILE_MAGIC "OBAUDT1"
 #define AUDIT_FILE_MAGIC_SIZE 8
-#define AUDIT_FILE_VERSION 2
+#define AUDIT_FILE_VERSION 3
 #define AUDIT_FLUSH_THRESHOLD (64 * 1024)
+#define AUDIT_EVENT_PAYLOAD_SIZE (MAX_NAME_LEN + MAX_NAME_LEN + MAX_NAME_LEN + MAX_DB_NAME_LEN + MAX_SQL_LEN + MAX_PARAMS_VALUE_LEN)
 
 struct audit_file_header {
 	char magic[AUDIT_FILE_MAGIC_SIZE];
@@ -121,6 +122,14 @@ struct ob_trace_id_raw {
 };
 
 struct event {
+	unsigned int total_size;
+	unsigned int user_name_len;
+	unsigned int proxy_user_name_len;
+	unsigned int tenant_name_len;
+	unsigned int db_name_len;
+	unsigned int query_sql_payload_len;
+	unsigned int params_value_payload_len;
+
 	unsigned long long event_seq; // 全局递增序号，用于发现丢记录和后续分片关联
 	unsigned long long parent_event_seq; // 后续分片事件关联的主事件序号，当前主事件为0
 	unsigned long long next_fragment_seq; // 后续分片事件序号，当前暂未生成分片事件
@@ -141,7 +150,7 @@ struct event {
 
 	int ret_code; //  status_ 成员变量
 	// elapsed_time的成员变量receive_ts_ 。 exec_timestamp_.receive_ts_
-	long long request_timestamp;// 虚拟表字段名：REQUEST_TIME   
+	long long request_timestamp;// 虚拟表字段名：REQUEST_TIME
 	
 	// 通过get_elapsed_time()成员函数调用计算得到
 	// exec_timestamp_.receive_ts_
@@ -165,21 +174,86 @@ struct event {
 	unsigned int fragment_flags;
 	unsigned int next_fragment_field;
 
-	char user_name[MAX_NAME_LEN];//
-	char proxy_user_name[MAX_NAME_LEN];//  虚拟表字段名：PROXY_USER
-	char tenant_name[MAX_NAME_LEN];//
-
 	// user_client_ip/client_ip 字段保存 ObAddr 原始二进制，仅 CSV 转换时格式化。
 	char user_client_ip[MAX_IP_LEN];// 
 	char client_ip[MAX_IP_LEN];//
 
 	// char server_ip[MAX_IP_LEN];// 可以本机获取
-	char db_name[MAX_DB_NAME_LEN];//
 	char sql_id[MAX_SQL_ID_LEN];//
-
 	struct ob_trace_id_raw trace_id;//
-	char query_sql[MAX_SQL_LEN];// 成员变量名:sql_
-	char params_value[MAX_PARAMS_VALUE_LEN]; // PS协议中的参数值
+
+	char payload[AUDIT_EVENT_PAYLOAD_SIZE];
 };
 
+static inline unsigned int event_payload_offset(void)
+{
+	return (unsigned int)__builtin_offsetof(struct event, payload);
+}
+
+static inline unsigned int event_payload_len(const struct event *e)
+{
+	return e->user_name_len + e->proxy_user_name_len + e->tenant_name_len + e->db_name_len +
+	       e->query_sql_payload_len + e->params_value_payload_len;
+}
+
+static inline int event_compact_size_valid(const struct event *e)
+{
+	unsigned int payload_offset = event_payload_offset();
+	if (e->total_size < payload_offset)
+		return 0;
+	if (e->total_size > sizeof(struct event))
+		return 0;
+	return payload_offset + event_payload_len(e) == e->total_size;
+}
+
+#ifdef __cplusplus
+#include <cstdio>
+#include <cstring>
+
+static inline const char *event_user_name(const struct event *e)
+{
+	return e->payload;
+}
+
+static inline const char *event_proxy_user_name(const struct event *e)
+{
+	return e->payload + e->user_name_len;
+}
+
+static inline const char *event_tenant_name(const struct event *e)
+{
+	return e->payload + e->user_name_len + e->proxy_user_name_len;
+}
+
+static inline const char *event_db_name(const struct event *e)
+{
+	return e->payload + e->user_name_len + e->proxy_user_name_len + e->tenant_name_len;
+}
+
+static inline const char *event_query_sql(const struct event *e)
+{
+	return e->payload + e->user_name_len + e->proxy_user_name_len + e->tenant_name_len + e->db_name_len;
+}
+
+static inline const char *event_params_value(const struct event *e)
+{
+	return event_query_sql(e) + e->query_sql_payload_len;
+}
+
+static inline bool read_compact_event(FILE *file, struct event *e)
+{
+	unsigned int total_size = 0;
+	if (fread(&total_size, sizeof(total_size), 1, file) != 1)
+		return false;
+	if (total_size < event_payload_offset() || total_size > sizeof(struct event))
+		return false;
+	*e = {};
+	e->total_size = total_size;
+	if (fread((char *)e + sizeof(total_size), total_size - sizeof(total_size), 1, file) != 1)
+		return false;
+	return event_compact_size_valid(e) != 0;
+}
+#endif
+
+ 
 #endif /* __UPROBE_H */

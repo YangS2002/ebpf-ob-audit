@@ -58,7 +58,7 @@ static int write_file_header(FILE *file)
 	}
 	return 0;
 }
-
+   
 // ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
 static int handle_event(void *ctx, void *data, size_t size)
 {
@@ -66,10 +66,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (size != sizeof(event))
 		return 0;
 
+	const event *e = static_cast<const event *>(data);
+	if (!event_compact_size_valid(e))
+		return 0;
+
 	const char *raw = static_cast<const char *>(data);
-	state->buffer.insert(state->buffer.end(), raw, raw + size);
+	state->buffer.insert(state->buffer.end(), raw, raw + e->total_size);
 	state->consumed_events++;
-	state->consumed_bytes += size;
+	state->consumed_bytes += e->total_size;
 
 	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
 		return -1;

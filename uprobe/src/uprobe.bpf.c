@@ -46,52 +46,69 @@ static __always_inline int read_bool(const void *base, unsigned long off, bool *
 	return bpf_probe_read_user(dst, sizeof(*dst), (const char *)base + off);
 }
 
-static __always_inline void read_user_string_64_field(const void *base, unsigned long ptr_off, unsigned long len_off,
-						     char *dst)
+static __always_inline unsigned int clamp_len(long long len, unsigned int max_len)
 {
-	const char *ptr = NULL;
-	long long len = 0;
-	int n = 0;
-
-	if (bpf_probe_read_user(&ptr, sizeof(ptr), (const char *)base + ptr_off))
-		return;
-	if (bpf_probe_read_user(&len, sizeof(len), (const char *)base + len_off))
-		return;
-	if (!ptr || len <= 0)
-		return;
-	if (len > MAX_NAME_LEN - 1)
-		len = MAX_NAME_LEN - 1;
-	// bpf_probe_read_user 的 size 参数必须被 verifier 证明有常量上界。
-	// 不能使用通用 dst_size 参数，否则 verifier 会报 R2 unbounded memory access。
-	// 这里用 64 字节字段专用函数，并用常量 mask 保证 n <= 63。
-	n = (int)len;
-	n &= MAX_NAME_LEN - 1;
-	if (n <= 0)
-		return;
-	bpf_probe_read_user(dst, n, ptr);
+	if (len <= 0)
+		return 0;
+	if (len > max_len)
+		return max_len;
+	return (unsigned int)len;
 }
 
-static __always_inline void read_user_string_128_field(const void *base, unsigned long ptr_off, unsigned long len_off,
-						      char *dst)
+static __always_inline unsigned int read_user_string_64_payload(const void *base, unsigned long ptr_off,
+							 unsigned long len_off, char *dst)
 {
 	const char *ptr = NULL;
 	long long len = 0;
-	int n = 0;
+	unsigned int n = 0;
 
 	if (bpf_probe_read_user(&ptr, sizeof(ptr), (const char *)base + ptr_off))
-		return;
+		return 0;
 	if (bpf_probe_read_user(&len, sizeof(len), (const char *)base + len_off))
-		return;
+		return 0;
 	if (!ptr || len <= 0)
-		return;
-	if (len > MAX_DB_NAME_LEN - 1)
-		len = MAX_DB_NAME_LEN - 1;
-	// 同上：128 字节字段专用函数，让 verifier 能证明 read size <= 127。
-	n = (int)len;
-	n &= MAX_DB_NAME_LEN - 1;
-	if (n <= 0)
-		return;
+		return 0;
+	n = clamp_len(len, MAX_NAME_LEN - 1);
+	n &= MAX_NAME_LEN - 1;
+	if (n == 0)
+		return 0;
 	bpf_probe_read_user(dst, n, ptr);
+	return n;
+}
+
+static __always_inline unsigned int read_user_string_128_payload(const void *base, unsigned long ptr_off,
+							  unsigned long len_off, char *dst)
+{
+	const char *ptr = NULL;
+	long long len = 0;
+	unsigned int n = 0;
+
+	if (bpf_probe_read_user(&ptr, sizeof(ptr), (const char *)base + ptr_off))
+		return 0;
+	if (bpf_probe_read_user(&len, sizeof(len), (const char *)base + len_off))
+		return 0;
+	if (!ptr || len <= 0)
+		return 0;
+	n = clamp_len(len, MAX_DB_NAME_LEN - 1);
+	n &= MAX_DB_NAME_LEN - 1;
+	if (n == 0)
+		return 0;
+	bpf_probe_read_user(dst, n, ptr);
+	return n;
+}
+
+static __always_inline unsigned int read_user_string_1024_payload(const char *ptr, long long len, char *dst)
+{
+	unsigned int n = 0;
+
+	if (!ptr || len <= 0)
+		return 0;
+	n = clamp_len(len, MAX_SQL_LEN - 1);
+	n &= MAX_SQL_LEN - 1;
+	if (n == 0)
+		return 0;
+	bpf_probe_read_user(dst, n, ptr);
+	return n;
 }
 
 static __always_inline void read_addr_field(const void *base, unsigned long addr_off, char *dst, int dst_size)
@@ -121,6 +138,9 @@ int handle_uprobe(struct pt_regs *ctx)
 	u32 key = 0;
 	u64 *seq_value;
 	u64 id;
+	char *payload;
+	unsigned int payload_len = 0;
+	unsigned int copied = 0;
 
 	// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
 	audit_record = (const void *)PT_REGS_PARM2(ctx);
@@ -162,19 +182,19 @@ int handle_uprobe(struct pt_regs *ctx)
 	seq_value = bpf_map_lookup_elem(&seq, &key);
 	if (seq_value)
 		e->event_seq = __sync_fetch_and_add(seq_value, 1) + 1;
+	else
+		e->event_seq = 0;
+	e->parent_event_seq = 0;
+	e->next_fragment_seq = 0;
 	// sql 分帧，暂时没做完
 	e->query_sql_len = sql_len;
+	e->params_value_len = 0;
 	e->fragment_flags = 0;
 	e->next_fragment_field = FRAG_FIELD_NONE;
 	if (sql_len >= MAX_SQL_LEN) {
 		e->fragment_flags |= FRAG_QUERY_SQL_TRUNCATED;
 		e->next_fragment_field = FRAG_FIELD_QUERY_SQL;
 	}
-	if (bpf_probe_read_user_str(e->query_sql, sizeof(e->query_sql), sql) < 0) {
-		bpf_ringbuf_discard(e, 0);
-		return 0;
-	}
-
 	if (!bpf_probe_read_user(&params_value, sizeof(params_value), (const char *)audit_record + OB_AUDIT_PARAMS_VALUE_PTR_OFF) &&
 	    !bpf_probe_read_user(&params_value_len, sizeof(params_value_len), (const char *)audit_record + OB_AUDIT_PARAMS_VALUE_LEN_OFF)) {
 		e->params_value_len = params_value_len;
@@ -184,7 +204,6 @@ int handle_uprobe(struct pt_regs *ctx)
 				if (e->next_fragment_field == FRAG_FIELD_NONE)
 					e->next_fragment_field = FRAG_FIELD_PARAMS_VALUE;
 			}
-			bpf_probe_read_user_str(e->params_value, sizeof(e->params_value), params_value);
 		}
 	}
 
@@ -223,18 +242,38 @@ int handle_uprobe(struct pt_regs *ctx)
 	if (e->execute_time <= 0 && executor_end_ts > 0 && process_executor_ts > 0)
 		e->execute_time = executor_end_ts - process_executor_ts;
 
-	read_user_string_64_field(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF, OB_AUDIT_TENANT_NAME_LEN_OFF,
-				  e->tenant_name);
-	read_user_string_64_field(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF,
-				  e->user_name);
-	read_user_string_64_field(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF, OB_AUDIT_PROXY_USER_NAME_LEN_OFF,
-				  e->proxy_user_name);
-	read_user_string_128_field(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF,
-				   e->db_name);
 	read_addr_field(audit_record, OB_AUDIT_USER_CLIENT_ADDR_OFF,
 			e->user_client_ip, sizeof(e->user_client_ip));
 	read_addr_field(audit_record, OB_AUDIT_CLIENT_ADDR_OFF,
 			e->client_ip, sizeof(e->client_ip));
+
+	payload = e->payload;
+	copied = read_user_string_64_payload(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF, payload);
+	e->user_name_len = copied;
+	payload += copied;
+	payload_len += copied;
+	copied = read_user_string_64_payload(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF,
+					      OB_AUDIT_PROXY_USER_NAME_LEN_OFF, payload);
+	e->proxy_user_name_len = copied;
+	payload += copied;
+	payload_len += copied;
+	copied = read_user_string_64_payload(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF,
+					      OB_AUDIT_TENANT_NAME_LEN_OFF, payload);
+	e->tenant_name_len = copied;
+	payload += copied;
+	payload_len += copied;
+	copied = read_user_string_128_payload(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF, payload);
+	e->db_name_len = copied;
+	payload += copied;
+	payload_len += copied;
+	copied = read_user_string_1024_payload(sql, sql_len, payload);
+	e->query_sql_payload_len = copied;
+	payload += copied;
+	payload_len += copied;
+	copied = read_user_string_1024_payload(params_value, params_value_len, payload);
+	e->params_value_payload_len = copied;
+	payload_len += copied;
+	e->total_size = event_payload_offset() + payload_len;
 
 	// 提交缓冲区
 	bpf_ringbuf_submit(e, 0);

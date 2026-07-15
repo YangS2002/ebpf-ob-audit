@@ -6,21 +6,9 @@
 
 #include "uprobe.h"
 
-static std::string bounded_string(const char *data, size_t max_len)
+static std::string field_string(const char *data, unsigned int len)
 {
-	size_t len = 0;
-	while (len < max_len && data[len] != '\0')
-		len++;
 	return std::string(data, len);
-}
-
-static size_t clamp_field_len(long long len, size_t max_len)
-{
-	if (len <= 0)
-		return 0;
-	if ((unsigned long long)len > max_len)
-		return max_len;
-	return (size_t)len;
 }
 
 static bool read_header(FILE *file, audit_file_header *header)
@@ -50,15 +38,15 @@ static bool read_header(FILE *file, audit_file_header *header)
 
 static void print_event(const event &e)
 {
-	std::string db_name = bounded_string(e.db_name, sizeof(e.db_name));
-	std::string user_name = bounded_string(e.user_name, sizeof(e.user_name));
-	std::string proxy_user_name = bounded_string(e.proxy_user_name, sizeof(e.proxy_user_name));
-	std::string tenant_name = bounded_string(e.tenant_name, sizeof(e.tenant_name));
-	std::string user_client_ip = bounded_string(e.user_client_ip, sizeof(e.user_client_ip));
-	std::string client_ip = bounded_string(e.client_ip, sizeof(e.client_ip));
-	std::string sql_id = bounded_string(e.sql_id, sizeof(e.sql_id));
-	std::string query_sql(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql)));
-	std::string params_value(e.params_value, clamp_field_len(e.params_value_len, sizeof(e.params_value)));
+	std::string db_name = field_string(event_db_name(&e), e.db_name_len);
+	std::string user_name = field_string(event_user_name(&e), e.user_name_len);
+	std::string proxy_user_name = field_string(event_proxy_user_name(&e), e.proxy_user_name_len);
+	std::string tenant_name = field_string(event_tenant_name(&e), e.tenant_name_len);
+	std::string user_client_ip(e.user_client_ip, sizeof(e.user_client_ip));
+	std::string client_ip(e.client_ip, sizeof(e.client_ip));
+	std::string sql_id(e.sql_id, sizeof(e.sql_id));
+	std::string query_sql(event_query_sql(&e), e.query_sql_payload_len);
+	std::string params_value(event_params_value(&e), e.params_value_payload_len);
 
 	printf("seq=%llu parent=%llu next=%llu pid=%d tid=%d tenant_id=%llu user_id=%llu session_id=%llu request_id=%llu ret_code=%d stmt_type=%d plan_type=%d trans_status=%d request_ts=%lld elapsed=%lld execute=%lld affected_rows=%llu return_rows=%llu db_id=%llu db=%s user=%s proxy_user=%s tenant=%s user_client_ip=%s client_ip=%s sql_id=%s sql_len=%lld params_len=%lld flags=0x%x next_field=%u trace_id=%llx:%llx:%llx:%llx sql=%s params=%s\n",
 	       e.event_seq, e.parent_event_seq, e.next_fragment_seq,
@@ -102,7 +90,7 @@ int main(int argc, char **argv)
 	unsigned long long sequence_gaps = 0;
 	unsigned long long expected_seq = 0;
 
-	while (fread(&e, sizeof(e), 1, file) == 1) {
+	while (read_compact_event(file, &e)) {
 		if (expected_seq && e.event_seq != expected_seq) {
 			sequence_gaps++;
 			printf("sequence_gap: expected=%llu actual=%llu\n", expected_seq, e.event_seq);
@@ -113,7 +101,7 @@ int main(int argc, char **argv)
 		if (e.fragment_flags & FRAG_PARAMS_VALUE_TRUNCATED)
 			params_truncated++;
 		total_records++;
-		total_bytes += sizeof(e);
+		total_bytes += e.total_size;
 		print_event(e);
 	}
 

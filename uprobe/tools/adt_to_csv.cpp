@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "uprobe.h"
 #include "audit_format.h"
@@ -219,14 +220,6 @@ static std::string format_trace_id(const ob_trace_id_raw &trace_id)
 	return std::string(buf);
 }
 
-static size_t clamp_field_len(long long len, size_t max_len)
-{
-	if (len <= 0)
-		return 0;
-	if ((unsigned long long)len > max_len)
-		return max_len;
-	return (size_t)len;
-}
 
 static void write_csv_string(FILE *out, const std::string &s)
 {
@@ -288,17 +281,17 @@ static void write_trans_status_name(FILE *out, const event &e)
 
 static void write_user_name(FILE *out, const event &e)
 {
-	write_csv_string(out, bounded_string(e.user_name, sizeof(e.user_name)));
+	write_csv_string(out, std::string(event_user_name(&e), e.user_name_len));
 }
 
 static void write_proxy_user_name(FILE *out, const event &e)
 {
-	write_csv_string(out, bounded_string(e.proxy_user_name, sizeof(e.proxy_user_name)));
+	write_csv_string(out, std::string(event_proxy_user_name(&e), e.proxy_user_name_len));
 }
 
 static void write_tenant_name(FILE *out, const event &e)
 {
-	write_csv_string(out, bounded_string(e.tenant_name, sizeof(e.tenant_name)));
+	write_csv_string(out, std::string(event_tenant_name(&e), e.tenant_name_len));
 }
 
 static void write_user_client_ip(FILE *out, const event &e)
@@ -313,7 +306,7 @@ static void write_client_ip(FILE *out, const event &e)
 
 static void write_db_name(FILE *out, const event &e)
 {
-	write_csv_string(out, bounded_string(e.db_name, sizeof(e.db_name)));
+	write_csv_string(out, std::string(event_db_name(&e), e.db_name_len));
 }
 
 static void write_sql_id(FILE *out, const event &e)
@@ -328,12 +321,12 @@ static void write_trace_id(FILE *out, const event &e)
 
 static void write_query_sql(FILE *out, const event &e)
 {
-	write_csv_string(out, std::string(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql))));
+	write_csv_string(out, std::string(event_query_sql(&e), e.query_sql_payload_len));
 }
 
 static void write_params_value(FILE *out, const event &e)
 {
-	write_csv_string(out, std::string(e.params_value, clamp_field_len(e.params_value_len, sizeof(e.params_value))));
+	write_csv_string(out, std::string(event_params_value(&e), e.params_value_payload_len));
 }
 
 static const CsvField CSV_FIELDS[] = {
@@ -398,27 +391,12 @@ static void write_event_csv(FILE *out, const event &e)
 	fputc('\n', out);
 }
 
-static bool get_record_count(FILE *file, unsigned long long *count)
+static bool load_events(FILE *file, std::vector<event> *events)
 {
-	long current = ftell(file);
-	if (current < 0)
-		return false;
-	if (fseek(file, 0, SEEK_END) != 0)
-		return false;
-	long end = ftell(file);
-	if (end < 0)
-		return false;
-	long data_size = end - (long)sizeof(audit_file_header);
-	if (data_size < 0 || data_size % (long)sizeof(event) != 0)
-		return false;
-	*count = (unsigned long long)(data_size / (long)sizeof(event));
-	return fseek(file, current, SEEK_SET) == 0;
-}
-
-static bool seek_to_record(FILE *file, unsigned long long index)
-{
-	unsigned long long offset = sizeof(audit_file_header) + index * sizeof(event);
-	return fseek(file, (long)offset, SEEK_SET) == 0;
+	event e = {};
+	while (read_compact_event(file, &e))
+		events->push_back(e);
+	return !ferror(file);
 }
 
 int main(int argc, char **argv)
@@ -441,12 +419,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	unsigned long long total_records = 0;
-	if (!get_record_count(input, &total_records)) {
-		fprintf(stderr, "Failed to get record count\n");
+	std::vector<event> events;
+	if (!load_events(input, &events)) {
+		fprintf(stderr, "Failed to read events: %s\n", strerror(errno));
 		fclose(input);
 		return 1;
 	}
+	unsigned long long total_records = events.size();
 
 	unsigned long long start = 0;
 	unsigned long long limit = total_records;
@@ -465,26 +444,13 @@ int main(int argc, char **argv)
 	}
 
 	write_csv_header(output);
-	if (!seek_to_record(input, start)) {
-		fprintf(stderr, "Failed to seek input file\n");
-		fclose(output);
-		fclose(input);
-		return 1;
-	}
 
-	event e = {};
 	unsigned long long converted = 0;
-	while (converted < limit && fread(&e, sizeof(e), 1, input) == 1) {
-		write_event_csv(output, e);
+	for (unsigned long long i = start; converted < limit && i < total_records; i++) {
+		write_event_csv(output, events[(size_t)i]);
 		converted++;
 	}
 
-	if (ferror(input)) {
-		fprintf(stderr, "Failed to read events: %s\n", strerror(errno));
-		fclose(output);
-		fclose(input);
-		return 1;
-	}
 	if (fclose(output) != 0) {
 		fprintf(stderr, "Failed to close %s: %s\n", opts.output_path, strerror(errno));
 		fclose(input);

@@ -261,18 +261,9 @@ static bool read_header(FILE *file)
 	return true;
 }
 
-static size_t clamp_field_len(long long len, size_t max_len)
-{
-	if (len <= 0)
-		return 0;
-	if ((unsigned long long)len > max_len)
-		return max_len;
-	return (size_t)len;
-}
-
 static void append_captured_event(std::vector<captured_sql> *captured, const event &e)
 {
-	std::string sql(e.query_sql, clamp_field_len(e.query_sql_len, sizeof(e.query_sql)));
+	std::string sql(event_query_sql(&e), e.query_sql_payload_len);
 	std::string canonical = canonical_sql(sql);
 	if (!canonical.empty())
 		captured->push_back({e.event_seq, normalize_sql(sql), canonical});
@@ -312,7 +303,7 @@ int main(int argc, char **argv)
 	std::vector<captured_sql> captured;
 	unsigned long long total_events = 0;
 	event e = {};
-	while (fread(&e, sizeof(e), 1, file) == 1) {
+	while (read_compact_event(file, &e)) {
 		total_events++;
 		append_captured_event(&captured, e);
 	}
