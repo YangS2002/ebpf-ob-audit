@@ -50,5 +50,5 @@ sysbench uprobe/test/sysbench_print_sql.lua \
 # 运行ebpf程序
 ./uprobe/bin/uprobe /home/yangshuo17/observer/bin/observer  0x000000000bf18950
 # 批量执行sql
-mysql -h 7.27.43.145 -P2881 -uroot@ebpf_tenant -p'' --skip-ssl -Dtest < uprobe/test/sysbench_test/sysbench_generated.sql
+mysql -h 7.27.43.145 -P2881 -uroot@ebpf_audit_tenant_a -p'' --skip-ssl -Dtest < uprobe/test/sysbench_test/sysbentch_audit_workload.sql
 ./uprobe/bin/check_audit_sql audit_manu.dat uprobe/test/sysbench_test/sysbench_generated.sql

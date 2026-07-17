@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
@@ -16,9 +18,17 @@ extern "C" {
 
 static volatile bool exiting = false;
 
+struct pending_event {
+	event main = {};
+	std::string query_sql;
+	std::string params_value;
+	bool has_last_fragment = false;
+};
+
 struct writer_state {
 	FILE *file = nullptr;
 	std::vector<char> buffer;
+	std::unordered_map<unsigned long long, pending_event> pending;
 	unsigned long long consumed_events = 0;
 	unsigned long long consumed_bytes = 0;
 	unsigned long long written_bytes = 0;
@@ -59,24 +69,109 @@ static int write_file_header(FILE *file)
 	return 0;
 }
    
+static int append_event(writer_state *state, const event &e)
+{
+	if (!event_compact_size_valid(&e))
+		return 0;
+	const char *raw = reinterpret_cast<const char *>(&e);
+	state->buffer.insert(state->buffer.end(), raw, raw + e.total_size);
+	state->consumed_events++;
+	state->consumed_bytes += e.total_size;
+	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
+		return -1;
+	return 0;
+}
+
+static bool build_merged_event(pending_event *pending, event *out)
+{
+	*out = pending->main;
+	unsigned int names_len = out->user_name_len + out->proxy_user_name_len + out->tenant_name_len + out->db_name_len;
+	if (names_len + pending->query_sql.size() + pending->params_value.size() > AUDIT_EVENT_PAYLOAD_SIZE)
+		return false;
+	std::memcpy(out->payload + names_len, pending->query_sql.data(), pending->query_sql.size());
+	std::memcpy(out->payload + names_len + pending->query_sql.size(), pending->params_value.data(), pending->params_value.size());
+	out->query_sql_payload_len = pending->query_sql.size();
+	out->params_value_payload_len = pending->params_value.size();
+	out->record_flags |= AUDIT_RECORD_FLAG_LOGICAL_COMPLETE;
+	out->total_size = event_payload_offset() + names_len + out->query_sql_payload_len + out->params_value_payload_len;
+	return true;
+}
+
+static int handle_main_event(writer_state *state, const event *e)
+{
+	if (!event_compact_size_valid(e))
+		return 0;
+	if ((e->fragment_flags & (FRAG_QUERY_SQL_FRAGMENTED | FRAG_PARAMS_VALUE_FRAGMENTED)) == 0)
+		return append_event(state, *e);
+
+	pending_event pending;
+	pending.main = *e;
+	pending.query_sql.assign(event_query_sql(e), e->query_sql_payload_len);
+	pending.params_value.assign(event_params_value(e), e->params_value_payload_len);
+	state->pending[e->event_seq] = std::move(pending);
+	state->consumed_events++;
+	state->consumed_bytes += e->total_size;
+	return 0;
+}
+
+static int handle_fragment_record(writer_state *state, const audit_fragment_record *fragment, size_t size)
+{
+	if (size < audit_fragment_payload_offset())
+		return 0;
+	if (fragment->total_size != size)
+		return 0;
+	if (fragment->payload_len > AUDIT_FRAGMENT_PAYLOAD_MAX)
+		return 0;
+	if (audit_fragment_payload_offset() + fragment->payload_len != fragment->total_size)
+		return 0;
+
+	auto it = state->pending.find(fragment->parent_event_seq);
+	if (it == state->pending.end())
+		return 0;
+
+	std::string *target = nullptr;
+	if (fragment->field == FRAG_FIELD_QUERY_SQL)
+		target = &it->second.query_sql;
+	else if (fragment->field == FRAG_FIELD_PARAMS_VALUE)
+		target = &it->second.params_value;
+	else
+		return 0;
+	if (fragment->fragment_offset > target->size())
+		target->resize(fragment->fragment_offset);
+	if (fragment->fragment_offset + fragment->payload_len > target->size())
+		target->resize(fragment->fragment_offset + fragment->payload_len);
+	if (fragment->payload_len != 0)
+		std::memcpy(&(*target)[fragment->fragment_offset], fragment->payload, fragment->payload_len);
+	state->consumed_events++;
+	state->consumed_bytes += fragment->total_size;
+
+	if (fragment->next_fragment_seq != 0 && (fragment->record_flags & AUDIT_RECORD_FLAG_LAST_FRAGMENT) == 0)
+		return 0;
+
+	event merged = {};
+	if (!build_merged_event(&it->second, &merged))
+		return 0;
+	state->pending.erase(it);
+	return append_event(state, merged);
+}
+
 // ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	auto *state = static_cast<writer_state *>(ctx);
-	if (size != sizeof(event))
+	if (size < sizeof(audit_record_header))
 		return 0;
 
-	const event *e = static_cast<const event *>(data);
-	if (!event_compact_size_valid(e))
+	const auto *header = static_cast<const audit_record_header *>(data);
+	if (header->total_size != size)
 		return 0;
-
-	const char *raw = static_cast<const char *>(data);
-	state->buffer.insert(state->buffer.end(), raw, raw + e->total_size);
-	state->consumed_events++;
-	state->consumed_bytes += e->total_size;
-
-	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
-		return -1;
+	if (header->record_type == AUDIT_RECORD_EVENT) {
+		if (size < event_payload_offset() || size > sizeof(event))
+			return 0;
+		return handle_main_event(state, static_cast<const event *>(data));
+	}
+	if (header->record_type == AUDIT_RECORD_FRAGMENT)
+		return handle_fragment_record(state, static_cast<const audit_fragment_record *>(data), size);
 	return 0;
 }
 

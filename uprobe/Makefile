@@ -103,23 +103,23 @@ event-size: $(BINDIR)/event_size
 .PHONY: gtest-audit-e2e
 gtest-audit-e2e: $(BINDIR)/audit_e2e_test
 
-$(BINDIR)/event_size: $(TEST_DIR)/event_size.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+$(BINDIR)/event_size: $(TEST_DIR)/event_size.cpp $(wildcard $(SRC_DIR)/*.h) | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 
-$(BINDIR)/audit_e2e_test: $(TEST_DIR)/audit_e2e_main.cpp $(TEST_DIR)/audit_e2e_common.cpp $(TEST_DIR)/audit_e2e_test.cpp $(TEST_DIR)/audit_e2e_common.h $(SRC_DIR)/uprobe.h | $(BINDIR)
+$(BINDIR)/audit_e2e_test: $(TEST_DIR)/audit_e2e_main.cpp $(TEST_DIR)/audit_e2e_common.cpp $(TEST_DIR)/audit_e2e_test.cpp $(TEST_DIR)/audit_e2e_common.h $(wildcard $(SRC_DIR)/*.h) | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) -I$(SRC_DIR) -I$(TEST_DIR) $(TEST_DIR)/audit_e2e_main.cpp $(TEST_DIR)/audit_e2e_common.cpp $(TEST_DIR)/audit_e2e_test.cpp $(GTEST_LDLIBS) -o $@
 
-$(BINDIR)/read_events: $(TOOLS_DIR)/read_events.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+$(BINDIR)/read_events: $(TOOLS_DIR)/read_events.cpp $(TOOLS_DIR)/audit_format.h $(wildcard $(SRC_DIR)/*.h) | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 
-$(BINDIR)/adt_to_csv: $(TOOLS_DIR)/adt_to_csv.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+$(BINDIR)/adt_to_csv: $(TOOLS_DIR)/adt_to_csv.cpp $(TOOLS_DIR)/audit_format.h $(wildcard $(SRC_DIR)/*.h) | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 
-$(BINDIR)/check_audit_sql: $(TOOLS_DIR)/check_audit_sql.cpp $(SRC_DIR)/uprobe.h | $(BINDIR)
+$(BINDIR)/check_audit_sql: $(TOOLS_DIR)/check_audit_sql.cpp $(TOOLS_DIR)/audit_format.h $(wildcard $(SRC_DIR)/*.h) | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) -I$(SRC_DIR) $< -o $@
 

@@ -2,14 +2,28 @@
 #ifndef __UPROBE_H
 #define __UPROBE_H
 
+#include "audit_record.h"
+
 #define TASK_COMM_LEN 16
 #define MAX_NAME_LEN 64
 #define MAX_IP_LEN OB_ADDR_SIZE
 #define MAX_DB_NAME_LEN 128
-#define MAX_SQL_ID_LEN 33 // 32 + 1 
+#define MAX_SQL_ID_LEN 33 // 32 + 1
 #define MAX_TRACE_ID_LEN 128
-#define MAX_SQL_LEN 1024
-#define MAX_PARAMS_VALUE_LEN 1024
+#define MAX_SQL_LEN AUDIT_SQL_CAPTURE_MAX
+#define MAX_PARAMS_VALUE_LEN AUDIT_PARAMS_CAPTURE_MAX
+
+/* BPF 端 struct event 的 payload 上限。
+ * 用户态需要容纳完整 SQL+params（含分片合并结果），用 AUDIT_EVENT_PAYLOAD_SIZE。
+ * BPF 端只发 main event 的 first chunks，payload 最大 =
+ *   三个 name + db_name + sql first + params first
+ * 缩小后 struct event 才能放进 per-cpu array（受 per-cpu 区域大小限制，约 32KB）。 */
+#ifdef __BPF__
+#undef AUDIT_EVENT_PAYLOAD_SIZE
+#define AUDIT_EVENT_PAYLOAD_SIZE \
+	(MAX_NAME_LEN + MAX_NAME_LEN + MAX_NAME_LEN + \
+	 MAX_DB_NAME_LEN + AUDIT_MAIN_SQL_PAYLOAD_MAX + AUDIT_MAIN_PARAMS_PAYLOAD_MAX)
+#endif
 
 #define OB_AUDIT_STATUS_OFF 4
 #define OB_AUDIT_TRACE_ID_OFF 8
@@ -78,9 +92,11 @@
 
 #define AUDIT_FILE_MAGIC "OBAUDT1"
 #define AUDIT_FILE_MAGIC_SIZE 8
-#define AUDIT_FILE_VERSION 3
+#define AUDIT_FILE_VERSION 4
 #define AUDIT_FLUSH_THRESHOLD (64 * 1024)
+#ifndef AUDIT_EVENT_PAYLOAD_SIZE
 #define AUDIT_EVENT_PAYLOAD_SIZE (MAX_NAME_LEN + MAX_NAME_LEN + MAX_NAME_LEN + MAX_DB_NAME_LEN + MAX_SQL_LEN + MAX_PARAMS_VALUE_LEN)
+#endif
 
 struct audit_file_header {
 	char magic[AUDIT_FILE_MAGIC_SIZE];
@@ -115,6 +131,11 @@ enum fragment_field {
 enum fragment_flags {
 	FRAG_QUERY_SQL_TRUNCATED = 1 << 0,
 	FRAG_PARAMS_VALUE_TRUNCATED = 1 << 1,
+	FRAG_QUERY_SQL_FRAGMENTED = 1 << 2,
+	FRAG_PARAMS_VALUE_FRAGMENTED = 1 << 3,
+	FRAG_LOGICAL_COMPLETE = 1 << 4,
+	FRAG_PHYSICAL_COMPLETE = 1 << 5,
+	FRAG_USER_LOSS = 1 << 6,
 };
 
 struct ob_trace_id_raw {
@@ -123,19 +144,12 @@ struct ob_trace_id_raw {
 
 struct event {
 	unsigned int total_size;
-	unsigned int user_name_len;
-	unsigned int proxy_user_name_len;
-	unsigned int tenant_name_len;
-	unsigned int db_name_len;
-	unsigned int query_sql_payload_len;
-	unsigned int params_value_payload_len;
+	unsigned short record_type;
+	unsigned short record_flags;
 
 	unsigned long long event_seq; // 全局递增序号，用于发现丢记录和后续分片关联
 	unsigned long long parent_event_seq; // 后续分片事件关联的主事件序号，当前主事件为0
 	unsigned long long next_fragment_seq; // 后续分片事件序号，当前暂未生成分片事件
-
-	int pid;
-	int tid;
 
 	unsigned long long user_id; // int64_t 
 	unsigned long long tenant_id; // int64_t
@@ -148,7 +162,6 @@ struct event {
 	unsigned long long transaction_hash;// 虚拟表字段名：TX_ID, 审计记录成员变量名：trans_id_
 	unsigned long long request_id;//
 
-	int ret_code; //  status_ 成员变量
 	// elapsed_time的成员变量receive_ts_ 。 exec_timestamp_.receive_ts_
 	long long request_timestamp;// 虚拟表字段名：REQUEST_TIME
 	
@@ -167,6 +180,18 @@ struct event {
 	long long query_sql_len;
 	long long params_value_len;
 
+	struct ob_trace_id_raw trace_id;//
+
+	unsigned int user_name_len;
+	unsigned int proxy_user_name_len;
+	unsigned int tenant_name_len;
+	unsigned int db_name_len;
+	unsigned int query_sql_payload_len;
+	unsigned int params_value_payload_len;
+
+	int pid;
+	int tid;
+	int ret_code; //  status_ 成员变量
 	int stmt_type; // enum:int_t 32 需要用户态解析，
 	enum ObPhyPlanType plan_type; // 
 	enum ObTransStatus trans_status;//
@@ -180,7 +205,6 @@ struct event {
 
 	// char server_ip[MAX_IP_LEN];// 可以本机获取
 	char sql_id[MAX_SQL_ID_LEN];//
-	struct ob_trace_id_raw trace_id;//
 
 	char payload[AUDIT_EVENT_PAYLOAD_SIZE];
 };
@@ -199,6 +223,8 @@ static inline unsigned int event_payload_len(const struct event *e)
 static inline int event_compact_size_valid(const struct event *e)
 {
 	unsigned int payload_offset = event_payload_offset();
+	if (e->record_type != AUDIT_RECORD_EVENT)
+		return 0;
 	if (e->total_size < payload_offset)
 		return 0;
 	if (e->total_size > sizeof(struct event))
