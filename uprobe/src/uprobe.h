@@ -92,7 +92,7 @@
 
 #define AUDIT_FILE_MAGIC "OBAUDT1"
 #define AUDIT_FILE_MAGIC_SIZE 8
-#define AUDIT_FILE_VERSION 4
+#define AUDIT_FILE_VERSION 5
 #define AUDIT_FLUSH_THRESHOLD (64 * 1024)
 #ifndef AUDIT_EVENT_PAYLOAD_SIZE
 #define AUDIT_EVENT_PAYLOAD_SIZE (MAX_NAME_LEN + MAX_NAME_LEN + MAX_NAME_LEN + MAX_DB_NAME_LEN + MAX_SQL_LEN + MAX_PARAMS_VALUE_LEN)
@@ -199,12 +199,11 @@ struct event {
 	unsigned int fragment_flags;
 	unsigned int next_fragment_field;
 
-	// user_client_ip/client_ip 字段保存 ObAddr 原始二进制，仅 CSV 转换时格式化。
-	char user_client_ip[MAX_IP_LEN];// 
-	char client_ip[MAX_IP_LEN];//
-
-	// char server_ip[MAX_IP_LEN];// 可以本机获取
-	char sql_id[MAX_SQL_ID_LEN];//
+		// user_client_ip/client_ip/server_ip 字段保存 ObAddr 原始二进制，仅 CSV 转换时格式化。
+		char user_client_ip[MAX_IP_LEN];// 
+		char client_ip[MAX_IP_LEN];//
+		char server_ip[MAX_IP_LEN];// BPF 端留空，用户态消费成功后填充本机 agent IP。
+		char sql_id[MAX_SQL_ID_LEN];//
 
 	char payload[AUDIT_EVENT_PAYLOAD_SIZE];
 };

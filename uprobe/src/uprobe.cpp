@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <cerrno>
 #include <csignal>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +36,7 @@ struct writer_state {
 	unsigned long long consumed_events = 0;
 	unsigned long long consumed_bytes = 0;
 	unsigned long long written_bytes = 0;
+	char server_ip[MAX_IP_LEN] = {};
 };
 
 static void handle_signal(int)
@@ -69,14 +74,75 @@ static int write_file_header(FILE *file)
 	return 0;
 }
    
+static void fill_ob_addr_ipv4(char *dst, const void *addr)
+{
+	int version = 4;
+	unsigned int ip = ntohl(reinterpret_cast<const sockaddr_in *>(addr)->sin_addr.s_addr);
+	std::memset(dst, 0, MAX_IP_LEN);
+	std::memcpy(dst + OB_ADDR_VERSION_OFF, &version, sizeof(version));
+	std::memcpy(dst + OB_ADDR_IP_OFF, &ip, sizeof(ip));
+}
+
+static bool fill_ipv4_string(char *dst, const char *ip)
+{
+	if (!ip || !*ip)
+		return false;
+
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
+		return false;
+	fill_ob_addr_ipv4(dst, &addr);
+	return true;
+}
+
+static std::string trim(std::string value)
+{
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+		value.erase(value.begin());
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+		value.pop_back();
+	return value;
+}
+
+static bool load_server_ip_config(const char *path, char *dst)
+{
+	if (!path || !*path)
+		return false;
+	FILE *file = fopen(path, "r");
+	if (!file)
+		return false;
+
+	char line[256];
+	bool found = false;
+	while (fgets(line, sizeof(line), file)) {
+		std::string text = trim(line);
+		if (text.empty() || text[0] == '#')
+			continue;
+		size_t pos = text.find('=');
+		if (pos == std::string::npos)
+			continue;
+		std::string key = trim(text.substr(0, pos));
+		std::string value = trim(text.substr(pos + 1));
+		if (key == "server_ip") {
+			found = fill_ipv4_string(dst, value.c_str());
+			break;
+		}
+	}
+	fclose(file);
+	return found;
+}
+
 static int append_event(writer_state *state, const event &e)
 {
 	if (!event_compact_size_valid(&e))
 		return 0;
-	const char *raw = reinterpret_cast<const char *>(&e);
-	state->buffer.insert(state->buffer.end(), raw, raw + e.total_size);
+	event out = e;
+	std::memcpy(out.server_ip, state->server_ip, sizeof(out.server_ip));
+	const char *raw = reinterpret_cast<const char *>(&out);
+	state->buffer.insert(state->buffer.end(), raw, raw + out.total_size);
 	state->consumed_events++;
-	state->consumed_bytes += e.total_size;
+	state->consumed_bytes += out.total_size;
 	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
 		return -1;
 	return 0;
@@ -190,14 +256,15 @@ static unsigned long long parse_offset(const char *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3 || argc > 4) {
-		fprintf(stderr, "Usage: %s <target-path> <offset> [output-file]\n", argv[0]);
+	if (argc < 3 || argc > 5) {
+		fprintf(stderr, "Usage: %s <target-path> <offset> [output-file] [config-file]\n", argv[0]);
 		return 1;
 	}
 
 	const char *target = argv[1];
 	unsigned long long offset = parse_offset(argv[2]);
-	const char *output_file = argc == 4 ? argv[3] : "audit_events.dat";
+	const char *output_file = argc >= 4 ? argv[3] : "audit_events.dat";
+	const char *config_file = argc == 5 ? argv[4] : "uprobe.conf";
 	uprobe_bpf *skel = nullptr;
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
@@ -206,6 +273,7 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
+	load_server_ip_config(config_file, state.server_ip);
 
 	state.file = fopen(output_file, "wb");
 	if (!state.file) {

@@ -371,6 +371,7 @@ int handle_uprobe(struct pt_regs *ctx)
 			e->user_client_ip, sizeof(e->user_client_ip));
 	read_addr_field(audit_record, OB_AUDIT_CLIENT_ADDR_OFF,
 			e->client_ip, sizeof(e->client_ip));
+	__builtin_memset(e->server_ip, 0, sizeof(e->server_ip));
 
 	payload = e->payload;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);

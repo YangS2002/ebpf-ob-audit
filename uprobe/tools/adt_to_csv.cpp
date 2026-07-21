@@ -304,6 +304,11 @@ static void write_client_ip(FILE *out, const event &e)
 	write_csv_string(out, format_ob_addr(e.client_ip, sizeof(e.client_ip)));
 }
 
+static void write_server_ip(FILE *out, const event &e)
+{
+	write_csv_string(out, format_ob_addr(e.server_ip, sizeof(e.server_ip)));
+}
+
 static void write_db_name(FILE *out, const event &e)
 {
 	write_csv_string(out, std::string(event_db_name(&e), e.db_name_len));
@@ -364,6 +369,7 @@ static const CsvField CSV_FIELDS[] = {
 	{"tenant_name", write_tenant_name},
 	{"user_client_ip", write_user_client_ip},
 	{"client_ip", write_client_ip},
+	{"server_ip", write_server_ip},
 	{"db_name", write_db_name},
 	{"sql_id", write_sql_id},
 	{"trace_id", write_trace_id},
