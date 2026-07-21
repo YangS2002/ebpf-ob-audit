@@ -8,9 +8,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <grpcpp/grpcpp.h>
+#include "audit_upload.grpc.pb.h"
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
 extern "C" {
@@ -29,6 +33,26 @@ struct pending_event {
 	bool has_last_fragment = false;
 };
 
+struct app_config {
+	std::string agent_id;
+	std::string server_ip_text;
+	std::string collector_addr;
+	unsigned int grpc_batch_bytes = 0;
+};
+
+struct grpc_sender {
+	bool enabled = false;
+	std::string agent_id;
+	std::string server_ip;
+	unsigned int batch_bytes = 0;
+	std::vector<char> buffer;
+	unsigned long long records = 0;
+	unsigned long long sent_batches = 0;
+	unsigned long long sent_records = 0;
+	unsigned long long sent_bytes = 0;
+	std::unique_ptr<audit::AuditCollector::Stub> stub;
+};
+
 struct writer_state {
 	FILE *file = nullptr;
 	std::vector<char> buffer;
@@ -37,6 +61,7 @@ struct writer_state {
 	unsigned long long consumed_bytes = 0;
 	unsigned long long written_bytes = 0;
 	char server_ip[MAX_IP_LEN] = {};
+	grpc_sender grpc;
 };
 
 static void handle_signal(int)
@@ -105,7 +130,7 @@ static std::string trim(std::string value)
 	return value;
 }
 
-static bool load_server_ip_config(const char *path, char *dst)
+static bool load_config(const char *path, app_config *config)
 {
 	if (!path || !*path)
 		return false;
@@ -113,8 +138,7 @@ static bool load_server_ip_config(const char *path, char *dst)
 	if (!file)
 		return false;
 
-	char line[256];
-	bool found = false;
+	char line[512];
 	while (fgets(line, sizeof(line), file)) {
 		std::string text = trim(line);
 		if (text.empty() || text[0] == '#')
@@ -124,13 +148,66 @@ static bool load_server_ip_config(const char *path, char *dst)
 			continue;
 		std::string key = trim(text.substr(0, pos));
 		std::string value = trim(text.substr(pos + 1));
-		if (key == "server_ip") {
-			found = fill_ipv4_string(dst, value.c_str());
-			break;
-		}
+		if (key == "server_ip")
+			config->server_ip_text = value;
+		else if (key == "agent_id")
+			config->agent_id = value;
+		else if (key == "collector_addr")
+			config->collector_addr = value;
+		else if (key == "grpc_batch_bytes")
+			config->grpc_batch_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 	}
 	fclose(file);
-	return found;
+	return true;
+}
+
+static int grpc_flush(grpc_sender *sender)
+{
+	if (!sender->enabled || sender->buffer.empty())
+		return 0;
+	audit::AuditBatch batch;
+	batch.set_agent_id(sender->agent_id);
+	batch.set_server_ip(sender->server_ip);
+	batch.set_file_version(AUDIT_FILE_VERSION);
+	batch.set_event_size(sizeof(event));
+	batch.set_record_count(sender->records);
+	batch.set_records(sender->buffer.data(), sender->buffer.size());
+
+	audit::UploadReply reply;
+	grpc::ClientContext context;
+	grpc::Status status = sender->stub->Upload(&context, batch, &reply);
+	if (!status.ok() || !reply.ok()) {
+		fprintf(stderr, "grpc upload failed: %s %s\n", status.error_message().c_str(), reply.message().c_str());
+		return -1;
+	}
+	sender->sent_batches++;
+	sender->sent_records += sender->records;
+	sender->sent_bytes += sender->buffer.size();
+	sender->buffer.clear();
+	sender->records = 0;
+	return 0;
+}
+
+static void grpc_append(grpc_sender *sender, const event &e)
+{
+	if (!sender->enabled)
+		return;
+	const char *raw = reinterpret_cast<const char *>(&e);
+	sender->buffer.insert(sender->buffer.end(), raw, raw + e.total_size);
+	sender->records++;
+	if (sender->batch_bytes > 0 && sender->buffer.size() >= sender->batch_bytes)
+		grpc_flush(sender);
+}
+
+static void init_grpc_sender(grpc_sender *sender, const app_config &config)
+{
+	if (config.collector_addr.empty())
+		return;
+	sender->enabled = true;
+	sender->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	sender->server_ip = config.server_ip_text;
+	sender->batch_bytes = config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144;
+	sender->stub = audit::AuditCollector::NewStub(grpc::CreateChannel(config.collector_addr, grpc::InsecureChannelCredentials()));
 }
 
 static int append_event(writer_state *state, const event &e)
@@ -141,6 +218,7 @@ static int append_event(writer_state *state, const event &e)
 	std::memcpy(out.server_ip, state->server_ip, sizeof(out.server_ip));
 	const char *raw = reinterpret_cast<const char *>(&out);
 	state->buffer.insert(state->buffer.end(), raw, raw + out.total_size);
+	grpc_append(&state->grpc, out);
 	state->consumed_events++;
 	state->consumed_bytes += out.total_size;
 	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
@@ -269,11 +347,14 @@ int main(int argc, char **argv)
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
 	writer_state state;
+	app_config config;
 	int err = 0;
 
+	load_config(config_file, &config);
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
-	load_server_ip_config(config_file, state.server_ip);
+	fill_ipv4_string(state.server_ip, config.server_ip_text.c_str());
+	init_grpc_sender(&state.grpc, config);
 
 	state.file = fopen(output_file, "wb");
 	if (!state.file) {
@@ -326,6 +407,7 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
+	grpc_flush(&state.grpc);
 	flush_events(&state);
 	if (state.file)
 		fclose(state.file);

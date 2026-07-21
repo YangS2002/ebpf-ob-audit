@@ -14,3 +14,4 @@ uprobe/test/audit_e2e.conf
 uprobe/test/*.adt
 *.dat
 *.tsv
+*.adt

@@ -9,6 +9,8 @@
 ```
 git submodule update --init --recursive
 docker build -f dev.dockerfile -t ebpf-ob-audit-dev .
+# gRPC 构建依赖已包含：protobuf-compiler protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev。
+# 进入容器后可执行：make -C uprobe grpc
 # OB4.2.5.5 源码编译版
 docker run -it --privileged   --pid=host  \
  -v "$PWD":/root \
@@ -32,8 +34,11 @@ docker run -it --privileged   --pid=host  \
 # 构建官方demo
 make build
 ./src/bootstra
-# 构建uprobe探针
+# 构建uprobe探针和消费者程序
 make -C uprobe
+./uprobe/bin/audit_collector 0.0.0.0:50051 collector_events.adt
+# 配置 uprobe/uprobe.conf: collector_addr=127.0.0.1:50051
+./uprobe/bin/uprobe /home/yangshuo17/observer/bin/observer 0x000000000bf18950 out.adt /home/yangshuo17/ebpf-ob-audit/uprobe/uprobe.conf
 ./uprobe/uprobe target_proc_path target_func_offset
 pidof observer # 查找进程id
 readlink -f /proc/972084/exe # 读取可执行文件位置
@@ -41,7 +46,7 @@ readlink -f /proc/972084/exe # 读取可执行文件位置
 readelf -Ws /home/yangshuo17/obd_obtest/observer1/bin/observer | c++filt | grep 'ObMySQLRequestManager::record_request'
 # 例如
 ./uprobe/bin/uprobe /home/yangshuo17/obd_obtest/observer1/bin/observer 0x000000000a7bae60
-./uprobe/bin/uprobe /home/yangshuo17/observer/bin/observer  0x000000000bf18950
+./uprobe/bin/uprobe /home/yangshuo17/observer/bin/observer  0x000000000bf18950 out.adt /home/yangshuo17/ebpf-ob-audit/uprobe/uprobe.conf
 ```
 
 4. 构建运行环境
