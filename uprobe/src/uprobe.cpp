@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -38,6 +39,7 @@ struct app_config {
 	std::string server_ip_text;
 	std::string collector_addr;
 	unsigned int grpc_batch_bytes = 0;
+	unsigned int grpc_timeout_ms = 0;
 };
 
 struct grpc_sender {
@@ -45,11 +47,13 @@ struct grpc_sender {
 	std::string agent_id;
 	std::string server_ip;
 	unsigned int batch_bytes = 0;
+	unsigned int timeout_ms = 0;
 	std::vector<char> buffer;
 	unsigned long long records = 0;
 	unsigned long long sent_batches = 0;
 	unsigned long long sent_records = 0;
 	unsigned long long sent_bytes = 0;
+	std::shared_ptr<grpc::Channel> channel;
 	std::unique_ptr<audit::AuditCollector::Stub> stub;
 };
 
@@ -156,6 +160,8 @@ static bool load_config(const char *path, app_config *config)
 			config->collector_addr = value;
 		else if (key == "grpc_batch_bytes")
 			config->grpc_batch_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
+		else if (key == "grpc_timeout_ms")
+			config->grpc_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 	}
 	fclose(file);
 	return true;
@@ -175,6 +181,8 @@ static int grpc_flush(grpc_sender *sender)
 
 	audit::UploadReply reply;
 	grpc::ClientContext context;
+	if (sender->timeout_ms > 0)
+		context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(sender->timeout_ms));
 	grpc::Status status = sender->stub->Upload(&context, batch, &reply);
 	if (!status.ok() || !reply.ok()) {
 		fprintf(stderr, "grpc upload failed: %s %s\n", status.error_message().c_str(), reply.message().c_str());
@@ -207,7 +215,31 @@ static void init_grpc_sender(grpc_sender *sender, const app_config &config)
 	sender->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
 	sender->server_ip = config.server_ip_text;
 	sender->batch_bytes = config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144;
-	sender->stub = audit::AuditCollector::NewStub(grpc::CreateChannel(config.collector_addr, grpc::InsecureChannelCredentials()));
+	sender->timeout_ms = config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000;
+	sender->channel = grpc::CreateChannel(config.collector_addr, grpc::InsecureChannelCredentials());
+	sender->stub = audit::AuditCollector::NewStub(sender->channel);
+}
+
+static void print_startup_status(const char *target, unsigned long long offset, const char *output_file,
+					 const char *config_file, const app_config &config, const writer_state &state)
+{
+	printf("uprobe config=%s target=%s offset=0x%llx output=%s\n", config_file, target, offset, output_file);
+	printf("agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u\n",
+	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
+	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
+	       config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144,
+	       config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000);
+	if (!state.grpc.enabled) {
+		printf("grpc upload disabled: collector_addr is empty\n");
+		return;
+	}
+
+	printf("grpc collector target=%s connecting...\n", config.collector_addr.c_str());
+	bool ready = state.grpc.channel->WaitForConnected(
+		std::chrono::system_clock::now() + std::chrono::milliseconds(config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000));
+	printf("grpc collector target=%s state=%s\n", config.collector_addr.c_str(), ready ? "READY" : "NOT_READY");
+	if (!ready)
+		fprintf(stderr, "grpc collector not ready now; events will still be captured locally, upload attempts use timeout.\n");
 }
 
 static int append_event(writer_state *state, const event &e)
@@ -355,6 +387,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state.server_ip, config.server_ip_text.c_str());
 	init_grpc_sender(&state.grpc, config);
+	print_startup_status(target, offset, output_file, config_file, config, state);
 
 	state.file = fopen(output_file, "wb");
 	if (!state.file) {
