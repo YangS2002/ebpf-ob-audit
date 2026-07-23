@@ -15,3 +15,6 @@ uprobe/test/*.adt
 *.dat
 *.tsv
 *.adt
+uprobe/.*
+*.pyc
+compare_report.txt
