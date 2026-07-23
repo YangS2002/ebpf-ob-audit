@@ -81,7 +81,8 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None, dry_run: bool = False, c
     if dry_run:
         print(f"DRY-RUN {printable}")
         return CmdResult(True, 0)
-    print(f"RUN {printable}")
+    if not capture:
+        print(f"RUN {printable}")
     if capture:
         result = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
         return CmdResult(result.returncode == 0, result.returncode, result.stdout.strip(), result.stderr.strip())
@@ -420,7 +421,7 @@ def start_node(config: DeployConfig, node: Node, dry_run: bool) -> NodeResult:
         f"if grep -q 'uprobe attach success' logs/uprobe.log 2>/dev/null; then attach=ok; "
         f"elif grep -q 'Failed to attach\|Failed to open\|Invalid offset' logs/uprobe.log 2>/dev/null; then attach=fail; "
         f"else attach=unknown; fi; "
-        f"printf 'state=%s running=%s pids=%s attach=%s\\n' \"$state\" \"$running\" \"$pids\" \"$attach\"; "
+        f"printf 'state=%s running=%s attach=%s\\n' \"$state\" \"$running\" \"$attach\"; "
         f"if [ \"$running\" != yes ]; then echo log_tail:; tail -n 30 logs/uprobe.log 2>/dev/null || true; exit 1; fi"
     )
     result = remote(config, node, cmd, dry_run=dry_run, capture=True)
@@ -444,7 +445,7 @@ def stop_node(config: DeployConfig, node: Node, dry_run: bool) -> NodeResult:
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -n \"$left\" ]; then {sudo_kill} kill -9 $left; fi; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
-        f"if [ -n \"$left\" ]; then echo state=failed pids=$left; exit 1; else echo state=stopped; fi"
+        f"if [ -n \"$left\" ]; then echo state=failed; exit 1; else echo state=stopped; fi"
     )
     result = remote(config, node, cmd, dry_run=dry_run, capture=True)
     if not result.ok:
@@ -471,8 +472,8 @@ def status_node(config: DeployConfig, node: Node, dry_run: bool) -> NodeResult:
         f"grpc=unknown; "
         f"if grep -q 'grpc collector target=.*state=READY' {quote_arg(node.deploy_home)}/logs/uprobe.log 2>/dev/null; then grpc=ready; fi; "
         f"if grep -q 'grpc upload failed' {quote_arg(node.deploy_home)}/logs/uprobe.log 2>/dev/null; then grpc=upload_failed; fi; "
-        f"{tcp_check}; "
-        f"printf 'deploy=%s running=%s pids=%s attach=%s grpc=%s ' \"$deploy\" \"$running\" \"$pids\" \"$attach\" \"$grpc\""
+        f"tcp=$({tcp_check}); "
+        f"printf 'deploy=%s running=%s attach=%s grpc=%s %s' \"$deploy\" \"$running\" \"$attach\" \"$grpc\" \"$tcp\""
     )
     result = remote(config, node, cmd, dry_run=dry_run, capture=True)
     if not result.ok:

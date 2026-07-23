@@ -16,3 +16,5 @@ uprobe/test/*.adt
 *.tsv
 *.adt
 uprobe/.deploy_output
+*.pyc
+uprobe/test/distributed_sql_test/out
