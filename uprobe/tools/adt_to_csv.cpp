@@ -260,7 +260,26 @@ DEFINE_I64_FIELD_WRITER(write_query_sql_len, query_sql_len)
 DEFINE_I64_FIELD_WRITER(write_params_value_len, params_value_len)
 DEFINE_I32_FIELD_WRITER(write_stmt_type, stmt_type)
 DEFINE_I32_FIELD_WRITER(write_plan_type, plan_type)
-DEFINE_I32_FIELD_WRITER(write_trans_status, trans_status)
+
+static const char *trans_status_to_ob_sql_audit_string(int trans_status)
+{
+	switch (trans_status) {
+	case 1:
+		return "Transaction not opened";
+	case 2:
+		return "Enable implicit transactions";
+	case 3:
+		return "Enable committable transaction";
+	default:
+		return "Unknown status";
+	}
+}
+
+static void write_trans_status(FILE *out, const event &e)
+{
+	write_csv_string(out, trans_status_to_ob_sql_audit_string(e.trans_status));
+}
+
 DEFINE_U32_FIELD_WRITER(write_fragment_flags, fragment_flags)
 DEFINE_U32_FIELD_WRITER(write_next_fragment_field, next_fragment_field)
 
@@ -276,7 +295,7 @@ static void write_plan_type_name(FILE *out, const event &e)
 
 static void write_trans_status_name(FILE *out, const event &e)
 {
-	write_csv_string(out, trans_status_to_string(e.trans_status));
+	write_csv_string(out, trans_status_to_ob_sql_audit_string(e.trans_status));
 }
 
 static void write_user_name(FILE *out, const event &e)
@@ -356,8 +375,8 @@ static const CsvField CSV_FIELDS[] = {
 	{"execute_time", write_execute_time},
 	{"query_sql_len", write_query_sql_len},
 	{"params_value_len", write_params_value_len},
-	{"stmt_type", write_stmt_type},
-	{"stmt_type_name", write_stmt_type_name},
+	{"stmt_type_value", write_stmt_type},
+	{"stmt_type", write_stmt_type_name},
 	{"plan_type", write_plan_type},
 	{"plan_type_name", write_plan_type_name},
 	{"trans_status", write_trans_status},

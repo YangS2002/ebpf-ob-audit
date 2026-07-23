@@ -1,0 +1,6 @@
+# Optional dependency for full YAML support.
+# deploy_agent.py has a built-in parser for the OBD-like subset used by mini-3node.yaml.
+PyYAML>=6.0
+
+# System dependency when user.password is configured:
+#   Debian/Ubuntu: sudo apt-get install sshpass

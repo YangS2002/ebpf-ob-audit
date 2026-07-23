@@ -67,9 +67,9 @@ CREATE TABLE ebpf_audit_dist_test.dist_unique_case (
   id BIGINT NOT NULL,
   uk BIGINT NOT NULL,
   c VARCHAR(120) NOT NULL,
-  PRIMARY KEY (id),
+  PRIMARY KEY (id, uk),
   UNIQUE KEY uk_dist_unique_case (uk)
-) PARTITION BY HASH(id) PARTITIONS 16;
+) PARTITION BY HASH(uk) PARTITIONS 16;
 
 INSERT INTO ebpf_audit_dist_test.dist_customer (customer_id, tenant_key, name, city, status) VALUES
   (1, 10, 'dist_customer_1', 'hangzhou', 1),

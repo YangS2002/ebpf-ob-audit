@@ -322,6 +322,7 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	state->consumed_bytes += fragment->total_size;
 
 	if (fragment->next_fragment_seq != 0 && (fragment->record_flags & AUDIT_RECORD_FLAG_LAST_FRAGMENT) == 0)
+		// 非最后一个分片，等待后续分片
 		return 0;
 
 	event merged = {};
