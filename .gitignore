@@ -18,3 +18,4 @@ uprobe/test/*.adt
 uprobe/.deploy_output
 *.pyc
 uprobe/test/distributed_sql_test/out
+uprobe/test/ring_buffer_test/test_ring_buffer
