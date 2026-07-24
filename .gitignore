@@ -14,3 +14,8 @@ uprobe/test/audit_e2e.conf
 uprobe/test/*.adt
 *.dat
 *.tsv
+*.adt
+uprobe/.deploy_output
+*.pyc
+uprobe/test/distributed_sql_test/out
+uprobe/test/ring_buffer_test
