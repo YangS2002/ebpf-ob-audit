@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package etcdserverpb;
+
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Range(RangeRequest) returns (RangeResponse);
+}
+
+service Lease {
+  rpc LeaseGrant(LeaseGrantRequest) returns (LeaseGrantResponse);
+  rpc LeaseRevoke(LeaseRevokeRequest) returns (LeaseRevokeResponse);
+  rpc LeaseKeepAlive(stream LeaseKeepAliveRequest) returns (stream LeaseKeepAliveResponse);
+}
+
+message ResponseHeader {
+  uint64 cluster_id = 1;
+  uint64 member_id = 2;
+  int64 revision = 3;
+  uint64 raft_term = 4;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  int64 lease = 3;
+  bool prev_kv = 4;
+  bool ignore_value = 5;
+  bool ignore_lease = 6;
+}
+
+message PutResponse {
+  ResponseHeader header = 1;
+}
+
+message RangeRequest {
+  bytes key = 1;
+  bytes range_end = 2;
+  int64 limit = 3;
+}
+
+message KeyValue {
+  bytes key = 1;
+  int64 create_revision = 2;
+  int64 mod_revision = 3;
+  int64 version = 4;
+  bytes value = 5;
+  int64 lease = 6;
+}
+
+message RangeResponse {
+  ResponseHeader header = 1;
+  repeated KeyValue kvs = 2;
+  bool more = 3;
+  int64 count = 4;
+}
+
+message LeaseGrantRequest {
+  int64 TTL = 1;
+  int64 ID = 2;
+}
+
+message LeaseGrantResponse {
+  ResponseHeader header = 1;
+  int64 ID = 2;
+  int64 TTL = 3;
+  string error = 4;
+}
+
+message LeaseRevokeRequest {
+  int64 ID = 1;
+}
+
+message LeaseRevokeResponse {
+  ResponseHeader header = 1;
+}
+
+message LeaseKeepAliveRequest {
+  int64 ID = 1;
+}
+
+message LeaseKeepAliveResponse {
+  ResponseHeader header = 1;
+  int64 ID = 2;
+  int64 TTL = 3;
+}

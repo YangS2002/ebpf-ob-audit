@@ -5,17 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <chrono>
-#include <memory>
 #include <string>
-#include <unordered_map>
-#include <vector>
-
-#include <grpcpp/grpcpp.h>
-#include "audit_upload.grpc.pb.h"
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
 extern "C" {
@@ -24,48 +18,36 @@ extern "C" {
 }
 
 #include "uprobe.h"
+#include "audit_grpc_sender.h"
+#include "ring_buffer/ring_buffer.h"
+
+// pending 环形缓冲区容量。单条合并事件最大约 128KB(sql + params 各 64KB)。
+#define PENDING_RINGBUF_SIZE (16 * 1024 * 1024)
 
 static volatile bool exiting = false;
-
-struct pending_event {
-	event main = {};
-	std::string query_sql;
-	std::string params_value;
-	bool has_last_fragment = false;
-};
 
 struct app_config {
 	std::string agent_id;
 	std::string server_ip_text;
 	std::string collector_addr;
+	std::string collector_discovery_etcd_endpoints;
+	std::string collector_discovery_service_name;
+	std::string collector_discovery_selection_policy;
+	bool collector_discovery = false;
 	unsigned int grpc_batch_bytes = 0;
 	unsigned int grpc_timeout_ms = 0;
-};
-
-struct grpc_sender {
-	bool enabled = false;
-	std::string agent_id;
-	std::string server_ip;
-	unsigned int batch_bytes = 0;
-	unsigned int timeout_ms = 0;
-	std::vector<char> buffer;
-	unsigned long long records = 0;
-	unsigned long long sent_batches = 0;
-	unsigned long long sent_records = 0;
-	unsigned long long sent_bytes = 0;
-	std::shared_ptr<grpc::Channel> channel;
-	std::unique_ptr<audit::AuditCollector::Stub> stub;
+	unsigned long long grpc_queue_bytes = 0;
+	unsigned int grpc_retry_initial_ms = 0;
+	unsigned int grpc_retry_max_ms = 0;
 };
 
 struct writer_state {
-	FILE *file = nullptr;
-	std::vector<char> buffer;
-	std::unordered_map<unsigned long long, pending_event> pending;
+	VarlenRingBuffer<unsigned long long> pending{PENDING_RINGBUF_SIZE};
 	unsigned long long consumed_events = 0;
 	unsigned long long consumed_bytes = 0;
-	unsigned long long written_bytes = 0;
+	unsigned long long dropped_events = 0;
 	char server_ip[MAX_IP_LEN] = {};
-	grpc_sender grpc;
+	AuditGrpcSender grpc;
 };
 
 static void handle_signal(int)
@@ -73,36 +55,6 @@ static void handle_signal(int)
 	exiting = true;
 }
 
-static int flush_events(writer_state *state)
-{
-	if (state->buffer.empty())
-		return 0;
-
-	size_t written = fwrite(state->buffer.data(), 1, state->buffer.size(), state->file);
-	if (written != state->buffer.size()) {
-		fprintf(stderr, "Failed to write event data: %s\n", strerror(errno));
-		return -1;
-	}
-	state->written_bytes += written;
-	state->buffer.clear();
-	return 0;
-}
-
-static int write_file_header(FILE *file)
-{
-	audit_file_header header = {};
-	memcpy(header.magic, AUDIT_FILE_MAGIC, sizeof(AUDIT_FILE_MAGIC));
-	header.version = AUDIT_FILE_VERSION;
-	header.header_size = sizeof(header);
-	header.event_size = sizeof(event);
-
-	if (fwrite(&header, sizeof(header), 1, file) != 1) {
-		fprintf(stderr, "Failed to write file header: %s\n", strerror(errno));
-		return -1;
-	}
-	return 0;
-}
-   
 static void fill_ob_addr_ipv4(char *dst, const void *addr)
 {
 	int version = 4;
@@ -158,119 +110,116 @@ static bool load_config(const char *path, app_config *config)
 			config->agent_id = value;
 		else if (key == "collector_addr")
 			config->collector_addr = value;
+		else if (key == "collector_discovery_enabled")
+			config->collector_discovery = value == "true" || value == "1" || value == "yes";
+		else if (key == "collector_discovery_etcd_endpoints")
+			config->collector_discovery_etcd_endpoints = value;
+		else if (key == "collector_discovery_service_name")
+			config->collector_discovery_service_name = value;
+		else if (key == "collector_discovery_selection_policy")
+			config->collector_discovery_selection_policy = value;
 		else if (key == "grpc_batch_bytes")
 			config->grpc_batch_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 		else if (key == "grpc_timeout_ms")
 			config->grpc_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
+		else if (key == "grpc_queue_bytes")
+			config->grpc_queue_bytes = strtoull(value.c_str(), nullptr, 10);
+		else if (key == "grpc_retry_initial_ms")
+			config->grpc_retry_initial_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
+		else if (key == "grpc_retry_max_ms")
+			config->grpc_retry_max_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 	}
 	fclose(file);
 	return true;
 }
 
-static int grpc_flush(grpc_sender *sender)
+static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 {
-	if (!sender->enabled || sender->buffer.empty())
-		return 0;
-	audit::AuditBatch batch;
-	batch.set_agent_id(sender->agent_id);
-	batch.set_server_ip(sender->server_ip);
-	batch.set_file_version(AUDIT_FILE_VERSION);
-	batch.set_event_size(sizeof(event));
-	batch.set_record_count(sender->records);
-	batch.set_records(sender->buffer.data(), sender->buffer.size());
-
-	audit::UploadReply reply;
-	grpc::ClientContext context;
-	if (sender->timeout_ms > 0)
-		context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(sender->timeout_ms));
-	grpc::Status status = sender->stub->Upload(&context, batch, &reply);
-	if (!status.ok() || !reply.ok()) {
-		fprintf(stderr, "grpc upload failed: %s %s\n", status.error_message().c_str(), reply.message().c_str());
-		return -1;
+	audit_grpc_config grpc_config;
+	grpc_config.agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	grpc_config.server_ip = config.server_ip_text;
+	grpc_config.collector_addr = config.collector_addr;
+	grpc_config.file_version = AUDIT_FILE_VERSION;
+	grpc_config.event_size = sizeof(event);
+	grpc_config.batch_bytes = config.grpc_batch_bytes;
+	grpc_config.timeout_ms = config.grpc_timeout_ms;
+	grpc_config.queue_bytes = config.grpc_queue_bytes;
+	grpc_config.retry_initial_ms = config.grpc_retry_initial_ms;
+	grpc_config.retry_max_ms = config.grpc_retry_max_ms;
+	if (config.collector_discovery && !config.collector_discovery_etcd_endpoints.empty()) {
+		std::unique_ptr<CollectorResolver> resolver(new EtcdCollectorResolver(
+			config.collector_discovery_etcd_endpoints,
+			config.collector_discovery_service_name.empty() ? "audit-collector" : config.collector_discovery_service_name,
+			grpc_config.agent_id,
+			config.collector_discovery_selection_policy.empty() ? "first" : config.collector_discovery_selection_policy));
+		sender->start(grpc_config, std::move(resolver));
+		return;
 	}
-	sender->sent_batches++;
-	sender->sent_records += sender->records;
-	sender->sent_bytes += sender->buffer.size();
-	sender->buffer.clear();
-	sender->records = 0;
-	return 0;
+	sender->start(grpc_config);
 }
 
-static void grpc_append(grpc_sender *sender, const event &e)
-{
-	if (!sender->enabled)
-		return;
-	const char *raw = reinterpret_cast<const char *>(&e);
-	sender->buffer.insert(sender->buffer.end(), raw, raw + e.total_size);
-	sender->records++;
-	if (sender->batch_bytes > 0 && sender->buffer.size() >= sender->batch_bytes)
-		grpc_flush(sender);
-}
-
-static void init_grpc_sender(grpc_sender *sender, const app_config &config)
-{
-	if (config.collector_addr.empty())
-		return;
-	sender->enabled = true;
-	sender->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
-	sender->server_ip = config.server_ip_text;
-	sender->batch_bytes = config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144;
-	sender->timeout_ms = config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000;
-	sender->channel = grpc::CreateChannel(config.collector_addr, grpc::InsecureChannelCredentials());
-	sender->stub = audit::AuditCollector::NewStub(sender->channel);
-}
-
-static void print_startup_status(const char *target, unsigned long long offset, const char *output_file,
+static void print_startup_status(const char *target, unsigned long long offset,
 					 const char *config_file, const app_config &config, const writer_state &state)
 {
-	printf("uprobe config=%s target=%s offset=0x%llx output=%s\n", config_file, target, offset, output_file);
-	printf("agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u\n",
+	printf("uprobe config=%s target=%s offset=0x%llx\n", config_file, target, offset);
+	printf("agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s\n",
 	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144,
-	       config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000);
-	if (!state.grpc.enabled) {
-		printf("grpc upload disabled: collector_addr is empty\n");
+	       config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000,
+	       config.grpc_queue_bytes ? config.grpc_queue_bytes : 64ULL * 1024 * 1024,
+	       config.collector_discovery ? "true" : "false");
+	if (!state.grpc.enabled()) {
+		printf("grpc upload disabled: no collector available\n");
 		return;
 	}
 
-	printf("grpc collector target=%s connecting...\n", config.collector_addr.c_str());
-	bool ready = state.grpc.channel->WaitForConnected(
-		std::chrono::system_clock::now() + std::chrono::milliseconds(config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000));
-	printf("grpc collector target=%s state=%s\n", config.collector_addr.c_str(), ready ? "READY" : "NOT_READY");
+	printf("grpc collector discovery=%s target=%s connecting...\n",
+	       config.collector_discovery ? "etcd" : "static", config.collector_addr.c_str());
+	bool ready = state.grpc.wait_ready(config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000);
+	printf("grpc collector state=%s\n", ready ? "READY" : "NOT_READY");
 	if (!ready)
 		fprintf(stderr, "grpc collector not ready now; events will still be captured locally, upload attempts use timeout.\n");
 }
 
+static unsigned int clamp_capture(unsigned int len, unsigned int max_len)
+{
+	return len > max_len ? max_len : len;
+}
+
+static unsigned int event_names_len(const event *e)
+{
+	return e->user_name_len + e->proxy_user_name_len + e->tenant_name_len + e->db_name_len;
+}
+
+// 变长落地：所有数据经 grpc 发送，不写盘。
+static int emit_record(writer_state *state, const char *data, size_t size)
+{
+	if (!state->grpc.submit(data, size)) {
+		state->dropped_events++;
+		return 0;
+	}
+	state->consumed_events++;
+	state->consumed_bytes += size;
+	return 0;
+}
+
+// 未分片小事件：值拷贝一份填 server_ip 再发。
 static int append_event(writer_state *state, const event &e)
 {
 	if (!event_compact_size_valid(&e))
 		return 0;
 	event out = e;
 	std::memcpy(out.server_ip, state->server_ip, sizeof(out.server_ip));
-	const char *raw = reinterpret_cast<const char *>(&out);
-	state->buffer.insert(state->buffer.end(), raw, raw + out.total_size);
-	grpc_append(&state->grpc, out);
-	state->consumed_events++;
-	state->consumed_bytes += out.total_size;
-	if (state->buffer.size() >= AUDIT_FLUSH_THRESHOLD && flush_events(state) < 0)
-		return -1;
-	return 0;
+	return emit_record(state, reinterpret_cast<const char *>(&out), out.total_size);
 }
 
-static bool build_merged_event(pending_event *pending, event *out)
+// 合并完成的变长事件：段可写，直接在段头填 server_ip 再发。
+static int append_merged(writer_state *state, char *seg, size_t size)
 {
-	*out = pending->main;
-	unsigned int names_len = out->user_name_len + out->proxy_user_name_len + out->tenant_name_len + out->db_name_len;
-	if (names_len + pending->query_sql.size() + pending->params_value.size() > AUDIT_EVENT_PAYLOAD_SIZE)
-		return false;
-	std::memcpy(out->payload + names_len, pending->query_sql.data(), pending->query_sql.size());
-	std::memcpy(out->payload + names_len + pending->query_sql.size(), pending->params_value.data(), pending->params_value.size());
-	out->query_sql_payload_len = pending->query_sql.size();
-	out->params_value_payload_len = pending->params_value.size();
-	out->record_flags |= AUDIT_RECORD_FLAG_LOGICAL_COMPLETE;
-	out->total_size = event_payload_offset() + names_len + out->query_sql_payload_len + out->params_value_payload_len;
-	return true;
+	event *hdr = reinterpret_cast<event *>(seg);
+	std::memcpy(hdr->server_ip, state->server_ip, sizeof(hdr->server_ip));
+	return emit_record(state, seg, size);
 }
 
 static int handle_main_event(writer_state *state, const event *e)
@@ -280,13 +229,33 @@ static int handle_main_event(writer_state *state, const event *e)
 	if ((e->fragment_flags & (FRAG_QUERY_SQL_FRAGMENTED | FRAG_PARAMS_VALUE_FRAGMENTED)) == 0)
 		return append_event(state, *e);
 
-	pending_event pending;
-	pending.main = *e;
-	pending.query_sql.assign(event_query_sql(e), e->query_sql_payload_len);
-	pending.params_value.assign(event_params_value(e), e->params_value_payload_len);
-	state->pending[e->event_seq] = std::move(pending);
-	state->consumed_events++;
-	state->consumed_bytes += e->total_size;
+	// 分片事件：按完整长度在 pending 环形缓冲区预分配整段。
+	// 未分片字段用其首片长，分片字段用捕获上限 clamp 后的完整长。
+	unsigned int names_len = event_names_len(e);
+	unsigned int full_sql = (e->fragment_flags & FRAG_QUERY_SQL_FRAGMENTED)
+					? clamp_capture(e->query_sql_len, AUDIT_SQL_CAPTURE_MAX)
+					: e->query_sql_payload_len;
+	unsigned int full_params = (e->fragment_flags & FRAG_PARAMS_VALUE_FRAGMENTED)
+					   ? clamp_capture(e->params_value_len, AUDIT_PARAMS_CAPTURE_MAX)
+					   : e->params_value_payload_len;
+	unsigned int payoff = event_payload_offset();
+	size_t total = (size_t)payoff + names_len + full_sql + full_params;
+
+	char *seg = static_cast<char *>(state->pending.allocate(e->event_seq, total));
+	if (!seg) {
+		// 空间不足：整条记录从首片起丢弃，后续分片找不到父 seq 也会被丢。
+		state->dropped_events++;
+		return 0;
+	}
+
+	// 段布局：[event 头][names][完整 query_sql][完整 params_value]。
+	// main 里两字段首片按最终 layout 落位，params 首片跳到完整 sql 之后。
+	state->pending.fill(e->event_seq, 0, e, payoff);
+	state->pending.fill(e->event_seq, payoff, e->payload, names_len);
+	state->pending.fill(e->event_seq, (size_t)payoff + names_len,
+			    event_query_sql(e), e->query_sql_payload_len);
+	state->pending.fill(e->event_seq, (size_t)payoff + names_len + full_sql,
+			    event_params_value(e), e->params_value_payload_len);
 	return 0;
 }
 
@@ -301,35 +270,51 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	if (audit_fragment_payload_offset() + fragment->payload_len != fragment->total_size)
 		return 0;
 
-	auto it = state->pending.find(fragment->parent_event_seq);
-	if (it == state->pending.end())
+	// 找不到父 seq：首片(main)已被丢弃，整条记录从首片起就没进缓冲区，丢弃该分片。
+	char *seg = static_cast<char *>(state->pending.find(fragment->parent_event_seq));
+	if (!seg)
 		return 0;
 
-	std::string *target = nullptr;
+	event *hdr = reinterpret_cast<event *>(seg);
+	unsigned int payoff = event_payload_offset();
+	unsigned int names_len = event_names_len(hdr);
+	unsigned int full_sql = (hdr->fragment_flags & FRAG_QUERY_SQL_FRAGMENTED)
+					? clamp_capture(hdr->query_sql_len, AUDIT_SQL_CAPTURE_MAX)
+					: hdr->query_sql_payload_len;
+
+	// 段内绝对 offset = 字段基址 + 分片自带的 fragment_offset(即该字段已填游标)。
+	size_t base;
 	if (fragment->field == FRAG_FIELD_QUERY_SQL)
-		target = &it->second.query_sql;
+		base = (size_t)payoff + names_len;
 	else if (fragment->field == FRAG_FIELD_PARAMS_VALUE)
-		target = &it->second.params_value;
+		base = (size_t)payoff + names_len + full_sql;
 	else
 		return 0;
-	if (fragment->fragment_offset > target->size())
-		target->resize(fragment->fragment_offset);
-	if (fragment->fragment_offset + fragment->payload_len > target->size())
-		target->resize(fragment->fragment_offset + fragment->payload_len);
-	if (fragment->payload_len != 0)
-		std::memcpy(&(*target)[fragment->fragment_offset], fragment->payload, fragment->payload_len);
-	state->consumed_events++;
-	state->consumed_bytes += fragment->total_size;
+
+	// 段已按完整长度预分配，fill 必然落在段内；越界说明数据异常，丢弃整条。
+	if (!state->pending.fill(fragment->parent_event_seq, base + fragment->fragment_offset,
+				 fragment->payload, fragment->payload_len)) {
+		state->pending.erase(fragment->parent_event_seq);
+		state->dropped_events++;
+		return 0;
+	}
 
 	if (fragment->next_fragment_seq != 0 && (fragment->record_flags & AUDIT_RECORD_FLAG_LAST_FRAGMENT) == 0)
 		// 非最后一个分片，等待后续分片
 		return 0;
 
-	event merged = {};
-	if (!build_merged_event(&it->second, &merged))
-		return 0;
-	state->pending.erase(it);
-	return append_event(state, merged);
+	// 尾片到达且记录完整：补齐段头，进发送队列，释放段。
+	unsigned int full_params = (hdr->fragment_flags & FRAG_PARAMS_VALUE_FRAGMENTED)
+					   ? clamp_capture(hdr->params_value_len, AUDIT_PARAMS_CAPTURE_MAX)
+					   : hdr->params_value_payload_len;
+	hdr->query_sql_payload_len = full_sql;
+	hdr->params_value_payload_len = full_params;
+	hdr->record_flags |= AUDIT_RECORD_FLAG_LOGICAL_COMPLETE;
+	size_t total = (size_t)payoff + names_len + full_sql + full_params;
+	hdr->total_size = (unsigned int)total;
+	int ret = append_merged(state, seg, total);
+	state->pending.erase(fragment->parent_event_seq);
+	return ret;
 }
 
 // ringbuf 回调：BPF 程序每提交一条 SQL 审计事件，用户态在这里消费。
@@ -368,14 +353,14 @@ static unsigned long long parse_offset(const char *arg)
 int main(int argc, char **argv)
 {
 	if (argc < 3 || argc > 5) {
-		fprintf(stderr, "Usage: %s <target-path> <offset> [output-file] [config-file]\n", argv[0]);
+		fprintf(stderr, "Usage: %s <target-path> <offset> [config-file]\n", argv[0]);
+		fprintf(stderr, "       %s <target-path> <offset> <ignored-output-file> <config-file>\n", argv[0]);
 		return 1;
 	}
 
 	const char *target = argv[1];
 	unsigned long long offset = parse_offset(argv[2]);
-	const char *output_file = argc >= 4 ? argv[3] : "audit_events.dat";
-	const char *config_file = argc == 5 ? argv[4] : "uprobe.conf";
+	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "uprobe.conf");
 	uprobe_bpf *skel = nullptr;
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
@@ -388,18 +373,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state.server_ip, config.server_ip_text.c_str());
 	init_grpc_sender(&state.grpc, config);
-	print_startup_status(target, offset, output_file, config_file, config, state);
-
-	state.file = fopen(output_file, "wb");
-	if (!state.file) {
-		fprintf(stderr, "Failed to open output file %s: %s\n", output_file, strerror(errno));
-		return 1;
-	}
-	state.buffer.reserve(AUDIT_FLUSH_THRESHOLD + sizeof(event));
-	if (write_file_header(state.file) < 0) {
-		err = 1;
-		goto cleanup;
-	}
+	print_startup_status(target, offset, config_file, config, state);
 
 	// 打开、加载并通过 verifier 校验 BPF 程序。
 	skel = uprobe_bpf__open_and_load();
@@ -425,7 +399,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	printf("uprobe attach success: %s+0x%llx output=%s\n", target, offset, output_file);
+	printf("uprobe attach success: %s+0x%llx\n", target, offset);
 
 	while (!exiting) {
 		// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
@@ -441,10 +415,7 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
-	grpc_flush(&state.grpc);
-	flush_events(&state);
-	if (state.file)
-		fclose(state.file);
+	state.grpc.stop();
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);

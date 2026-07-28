@@ -405,8 +405,17 @@ def main():
 
     result = compare(workload_sqls, official_rows, collector_rows, out_dir / "compare_report.txt", args.max_print)
 
+    fail_count = (len(result["collector_missing"]) + len(result["duplicate_collector"]) +
+                  len(result["official_missing"]) + len(result["duplicate_official"]) +
+                  len(result["mismatches"]))
     print(color("cyan", ""))
-    print(color("cyan", f"SUMMARY workload_sql={len(workload_sqls)} pass={result['pass']}"))
+    print(color("cyan", f"SUMMARY workload_sql={len(workload_sqls)} pass={result['pass']} fail={fail_count} "
+                        f"collector_missing={len(result['collector_missing'])} "
+                        f"duplicate_collector={len(result['duplicate_collector'])} "
+                        f"official_missing={len(result['official_missing'])} "
+                        f"duplicate_official={len(result['duplicate_official'])} "
+                        f"mismatches={len(result['mismatches'])}"))
+    print(color("cyan", f"REPORT {out_dir / 'compare_report.txt'}"))
     print(color("cyan", f"collector_missing={len(result['collector_missing'])}"))
     for sql in result["collector_missing"]:
         print(color("red", f"  missing collector: {short_sql(sql)}"))

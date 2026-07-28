@@ -416,11 +416,39 @@ static void write_event_csv(FILE *out, const event &e)
 	fputc('\n', out);
 }
 
-static bool load_events(FILE *file, std::vector<event> *events)
+// 合并后事件为变长，total_size 可超过 sizeof(struct event)，故不能用 read_compact_event。
+static const unsigned int ADT_RECORD_MAX =
+	(unsigned int)sizeof(event) + AUDIT_SQL_CAPTURE_MAX + AUDIT_PARAMS_CAPTURE_MAX;
+
+static bool variable_event_valid(const event *e, unsigned int total_size)
 {
-	event e = {};
-	while (read_compact_event(file, &e))
-		events->push_back(e);
+	if (e->record_type != AUDIT_RECORD_EVENT)
+		return false;
+	if (total_size < event_payload_offset())
+		return false;
+	return event_payload_offset() + event_payload_len(e) == total_size;
+}
+
+// 变长读取：每条记录自带 total_size 头，读入按 total_size 分配的堆缓冲。
+static bool read_variable_event(FILE *file, std::vector<char> *buf)
+{
+	unsigned int total_size = 0;
+	if (fread(&total_size, sizeof(total_size), 1, file) != 1)
+		return false;
+	if (total_size < event_payload_offset() || total_size > ADT_RECORD_MAX)
+		return false;
+	buf->assign(total_size, 0);
+	memcpy(buf->data(), &total_size, sizeof(total_size));
+	if (fread(buf->data() + sizeof(total_size), total_size - sizeof(total_size), 1, file) != 1)
+		return false;
+	return variable_event_valid(reinterpret_cast<const event *>(buf->data()), total_size);
+}
+
+static bool load_events(FILE *file, std::vector<std::vector<char>> *events)
+{
+	std::vector<char> buf;
+	while (read_variable_event(file, &buf))
+		events->push_back(std::move(buf));
 	return !ferror(file);
 }
 
@@ -444,7 +472,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	std::vector<event> events;
+	std::vector<std::vector<char>> events;
 	if (!load_events(input, &events)) {
 		fprintf(stderr, "Failed to read events: %s\n", strerror(errno));
 		fclose(input);
@@ -472,7 +500,7 @@ int main(int argc, char **argv)
 
 	unsigned long long converted = 0;
 	for (unsigned long long i = start; converted < limit && i < total_records; i++) {
-		write_event_csv(output, events[(size_t)i]);
+		write_event_csv(output, *reinterpret_cast<const event *>(events[(size_t)i].data()));
 		converted++;
 	}
 

@@ -100,12 +100,17 @@ $(OUTPUT)/%.o: $(SRC_DIR)/%.cpp $(wildcard $(SRC_DIR)/*.h) $(OUTPUT)/audit_uploa
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $(filter %.cpp,$^) -o $@
 
-$(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(LIBBPF_OBJ) $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o | $(OUTPUT) $(BINDIR)
+$(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(LIBBPF_OBJ) $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(OUTPUT) $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) -lelf -lz -o $@
 
 $(OUTPUT)/audit_upload.pb.cc $(OUTPUT)/audit_upload.pb.h $(OUTPUT)/audit_upload.grpc.pb.cc $(OUTPUT)/audit_upload.grpc.pb.h: proto/audit_upload.proto | $(OUTPUT)
 	$(call msg,PROTO,$<)
+	$(Q)$(PROTOC) -Iproto --cpp_out=$(OUTPUT) --grpc_out=$(OUTPUT) --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
+
+$(OUTPUT)/etcdserverpb/rpc.pb.cc $(OUTPUT)/etcdserverpb/rpc.pb.h $(OUTPUT)/etcdserverpb/rpc.grpc.pb.cc $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h: proto/etcdserverpb/rpc.proto | $(OUTPUT)
+	$(call msg,PROTO,$<)
+	$(Q)mkdir -p $(OUTPUT)/etcdserverpb
 	$(Q)$(PROTOC) -Iproto --cpp_out=$(OUTPUT) --grpc_out=$(OUTPUT) --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $<
 
 $(OUTPUT)/audit_upload.pb.o: $(OUTPUT)/audit_upload.pb.cc $(OUTPUT)/audit_upload.pb.h | $(OUTPUT)
@@ -116,11 +121,27 @@ $(OUTPUT)/audit_upload.grpc.pb.o: $(OUTPUT)/audit_upload.grpc.pb.cc $(OUTPUT)/au
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) -c $< -o $@
 
+$(OUTPUT)/etcdserverpb/rpc.pb.o: $(OUTPUT)/etcdserverpb/rpc.pb.cc $(OUTPUT)/etcdserverpb/rpc.pb.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) -c $< -o $@
+
+$(OUTPUT)/etcdserverpb/rpc.grpc.pb.o: $(OUTPUT)/etcdserverpb/rpc.grpc.pb.cc $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h $(OUTPUT)/etcdserverpb/rpc.pb.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) -c $< -o $@
+
+$(OUTPUT)/collector_registry.o: $(SRC_DIR)/collector_registry.cpp $(SRC_DIR)/collector_registry.h $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $< -o $@
+
+$(OUTPUT)/collector_resolver.o: $(SRC_DIR)/collector_resolver.cpp $(SRC_DIR)/collector_resolver.h $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $< -o $@
+
 $(OUTPUT)/audit_collector.o: collector/audit_collector.cpp $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o | $(BINDIR)
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
 

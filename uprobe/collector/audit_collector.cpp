@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +8,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include "audit_upload.grpc.pb.h"
+#include "collector_registry.h"
 #include "uprobe.h"
 
 class AuditCollectorService final : public audit::AuditCollector::Service {
@@ -67,21 +69,95 @@ private:
 	unsigned long long accepted_bytes_ = 0;
 };
 
+struct collector_app_config {
+	std::string listen_addr = "0.0.0.0:50051";
+	bool registry_enabled = false;
+	collector_registry_config registry;
+};
+
+static std::string trim(std::string value)
+{
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+		value.erase(value.begin());
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+		value.pop_back();
+	return value;
+}
+
+static bool parse_bool(const std::string &value)
+{
+	return value == "true" || value == "1" || value == "yes";
+}
+
+static bool load_config_file(const char *path, collector_app_config *config)
+{
+	FILE *file = fopen(path, "r");
+	if (!file)
+		return false;
+
+	char line[512];
+	while (fgets(line, sizeof(line), file)) {
+		std::string text = trim(line);
+		if (text.empty() || text[0] == '#')
+			continue;
+		size_t pos = text.find('=');
+		if (pos == std::string::npos)
+			continue;
+		std::string key = trim(text.substr(0, pos));
+		std::string value = trim(text.substr(pos + 1));
+		if (key == "collector_listen_addr")
+			config->listen_addr = value;
+		else if (key == "collector_registry_enabled")
+			config->registry_enabled = parse_bool(value);
+		else if (key == "collector_registry_etcd_endpoints")
+			config->registry.etcd_endpoint = value;
+		else if (key == "collector_registry_service_name")
+			config->registry.service_name = value;
+		else if (key == "collector_registry_instance_id")
+			config->registry.collector_id = value;
+		else if (key == "collector_registry_advertise_addr")
+			config->registry.advertise_addr = value;
+		else if (key == "collector_registry_lease_ttl_sec")
+			config->registry.lease_ttl_sec = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+		else if (key == "collector_registry_keepalive_interval_sec")
+			config->registry.keepalive_interval_sec = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+	}
+	fclose(file);
+	return true;
+}
+
+static const char *config_path_from_args(int argc, char **argv)
+{
+	for (int i = 1; i + 1 < argc; i++) {
+		if (strcmp(argv[i], "--config") == 0)
+			return argv[i + 1];
+	}
+	return "uprobe.conf";
+}
+
 int main(int argc, char **argv)
 {
-	const char *listen_addr = argc >= 2 ? argv[1] : "0.0.0.0:50051";
-	const char *output_path = argc >= 3 ? argv[2] : "collector_events.adt";
+	collector_app_config config;
+	const char *config_path = config_path_from_args(argc, argv);
+	load_config_file(config_path, &config);
+	const char *output_path = "collector_events.adt";
 
 	AuditCollectorService service(output_path);
+	CollectorRegistry registry;
+	if (config.registry_enabled && !registry.start(config.registry)) {
+		fprintf(stderr, "collector etcd registration failed; collector will not start\n");
+		return 1;
+	}
 	grpc::ServerBuilder builder;
-	builder.AddListeningPort(listen_addr, grpc::InsecureServerCredentials());
+	builder.AddListeningPort(config.listen_addr, grpc::InsecureServerCredentials());
 	builder.RegisterService(&service);
 	std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
 	if (!server) {
-		fprintf(stderr, "Failed to listen on %s\n", listen_addr);
+		fprintf(stderr, "Failed to listen on %s\n", config.listen_addr.c_str());
 		return 1;
 	}
-	printf("collector listen=%s output=%s\n", listen_addr, output_path);
+	printf("collector listen=%s output=%s config=%s\n", config.listen_addr.c_str(), output_path, config_path);
 	server->Wait();
+	registry.stop();
 	return 0;
 }
