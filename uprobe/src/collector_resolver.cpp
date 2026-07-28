@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
 #include <utility>
 
 #include <grpcpp/grpcpp.h>
@@ -206,5 +207,10 @@ void EtcdCollectorResolver::select_initial_locked()
 {
 	if (collectors_.empty())
 		return;
+	if (policy_ == "hash_agent") {
+		std::hash<std::string> hasher;
+		current_index_ = hasher(agent_id_) % collectors_.size();
+		return;
+	}
 	current_index_ = 0;
 }

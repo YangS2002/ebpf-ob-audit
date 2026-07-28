@@ -127,9 +127,21 @@ static bool upload_batch(AuditGrpcSender::Impl *impl)
 static void flush_with_retry(AuditGrpcSender::Impl *impl)
 {
 	uint32_t delay_ms = impl->config.retry_initial_ms;
-	while (!upload_batch(impl)) {
+	while (true) {
+		{
+			std::lock_guard<std::mutex> lock(impl->mutex);
+			if (impl->stopping) {
+				impl->batch.clear();
+				impl->batch_records = 0;
+				return;
+			}
+		}
+		if (upload_batch(impl))
+			return;
 		std::unique_lock<std::mutex> lock(impl->mutex);
-		impl->cond.wait_for(lock, std::chrono::milliseconds(delay_ms));
+		impl->cond.wait_for(lock, std::chrono::milliseconds(delay_ms), [&] { return impl->stopping; });
+		if (impl->stopping)
+			return;
 		delay_ms = std::min<uint32_t>(delay_ms * 2, impl->config.retry_max_ms);
 	}
 }
@@ -234,6 +246,11 @@ bool AuditGrpcSender::submit(const char *data, size_t size)
 bool AuditGrpcSender::enabled() const
 {
 	return impl_->enabled;
+}
+
+std::string AuditGrpcSender::current_collector() const
+{
+	return impl_->current_addr;
 }
 
 bool AuditGrpcSender::wait_ready(uint32_t timeout_ms) const

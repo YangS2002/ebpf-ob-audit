@@ -46,6 +46,7 @@ public:
 	void stop();
 	bool submit(const char *data, size_t size);
 	bool enabled() const;
+	std::string current_collector() const;
 	bool wait_ready(uint32_t timeout_ms) const;
 	audit_grpc_stats stats() const;
 

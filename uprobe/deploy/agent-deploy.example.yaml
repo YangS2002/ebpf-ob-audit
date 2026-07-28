@@ -21,6 +21,12 @@ agent:
   global:
     deploy_home: /home/yangshuo17/ebpf-ob-audit-agent
     collector_addr: 7.27.43.138:50051
+    collector_discovery_enabled: true
+    collector_discovery_etcd_endpoints: http://7.27.43.139:2379
+    collector_discovery_service_name: audit-collector
+    collector_discovery_watch: true
+    collector_discovery_retry_interval_ms: 3000
+    collector_discovery_selection_policy: hash_agent
     grpc_batch_bytes: 262144
     grpc_timeout_ms: 2000
     # If observer_path is empty, deployer defaults to oceanbase-ce.global.home_path/bin/observer.

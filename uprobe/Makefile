@@ -100,7 +100,7 @@ $(OUTPUT)/%.o: $(SRC_DIR)/%.cpp $(wildcard $(SRC_DIR)/*.h) $(OUTPUT)/audit_uploa
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $(filter %.cpp,$^) -o $@
 
-$(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(LIBBPF_OBJ) $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(OUTPUT) $(BINDIR)
+$(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(OUTPUT)/agent_logger.o $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(LIBBPF_OBJ) $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(OUTPUT) $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) -lelf -lz -o $@
 
@@ -144,6 +144,13 @@ $(OUTPUT)/audit_collector.o: collector/audit_collector.cpp $(OUTPUT)/audit_uploa
 $(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
+
+.PHONY: collector-connection-test
+collector-connection-test: $(BINDIR)/collector_connection_test
+
+$(BINDIR)/collector_connection_test: $(TEST_DIR)/collector_connection_test.cpp $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) $< $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
 
 .PHONY: event-size
 event-size: $(BINDIR)/event_size

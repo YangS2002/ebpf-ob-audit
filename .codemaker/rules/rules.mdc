@@ -1,0 +1,20 @@
+---
+description: AI coding guidance and rules for this repository.
+alwaysApply: true
+---
+<rule>
+# Debug and Bugfix Workflow
+
+When debugging, fixing bugs, or changing code in response to broken behavior, first provide the user with a pre-change analysis before editing any code.
+
+Required order:
+1. State the observed problem.
+2. Explain why the problem happens, based on verified code, logs, or runtime behavior.
+3. Describe the planned fix and which files/functions will be changed.
+4. Only after that, modify code.
+5. After the modification, report what changed and how it was verified.
+
+Do not fix code first and explain the bug afterward. The user must see the bug analysis before code changes.
+
+No extra confirmation is required unless there are multiple risky implementation choices, destructive actions, or missing facts that block diagnosis.
+</rule>

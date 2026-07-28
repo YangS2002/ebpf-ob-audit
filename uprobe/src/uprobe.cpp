@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include "uprobe.h"
+#include "agent_logger.h"
 #include "audit_grpc_sender.h"
 #include "ring_buffer/ring_buffer.h"
 
@@ -161,8 +162,8 @@ static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 static void print_startup_status(const char *target, unsigned long long offset,
 					 const char *config_file, const app_config &config, const writer_state &state)
 {
-	printf("uprobe config=%s target=%s offset=0x%llx\n", config_file, target, offset);
-	printf("agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s\n",
+	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
+	agent_log_info("event=agent_config agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s",
 	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144,
@@ -170,16 +171,20 @@ static void print_startup_status(const char *target, unsigned long long offset,
 	       config.grpc_queue_bytes ? config.grpc_queue_bytes : 64ULL * 1024 * 1024,
 	       config.collector_discovery ? "true" : "false");
 	if (!state.grpc.enabled()) {
-		printf("grpc upload disabled: no collector available\n");
+		agent_log_error("event=collector_disabled reason=no_collector_available");
 		return;
 	}
 
-	printf("grpc collector discovery=%s target=%s connecting...\n",
-	       config.collector_discovery ? "etcd" : "static", config.collector_addr.c_str());
+	std::string current_collector = state.grpc.current_collector();
+	const char *target_addr = current_collector.empty()
+		? (config.collector_discovery ? "<none>" : config.collector_addr.c_str())
+		: current_collector.c_str();
+	agent_log_info("event=collector_connect discovery=%s target=%s",
+	       config.collector_discovery ? "etcd" : "static", target_addr);
 	bool ready = state.grpc.wait_ready(config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000);
-	printf("grpc collector state=%s\n", ready ? "READY" : "NOT_READY");
+	agent_log_info("event=collector_state state=%s", ready ? "READY" : "NOT_READY");
 	if (!ready)
-		fprintf(stderr, "grpc collector not ready now; events will still be captured locally, upload attempts use timeout.\n");
+		agent_log_error("event=collector_not_ready action=capture_local");
 }
 
 static unsigned int clamp_capture(unsigned int len, unsigned int max_len)
@@ -361,6 +366,10 @@ int main(int argc, char **argv)
 	const char *target = argv[1];
 	unsigned long long offset = parse_offset(argv[2]);
 	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "uprobe.conf");
+	const char *log_file = getenv("UPROBE_LOG_FILE");
+	if (!log_file || !*log_file)
+		log_file = "agent.log";
+	agent_log_init(log_file);
 	uprobe_bpf *skel = nullptr;
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
@@ -378,7 +387,7 @@ int main(int argc, char **argv)
 	// 打开、加载并通过 verifier 校验 BPF 程序。
 	skel = uprobe_bpf__open_and_load();
 	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		agent_log_error("event=bpf_load_failed");
 		err = 1;
 		goto cleanup;
 	}
@@ -386,7 +395,7 @@ int main(int argc, char **argv)
 	link = bpf_program__attach_uprobe(skel->progs.handle_uprobe, false, -1, target, offset);
 	if (!link) {
 		err = -errno;
-		fprintf(stderr, "Failed to attach uprobe to %s+0x%llx\n", target, offset);
+		agent_log_error("event=attach_failed target=%s offset=0x%llx", target, offset);
 		goto cleanup;
 	}
 
@@ -395,11 +404,11 @@ int main(int argc, char **argv)
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &state, nullptr);
 	if (!rb) {
 		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
+		agent_log_error("event=ring_buffer_create_failed");
 		goto cleanup;
 	}
 
-	printf("uprobe attach success: %s+0x%llx\n", target, offset);
+	agent_log_info("event=attach_success target=%s offset=0x%llx", target, offset);
 
 	while (!exiting) {
 		// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
@@ -409,7 +418,7 @@ int main(int argc, char **argv)
 			break;
 		}
 		if (err < 0) {
-			fprintf(stderr, "Error polling ring buffer: %d\n", err);
+			agent_log_error("event=ring_buffer_poll_failed err=%d", err);
 			break;
 		}
 	}
@@ -419,5 +428,6 @@ cleanup:
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);
+	agent_log_close();
 	return err < 0 ? -err : err;
 }
