@@ -28,6 +28,8 @@ PROTOC ?= protoc
 GRPC_CPP_PLUGIN ?= $(shell command -v grpc_cpp_plugin 2>/dev/null || printf grpc_cpp_plugin)
 GRPC_CXXFLAGS ?= $(shell pkg-config --cflags grpc++ protobuf 2>/dev/null)
 GRPC_LDLIBS ?= $(shell pkg-config --libs grpc++ protobuf 2>/dev/null)
+MONGO_CFLAGS ?= $(shell pkg-config --cflags libmongoc-1.0 libbson-1.0 2>/dev/null)
+MONGO_LDLIBS ?= $(shell pkg-config --libs libmongoc-1.0 libbson-1.0 2>/dev/null)
 GTEST_CXXFLAGS ?= $(shell pkg-config --cflags gtest 2>/dev/null)
 GTEST_LDLIBS ?= $(shell pkg-config --libs gtest_main gtest 2>/dev/null || printf -- '-lgtest_main -lgtest -pthread')
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
@@ -98,7 +100,7 @@ $(OUTPUT)/$(APP).o: $(OUTPUT)/$(APP).skel.h
 
 $(OUTPUT)/%.o: $(SRC_DIR)/%.cpp $(wildcard $(SRC_DIR)/*.h) $(OUTPUT)/audit_upload.grpc.pb.h | $(OUTPUT)
 	$(call msg,CXX,$@)
-	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $(filter %.cpp,$^) -o $@
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(MONGO_CFLAGS) $(INCLUDES) -I$(OUTPUT) -c $(filter %.cpp,$^) -o $@
 
 $(BINDIR)/$(APP): $(OUTPUT)/$(APP).o $(OUTPUT)/agent_logger.o $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(LIBBPF_OBJ) $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(OUTPUT) $(BINDIR)
 	$(call msg,BINARY,$@)
@@ -141,9 +143,9 @@ $(OUTPUT)/audit_collector.o: collector/audit_collector.cpp $(OUTPUT)/audit_uploa
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
-	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
+	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) -o $@
 
 .PHONY: collector-connection-test
 collector-connection-test: $(BINDIR)/collector_connection_test

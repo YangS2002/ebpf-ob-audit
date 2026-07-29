@@ -152,11 +152,23 @@ static void sender_worker(AuditGrpcSender::Impl *impl)
 		std::vector<char> record;
 		{
 			std::unique_lock<std::mutex> lock(impl->mutex);
-			impl->cond.wait(lock, [&] { return impl->stopping || !impl->queue.empty(); });
-			if (impl->queue.empty()) {
-				if (impl->stopping)
-					break;
-				continue;
+			if (impl->batch.empty()) {
+				impl->cond.wait(lock, [&] { return impl->stopping || !impl->queue.empty(); });
+				if (impl->queue.empty()) {
+					if (impl->stopping)
+						break;
+					continue;
+				}
+			} else {
+				impl->cond.wait_for(lock, std::chrono::milliseconds(impl->config.flush_interval_ms),
+						    [&] { return impl->stopping || !impl->queue.empty(); });
+				if (impl->queue.empty()) {
+					if (impl->stopping)
+						break;
+					lock.unlock();
+					flush_with_retry(impl);
+					continue;
+				}
 			}
 			record = std::move(impl->queue.front());
 			impl->queue.pop_front();
@@ -188,6 +200,7 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 	impl_->config = config;
 	impl_->config.agent_id = impl_->config.agent_id.empty() ? "default-agent" : impl_->config.agent_id;
 	impl_->config.batch_bytes = default_or(impl_->config.batch_bytes, 262144);
+	impl_->config.flush_interval_ms = default_or(impl_->config.flush_interval_ms, 1000);
 	impl_->config.timeout_ms = default_or(impl_->config.timeout_ms, 2000);
 	impl_->config.queue_bytes = default_or64(impl_->config.queue_bytes, 64ULL * 1024 * 1024);
 	impl_->config.retry_initial_ms = default_or(impl_->config.retry_initial_ms, 100);

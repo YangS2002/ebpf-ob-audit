@@ -28,6 +28,7 @@ agent:
     collector_discovery_retry_interval_ms: 3000
     collector_discovery_selection_policy: hash_agent
     grpc_batch_bytes: 262144
+    grpc_flush_interval_ms: 1000
     grpc_timeout_ms: 2000
     # If observer_path is empty, deployer defaults to oceanbase-ce.global.home_path/bin/observer.
     observer_path: /home/yangshuo17/ob3node/bin/observer

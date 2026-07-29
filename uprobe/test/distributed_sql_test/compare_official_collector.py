@@ -75,12 +75,14 @@ def color(name, text):
 def normalize_text(value):
     text = str(value or "")
     text = text.replace("\\n", " ").replace("\\r", " ")
-    text = text.replace("\n", " ").replace("\r", " ")
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    text = "".join(" " if ch.isspace() else ch for ch in text if ch >= " " or ch.isspace())
     return re.sub(r"\s+", " ", text).strip()
 
 
 def normalize_sql(value):
     text = normalize_text(value)
+    text = normalize_text(strip_sql_comments(text))
     while text.endswith(";"):
         text = text[:-1].rstrip()
     return text
@@ -150,7 +152,6 @@ def strip_sql_comments(sql_text):
 
 
 def split_sql_statements(sql_text):
-    sql_text = strip_sql_comments(sql_text)
     statements = []
     buf = []
     quote = ""

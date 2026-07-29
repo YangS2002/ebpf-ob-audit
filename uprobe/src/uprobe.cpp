@@ -36,6 +36,7 @@ struct app_config {
 	std::string collector_discovery_selection_policy;
 	bool collector_discovery = false;
 	unsigned int grpc_batch_bytes = 0;
+	unsigned int grpc_flush_interval_ms = 0;
 	unsigned int grpc_timeout_ms = 0;
 	unsigned long long grpc_queue_bytes = 0;
 	unsigned int grpc_retry_initial_ms = 0;
@@ -121,6 +122,8 @@ static bool load_config(const char *path, app_config *config)
 			config->collector_discovery_selection_policy = value;
 		else if (key == "grpc_batch_bytes")
 			config->grpc_batch_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
+		else if (key == "grpc_flush_interval_ms")
+			config->grpc_flush_interval_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 		else if (key == "grpc_timeout_ms")
 			config->grpc_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
 		else if (key == "grpc_queue_bytes")
@@ -143,6 +146,7 @@ static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 	grpc_config.file_version = AUDIT_FILE_VERSION;
 	grpc_config.event_size = sizeof(event);
 	grpc_config.batch_bytes = config.grpc_batch_bytes;
+	grpc_config.flush_interval_ms = config.grpc_flush_interval_ms;
 	grpc_config.timeout_ms = config.grpc_timeout_ms;
 	grpc_config.queue_bytes = config.grpc_queue_bytes;
 	grpc_config.retry_initial_ms = config.grpc_retry_initial_ms;
@@ -163,10 +167,11 @@ static void print_startup_status(const char *target, unsigned long long offset,
 					 const char *config_file, const app_config &config, const writer_state &state)
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
-	agent_log_info("event=agent_config agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s",
+	agent_log_info("event=agent_config agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s",
 	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144,
+	       config.grpc_flush_interval_ms ? config.grpc_flush_interval_ms : 1000,
 	       config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000,
 	       config.grpc_queue_bytes ? config.grpc_queue_bytes : 64ULL * 1024 * 1024,
 	       config.collector_discovery ? "true" : "false");

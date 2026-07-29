@@ -48,6 +48,7 @@ class DeployConfig:
     collector_discovery_retry_interval_ms: int
     collector_discovery_selection_policy: str
     grpc_batch_bytes: int
+    grpc_flush_interval_ms: int
     grpc_timeout_ms: int
     observer_path: str
     offset: str
@@ -217,6 +218,7 @@ def parse_config(path: Path) -> DeployConfig:
     collector_discovery_retry_interval_ms = int(agent_global.get("collector_discovery_retry_interval_ms", 3000))
     collector_discovery_selection_policy = str(agent_global.get("collector_discovery_selection_policy", "hash_agent"))
     grpc_batch_bytes = int(agent_global.get("grpc_batch_bytes", 262144))
+    grpc_flush_interval_ms = int(agent_global.get("grpc_flush_interval_ms", 1000))
     grpc_timeout_ms = int(agent_global.get("grpc_timeout_ms", 2000))
     observer_path = str(agent_global.get("observer_path", ""))
     offset = str(agent_global.get("offset", ""))
@@ -248,7 +250,7 @@ def parse_config(path: Path) -> DeployConfig:
                           collector_discovery_enabled, collector_discovery_etcd_endpoints,
                           collector_discovery_service_name, collector_discovery_watch,
                           collector_discovery_retry_interval_ms, collector_discovery_selection_policy,
-                          grpc_batch_bytes, grpc_timeout_ms, observer_path, offset, output_file, nodes)
+                          grpc_batch_bytes, grpc_flush_interval_ms, grpc_timeout_ms, observer_path, offset, output_file, nodes)
     validate_config(config)
     return config
 
@@ -335,6 +337,7 @@ def render_uprobe_conf(config: DeployConfig, node: Node) -> str:
         f"collector_discovery_selection_policy={config.collector_discovery_selection_policy}",
         "",
         f"grpc_batch_bytes={config.grpc_batch_bytes}",
+        f"grpc_flush_interval_ms={config.grpc_flush_interval_ms}",
         f"grpc_timeout_ms={config.grpc_timeout_ms}",
         "grpc_queue_bytes=262144",
         "grpc_retry_initial_ms=100",

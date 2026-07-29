@@ -16,6 +16,7 @@ struct audit_grpc_config {
 	uint32_t file_version = 0;
 	uint32_t event_size = 0;
 	uint32_t batch_bytes = 0;
+	uint32_t flush_interval_ms = 0;
 	uint32_t timeout_ms = 0;
 	uint64_t queue_bytes = 0;
 	uint32_t retry_initial_ms = 0;
