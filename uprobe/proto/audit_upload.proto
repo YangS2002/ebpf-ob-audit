@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package audit;
+
+service AuditCollector {
+  rpc Upload(AuditBatch) returns (UploadReply);
+}
+
+message AuditBatch {
+  string agent_id = 1;
+  string server_ip = 2;
+  uint32 file_version = 3;
+  uint32 event_size = 4;
+  uint64 record_count = 5;
+  bytes records = 6;
+}
+
+message UploadReply {
+  bool ok = 1;
+  string message = 2;
+  uint64 accepted_records = 3;
+  uint64 accepted_bytes = 4;
+}

@@ -2,7 +2,7 @@
 .bash_history
 /build
 openspec
-uprobe/.output
+
 uprobe/bin
 help
 log
@@ -15,7 +15,10 @@ uprobe/test/*.adt
 *.dat
 *.tsv
 *.adt
+*.txt
 uprobe/.deploy_output
+uprobe/.deploy_output_collector
+uprobe/.output
 *.pyc
 uprobe/test/distributed_sql_test/out
-uprobe/test/ring_buffer_test
+uprobe/test/ring_buffer_test/test_ring_buffer

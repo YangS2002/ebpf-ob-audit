@@ -4,7 +4,9 @@ WORKDIR /root/
 COPY . /root/
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libelf1 \
+    && apt-get install -y --no-install-recommends libelf1 libgrpc++1.51 libprotobuf32 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["/root/src/bootstrap"]
+EXPOSE 50051
+
+ENTRYPOINT ["/bin/bash"]

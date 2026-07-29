@@ -1,0 +1,44 @@
+user:
+  username: yangshuo17
+  port: 32200
+  password: ""
+
+collector:
+  global:
+    deploy_home: /home/yangshuo17/ebpf-ob-audit-collector
+    storage: mongodb
+
+    registry_enabled: true
+    registry_etcd_endpoints: http://7.27.43.139:2379
+    registry_service_name: audit-collector
+    registry_lease_ttl_sec: 10
+    registry_keepalive_interval_sec: 3
+
+    mongodb_uri: mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit
+    mongodb_database: ob_audit
+    mongodb_collection: audit_events
+    mongodb_app_name: ebpf-ob-audit-collector
+    mongodb_write_concern: w1
+    mongodb_connect_timeout_ms: 2000
+    mongodb_server_selection_timeout_ms: 3000
+    mongodb_socket_timeout_ms: 5000
+    mongodb_pool_min_size: 1
+    mongodb_pool_max_size: 4
+    mongodb_insert_concurrency: 2
+    mongodb_bulk_max_records: 1000
+    mongodb_bulk_max_bytes: 4194304
+    mongodb_ordered_insert: false
+
+  servers:
+    - name: collector-50051
+      ip: 7.27.43.138
+      listen_port: 50051
+      instance_id: collector-50051
+    - name: collector-50052
+      ip: 7.27.43.138
+      listen_port: 50052
+      instance_id: collector-50052
+    - name: collector-50053
+      ip: 7.27.43.138
+      listen_port: 50053
+      instance_id: collector-50053
