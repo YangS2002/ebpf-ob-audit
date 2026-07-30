@@ -66,6 +66,8 @@ def run_case(args, case):
         cmd.append("--mysql-force")
     if args.mongo_sort_desc:
         cmd.append("--mongo-sort-desc")
+    if args.mismatches_only:
+        cmd.append("--mismatches-only")
 
     if case["name"] != CASES[0]["name"]:
         cmd.append("--no-clear-mongo")
@@ -98,6 +100,7 @@ def parse_args():
     parser.add_argument("--mongo-sort", default="event_seq")
     parser.add_argument("--mongo-sort-desc", action="store_true")
     parser.add_argument("--mongo-export-wait-seconds", type=float, default=5.0)
+    parser.add_argument("--mismatches-only", action="store_true", help="only print/write failed compare units")
     return parser.parse_args()
 
 

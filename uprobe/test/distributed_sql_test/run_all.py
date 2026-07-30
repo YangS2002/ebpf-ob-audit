@@ -78,6 +78,8 @@ def run_case(args, case):
         cmd.append("--mysql-force")
     if args.no_deploy_after_first and case["name"] != CASES[0]["name"]:
         cmd.append("--skip-deploy")
+    if args.mismatches_only:
+        cmd.append("--mismatches-only")
 
     batch_stage(f"case {case['name']}", Path(case["workload"]).name)
     result = subprocess.run(cmd)
@@ -110,6 +112,7 @@ def parse_args():
     parser.add_argument("--skip-tools-build", action="store_true")
     parser.add_argument("--no-deploy-after-first", action="store_true", default=True)
     parser.add_argument("--deploy-each-case", action="store_false", dest="no_deploy_after_first")
+    parser.add_argument("--mismatches-only", action="store_true", help="only print/write failed compare units")
     return parser.parse_args()
 
 

@@ -1,11 +1,11 @@
 # uprobe 使用说明
 
-本文记录当前 uprobe/collector/MongoDB 全链路测试流程。
+本文记录当前 uprobe/collector/MongoDB 全链路测试流程。所有命令均使用当前机器真实路径，可直接复制执行。
 
 ## 1. 构建
 
 ```bash
-git submodule update --init --recursive
+git -C /home/yangshuo17/ebpf-ob-audit submodule update --init --recursive
 make -C uprobe
 ```
 
@@ -20,12 +20,12 @@ uprobe/bin/adt_to_csv
 开发容器可选：
 
 ```bash
-docker build -f dev.dockerfile -t ebpf-ob-audit-dev .
+docker build -f dev.dockerfile -t ebpf-ob-audit-dev /home/yangshuo17/ebpf-ob-audit
 docker run -it --privileged --pid=host \
-  -v "$PWD":/root \
+  -v /home/yangshuo17/ebpf-ob-audit:/root/ebpf-ob-audit \
   -v /sys/kernel/tracing:/sys/kernel/tracing \
   -v /sys/kernel/debug:/sys/kernel/debug \
-  -v /home/yangshuo17/:/home/yangshuo17 \
+  -v /home/yangshuo17:/home/yangshuo17 \
   ebpf-ob-audit-dev
 ```
 
@@ -37,19 +37,44 @@ observer record_request
   -> gRPC AuditBatch
   -> audit_collector
   -> MongoDB ob_audit.audit_events
-  -> mongo_to_csv.py
-  -> compare_official_collector.py
+  -> uprobe/tools/mongo_to_csv.py
+  -> uprobe/test/distributed_sql_test/compare_official_collector.py
   -> GV$OB_SQL_AUDIT 对比
 ```
 
 collector 支持 MongoDB 存储。agent 支持 collector 服务发现，默认通过 etcd 服务名 `audit-collector` 选择 collector。
 
-## 3. 部署 collector
+## 3. 启动 etcd
 
-参考配置：
+collector 注册和 agent 服务发现依赖 etcd。单节点测试可这样启动：
 
 ```bash
-cp uprobe/deploy/collector-deploy.example.yaml collector-deploy.yaml
+etcd \
+  --name node1 \
+  --data-dir /home/yangshuo17/etcd-data \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://7.27.43.139:2379 \
+  --listen-peer-urls http://0.0.0.0:2381 \
+  --initial-advertise-peer-urls http://7.27.43.139:2381 \
+  --initial-cluster node1=http://7.27.43.139:2381 \
+  --initial-cluster-state new
+```
+
+如果复用已有 `/home/yangshuo17/etcd-data`，`--initial-cluster-state new` 可能因旧数据报错。测试环境可先停止 etcd，再清理旧数据目录后启动：
+
+```bash
+sudo systemctl stop etcd
+rm -rf /home/yangshuo17/etcd-data
+```
+
+注意：etcd 只负责服务注册/发现，不是数据通道。停 etcd 不会切断已有 `agent -> collector -> MongoDB` 数据链路。
+
+## 4. 部署 collector
+
+当前配置文件：
+
+```text
+uprobe/deploy/collector-deploy.example.yaml
 ```
 
 关键配置：
@@ -69,25 +94,27 @@ collector:
 部署并启动：
 
 ```bash
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action deploy-start
+python3 uprobe/deploy/deploy_collector.py \
+  -c uprobe/deploy/collector-deploy.example.yaml \
+  --action deploy-start
 ```
 
 常用操作：
 
 ```bash
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action logs
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action restart
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action stop
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action clear-logs
-python3 uprobe/deploy/deploy_collector.py -c collector-deploy.yaml --action clean
+python3 uprobe/deploy/deploy_collector.py -c uprobe/deploy/collector-deploy.example.yaml --action logs
+python3 uprobe/deploy/deploy_collector.py -c uprobe/deploy/collector-deploy.example.yaml --action restart
+python3 uprobe/deploy/deploy_collector.py -c uprobe/deploy/collector-deploy.example.yaml --action stop
+python3 uprobe/deploy/deploy_collector.py -c uprobe/deploy/collector-deploy.example.yaml --action clear-logs
+python3 uprobe/deploy/deploy_collector.py -c uprobe/deploy/collector-deploy.example.yaml --action clean
 ```
 
-## 4. 部署 agent
+## 5. 部署 agent
 
-参考配置：
+当前配置文件：
 
-```bash
-cp uprobe/deploy/agent-deploy.example.yaml agent-deploy.yaml
+```text
+uprobe/deploy/agent-deploy.example.yaml
 ```
 
 关键配置：
@@ -114,69 +141,73 @@ agent:
 部署并启动：
 
 ```bash
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --action deploy-start
+python3 uprobe/deploy/deploy_agent.py \
+  -c uprobe/deploy/agent-deploy.example.yaml \
+  --action deploy-start
 ```
 
 常用操作：
 
 ```bash
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --action status
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --action restart
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --action stop
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --action clean
-python3 uprobe/deploy/deploy_agent.py -c agent-deploy.yaml --dry-run
+python3 uprobe/deploy/deploy_agent.py -c uprobe/deploy/agent-deploy.example.yaml --action status
+python3 uprobe/deploy/deploy_agent.py -c uprobe/deploy/agent-deploy.example.yaml --action restart
+python3 uprobe/deploy/deploy_agent.py -c uprobe/deploy/agent-deploy.example.yaml --action stop
+python3 uprobe/deploy/deploy_agent.py -c uprobe/deploy/agent-deploy.example.yaml --action clean
+python3 uprobe/deploy/deploy_agent.py -c uprobe/deploy/agent-deploy.example.yaml --dry-run
 ```
 
-部署包包含：
+部署包在目标机：
 
 ```text
-bin/uprobe
-conf/uprobe.conf
-lib/*.so*
-run/start_agent.sh
+/home/yangshuo17/ebpf-ob-audit-agent/bin/uprobe
+/home/yangshuo17/ebpf-ob-audit-agent/conf/uprobe.conf
+/home/yangshuo17/ebpf-ob-audit-agent/lib/*.so*
+/home/yangshuo17/ebpf-ob-audit-agent/run/start_agent.sh
 ```
 
 目标机不需要安装 gRPC/protobuf 构建依赖，但需要 eBPF 权限、正确 observer 路径和函数 offset。
 
-## 5. 手工运行 agent/collector
+## 6. 手工运行 agent/collector
 
 本地文件存储 collector：
 
 ```bash
-./uprobe/bin/audit_collector 0.0.0.0:50051 collector_events.adt
+uprobe/bin/audit_collector \
+  0.0.0.0:50051 \
+  uprobe/test/full_connectivity_test/out/manual/collector_events.adt
 ```
 
 agent：
 
 ```bash
-./uprobe/bin/uprobe \
+uprobe/bin/uprobe \
   /home/yangshuo17/ob3node/bin/observer \
   0x000000000bf18950 \
-  out.adt \
-  /home/yangshuo17/ebpf-ob-audit/uprobe/uprobe.conf
+  uprobe/test/full_connectivity_test/out/manual/out.adt \
+  uprobe/uprobe.conf
 ```
 
 查 observer 和 offset：
 
 ```bash
 pidof observer
-readlink -f /proc/<pid>/exe
+readlink -f /proc/$(pidof observer | cut -d ' ' -f 1)/exe
 readelf -Ws /home/yangshuo17/ob3node/bin/observer | c++filt | grep 'ObMySQLRequestManager::record_request'
 ```
 
-## 6. 全联通测试
+## 7. 全联通测试
 
 测试目录：
 
 ```text
 uprobe/test/full_connectivity_test/
-  workload.sql
-  run_one_mongo.py
-  run_all_mongo.py
-  readme.md
+uprobe/test/full_connectivity_test/workload.sql
+uprobe/test/full_connectivity_test/run_one_mongo.py
+uprobe/test/full_connectivity_test/run_all_mongo.py
+uprobe/test/full_connectivity_test/readme.md
 ```
 
-`workload.sql` 会先：
+`uprobe/test/full_connectivity_test/workload.sql` 会先：
 
 ```sql
 CREATE DATABASE IF NOT EXISTS ebpf_audit_dist_test;
@@ -211,16 +242,18 @@ python3 uprobe/test/full_connectivity_test/run_one_mongo.py \
 输出：
 
 ```text
-uprobe/test/full_connectivity_test/out/single_mongo/
-  official_ob_sql_audit.tsv
-  collector_events.csv
-  compare/
+uprobe/test/full_connectivity_test/out/single_mongo/official_ob_sql_audit.tsv
+uprobe/test/full_connectivity_test/out/single_mongo/collector_events.csv
+uprobe/test/full_connectivity_test/out/single_mongo/compare/
 ```
 
 `run_one_mongo.py` 默认会清空 MongoDB collection。复用已有 collection 时加：
 
 ```bash
---no-clear-mongo
+python3 uprobe/test/full_connectivity_test/run_one_mongo.py \
+  --out-dir uprobe/test/full_connectivity_test/out/single_mongo \
+  --mongo-query '{"db_name":"ebpf_audit_dist_test"}' \
+  --no-clear-mongo
 ```
 
 `--deploy-config` 目前无实际作用，仅保留兼容旧命令。
@@ -235,7 +268,7 @@ python3 uprobe/test/full_connectivity_test/run_all_mongo.py \
 
 当前批量只有一个 case：`full_connectivity`。
 
-## 7. 只导出 MongoDB
+## 8. 只导出 MongoDB
 
 ```bash
 python3 uprobe/tools/mongo_to_csv.py \
@@ -243,7 +276,7 @@ python3 uprobe/tools/mongo_to_csv.py \
   --db ob_audit \
   --collection audit_events \
   --query '{"db_name":"ebpf_audit_dist_test"}' \
-  --output /tmp/collector_events.csv
+  --output uprobe/test/full_connectivity_test/out/manual/collector_events.csv
 ```
 
 导出时会：
@@ -252,12 +285,12 @@ python3 uprobe/tools/mongo_to_csv.py \
 - 将 `plan_type_name` 导出为名称。
 - 过滤 SQL 中不可见控制字符，避免 CSV/normalize 结果异常。
 
-## 8. 手工导出官方审计表
+## 9. 手工导出官方审计表
 
 ```bash
 mysql -h7.27.43.136 -P2881 -uroot@sys -A --batch --raw \
   -e "SELECT * FROM oceanbase.GV\$OB_SQL_AUDIT WHERE is_inner_sql=0" \
-  -p > official_ob_sql_audit.tsv
+  -p > uprobe/test/full_connectivity_test/out/manual/official_ob_sql_audit.tsv
 ```
 
 全联通脚本会自动执行官方导出并和 MongoDB collector 数据对比，通常不需要手工导出。

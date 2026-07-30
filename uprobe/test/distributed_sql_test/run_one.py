@@ -215,6 +215,8 @@ def compare_with_official(args, official_tsv, collector_csv, out_dir):
         "--collector-csv", str(collector_csv),
         "--out-dir", str(compare_out),
     ]
+    if getattr(args, "mismatches_only", False):
+        cmd.append("--mismatches-only")
     return run(cmd, check=False).returncode
 
 
@@ -378,6 +380,7 @@ def parse_args():
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--skip-tools-build", action="store_true")
     parser.add_argument("--no-stop", action="store_true")
+    parser.add_argument("--mismatches-only", action="store_true", help="only print/write failed compare units")
     return parser.parse_args()
 
 

@@ -24,7 +24,7 @@ from run_one import (
     warn,
 )
 
-DEFAULT_WORKLOAD = TEST_DIR / "workload.sql"
+DEFAULT_WORKLOAD = TEST_DIR / "sysbench_generated.sql"
 DEFAULT_OUT_DIR = TEST_DIR / "out" / "single"
 
 MONGO_TO_CSV = UPROBE_DIR / "tools" / "mongo_to_csv.py"
@@ -84,6 +84,7 @@ def parse_args():
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR.parent / "single_mongo"))
     parser.add_argument("--mongo-export-wait-seconds", type=float, default=5.0)
     parser.add_argument("--no-clear-mongo", action="store_true")
+    parser.add_argument("--mismatches-only", action="store_true", help="only print/write failed compare units")
     return parser.parse_args()
 
 

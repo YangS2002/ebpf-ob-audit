@@ -284,7 +284,7 @@ def print_lines(lines, color_name):
         print(color(color_name, line))
 
 
-def compare(workload_sqls, official_rows, collector_rows, report_path, max_print):
+def compare(workload_sqls, official_rows, collector_rows, report_path, max_print, mismatches_only=False):
     collector_index = index_by_sql(collector_rows)
     collector_missing = []
     duplicate_collector = []
@@ -354,14 +354,15 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
             continue
 
         pass_count += 1
-        sample_field = random.choice(COMPARE_FIELDS)
-        unit.append("  PASS")
-        unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
-        unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
-        report.extend(unit)
-        if printed < max_print:
-            print_lines(unit, "green")
-            printed += 1
+        if not mismatches_only:
+            sample_field = random.choice(COMPARE_FIELDS)
+            unit.append("  PASS")
+            unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
+            unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
+            report.extend(unit)
+            if printed < max_print:
+                print_lines(unit, "green")
+                printed += 1
 
     Path(report_path).write_text("\n".join(report) + "\n", encoding="utf-8")
     return {
@@ -384,6 +385,7 @@ def parse_args():
     parser.add_argument("--adt-to-csv", default=str(DEFAULT_ADT_TO_CSV))
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--max-print", type=int, default=50)
+    parser.add_argument("--mismatches-only", action="store_true", help="print and write only failed SQL units; suppress PASS details")
     return parser.parse_args()
 
 
@@ -404,7 +406,7 @@ def main():
     write_csv(out_dir / "official.normalized.csv", official_rows)
     write_csv(out_dir / "collector.normalized.csv", collector_rows)
 
-    result = compare(workload_sqls, official_rows, collector_rows, out_dir / "compare_report.txt", args.max_print)
+    result = compare(workload_sqls, official_rows, collector_rows, out_dir / "compare_report.txt", args.max_print, args.mismatches_only)
 
     fail_count = (len(result["collector_missing"]) + len(result["duplicate_collector"]) +
                   len(result["official_missing"]) + len(result["duplicate_official"]) +
