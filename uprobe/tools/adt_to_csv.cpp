@@ -258,6 +258,15 @@ DEFINE_I64_FIELD_WRITER(write_elapsed_time, elapsed_time)
 DEFINE_I64_FIELD_WRITER(write_execute_time, execute_time)
 DEFINE_I64_FIELD_WRITER(write_query_sql_len, query_sql_len)
 DEFINE_I64_FIELD_WRITER(write_params_value_len, params_value_len)
+#if AUDIT_PERF_FIELDS_ENABLED
+DEFINE_U64_FIELD_WRITER(write_perf_bpf_entry_ns, perf_bpf_entry_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_bpf_before_output_ns, perf_bpf_before_output_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_agent_receive_ns, perf_agent_receive_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_agent_before_submit_ns, perf_agent_before_submit_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_agent_after_submit_ns, perf_agent_after_submit_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_collector_receive_ns, perf_collector_receive_ns)
+DEFINE_U64_FIELD_WRITER(write_perf_mongo_before_insert_ns, perf_mongo_before_insert_ns)
+#endif
 DEFINE_I32_FIELD_WRITER(write_stmt_type, stmt_type)
 DEFINE_I32_FIELD_WRITER(write_plan_type, plan_type)
 
@@ -375,6 +384,15 @@ static const CsvField CSV_FIELDS[] = {
 	{"execute_time", write_execute_time},
 	{"query_sql_len", write_query_sql_len},
 	{"params_value_len", write_params_value_len},
+#if AUDIT_PERF_FIELDS_ENABLED
+	{"perf_bpf_entry_ns", write_perf_bpf_entry_ns},
+	{"perf_bpf_before_output_ns", write_perf_bpf_before_output_ns},
+	{"perf_agent_receive_ns", write_perf_agent_receive_ns},
+	{"perf_agent_before_submit_ns", write_perf_agent_before_submit_ns},
+	{"perf_agent_after_submit_ns", write_perf_agent_after_submit_ns},
+	{"perf_collector_receive_ns", write_perf_collector_receive_ns},
+	{"perf_mongo_before_insert_ns", write_perf_mongo_before_insert_ns},
+#endif
 	{"stmt_type_value", write_stmt_type},
 	{"stmt_type", write_stmt_type_name},
 	{"plan_type", write_plan_type},

@@ -22,3 +22,4 @@ uprobe/.output
 *.pyc
 uprobe/test/distributed_sql_test/out
 uprobe/test/ring_buffer_test/test_ring_buffer
+uprobe/grpc_rtt_plots

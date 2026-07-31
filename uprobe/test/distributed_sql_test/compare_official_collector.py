@@ -228,6 +228,20 @@ def read_collector_csv(path):
         return [{normalize_key(key): value for key, value in row.items()} for row in reader]
 
 
+def read_normalized_csv(path):
+    path = Path(path)
+    if path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        rows = []
+        for row in reader:
+            normalized = {normalize_key(key): normalize_text(value) for key, value in row.items()}
+            normalized["query_sql"] = normalize_sql(normalized.get("query_sql", ""))
+            rows.append(normalized)
+        return rows
+
+
 def write_csv(path, rows):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as file:
@@ -265,8 +279,32 @@ def index_by_sql(rows):
     return indexed
 
 
+def index_by_sql_db(rows):
+    indexed = {}
+    for row in rows:
+        indexed.setdefault((row.get("query_sql", ""), row.get("db_name", "")), []).append(row)
+    return indexed
+
+
+def unique_db_names(rows):
+    return sorted({row.get("db_name", "") for row in rows})
+
+
+def rows_for_sql_by_db(rows, db_name):
+    return [row for row in rows if row.get("db_name", "") == db_name]
+
+
 def official_matches(official_rows, sql, trace_id):
     return [row for row in official_rows if row.get("query_sql") == sql and row.get("trace_id") == trace_id]
+
+
+def official_matches_for_collector(official_rows, collector):
+    sql = collector.get("query_sql", "")
+    trace_id = collector.get("trace_id", "")
+    matches = [row for row in official_rows if row.get("query_sql") == sql and row.get("trace_id") == trace_id]
+    if matches:
+        return matches
+    return [row for row in official_rows if row.get("query_sql") == sql and row.get("db_name") == collector.get("db_name", "")]
 
 
 def diff_rows(official, collector):
@@ -286,6 +324,7 @@ def print_lines(lines, color_name):
 
 def compare(workload_sqls, official_rows, collector_rows, report_path, max_print, mismatches_only=False):
     collector_index = index_by_sql(collector_rows)
+    collector_db_index = index_by_sql_db(collector_rows)
     collector_missing = []
     duplicate_collector = []
     official_missing = []
@@ -299,6 +338,20 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
         title = short_sql(sql)
         unit = ["", f"SQL #{idx} {title}"]
         collectors = collector_index.get(sql, [])
+        if len(collectors) > 1:
+            db_names = unique_db_names(collectors)
+            if len(db_names) == 1:
+                collectors = collector_db_index.get((sql, db_names[0]), [])
+            else:
+                filtered = []
+                for db_name in db_names:
+                    rows = collector_db_index.get((sql, db_name), [])
+                    if len(rows) == 1:
+                        filtered = rows
+                        unit.append(f"  DEDUP collector by db_name={db_name} duplicate_rows={len(collectors)} db_names={','.join(db_names)}")
+                        break
+                if filtered:
+                    collectors = filtered
         if not collectors:
             collector_missing.append(sql)
             unit.append("  MISSING collector")
@@ -375,13 +428,88 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
     }
 
 
+def compare_from_collector(official_rows, collector_rows, db_name, report_path, max_print, mismatches_only=False):
+    scoped_collectors = [row for row in collector_rows if row.get("db_name", "") == db_name] if db_name else collector_rows
+    official_missing = []
+    duplicate_official = []
+    mismatches = []
+    pass_count = 0
+    report = []
+    printed = 0
+
+    for idx, collector in enumerate(scoped_collectors, 1):
+        sql = collector.get("query_sql", "")
+        title = short_sql(sql)
+        unit = ["", f"COLLECTOR SQL #{idx} {title}"]
+        trace_id = collector.get("trace_id", "")
+        unit.append(f"  event_seq={collector.get('event_seq', '')} trace_id={trace_id} db_name={collector.get('db_name', '')}")
+        officials = official_matches_for_collector(official_rows, collector)
+        if not officials:
+            official_missing.append(sql)
+            unit.append("  MISSING official")
+            report.extend(unit)
+            if printed < max_print:
+                print_lines(unit, "red")
+                printed += 1
+            continue
+        if len(officials) > 1:
+            duplicate_official.append((sql, len(officials)))
+            unit.append(f"  DUPLICATE official rows={len(officials)} unsupported")
+            report.extend(unit)
+            if printed < max_print:
+                print_lines(unit, "yellow")
+                printed += 1
+            continue
+
+        official = officials[0]
+        diffs = diff_rows(official, collector)
+        if diffs:
+            mismatches.append(sql)
+            unit.append(f"  DIFF fields={len(diffs)}")
+            for field, official_value, collector_value in diffs:
+                unit.append(f"  KEY {field}")
+                unit.append(f"    official : {short_sql(official_value) if field == 'query_sql' else official_value}")
+                unit.append(f"    collector: {short_sql(collector_value) if field == 'query_sql' else collector_value}")
+            report.extend(unit)
+            if printed < max_print:
+                print_lines(unit, "red")
+                printed += 1
+            continue
+
+        pass_count += 1
+        if not mismatches_only:
+            sample_field = random.choice(COMPARE_FIELDS)
+            unit.append("  PASS")
+            unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
+            unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
+            report.extend(unit)
+            if printed < max_print:
+                print_lines(unit, "green")
+                printed += 1
+
+    Path(report_path).write_text("\n".join(report) + "\n", encoding="utf-8")
+    return {
+        "pass": pass_count,
+        "collector_missing": [],
+        "duplicate_collector": [],
+        "official_missing": official_missing,
+        "duplicate_official": duplicate_official,
+        "mismatches": mismatches,
+        "collector_checked": len(scoped_collectors),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare workload SQL against collector records and official GV$OB_SQL_AUDIT.")
-    parser.add_argument("--workload", required=True)
-    parser.add_argument("--official-tsv", required=True)
-    group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument("--workload")
+    parser.add_argument("--match-mode", choices=["workload", "collector-db"], default="workload", help="workload: compare workload SQLs; collector-db: use collector rows filtered by --db-name as targets")
+    parser.add_argument("--db-name", default="", help="db_name filter used by --match-mode collector-db")
+    parser.add_argument("--official-tsv")
+    parser.add_argument("--official-normalized-csv")
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--collector-csv")
     group.add_argument("--collector-adt")
+    group.add_argument("--collector-normalized-csv")
     parser.add_argument("--adt-to-csv", default=str(DEFAULT_ADT_TO_CSV))
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--max-print", type=int, default=50)
@@ -391,28 +519,45 @@ def parse_args():
 
 def main():
     args = parse_args()
-    official_path = Path(args.official_tsv)
-    out_dir = Path(args.out_dir) if args.out_dir else official_path.parent / "compare_official_collector"
+    if args.match_mode == "workload" and not args.workload:
+        raise SystemExit("--workload is required when --match-mode workload")
+    if not args.official_tsv and not args.official_normalized_csv:
+        raise SystemExit("--official-tsv or --official-normalized-csv is required")
+    if not args.collector_csv and not args.collector_adt and not args.collector_normalized_csv:
+        raise SystemExit("--collector-csv, --collector-adt, or --collector-normalized-csv is required")
+
+    base_path = Path(args.official_normalized_csv or args.official_tsv)
+    out_dir = Path(args.out_dir) if args.out_dir else base_path.parent / "compare_official_collector"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    collector_csv = Path(args.collector_csv) if args.collector_csv else out_dir / "collector_events.csv"
-    if args.collector_adt:
-        convert_adt(args.collector_adt, collector_csv, Path(args.adt_to_csv))
+    if args.collector_normalized_csv:
+        collector_csv = Path(args.collector_normalized_csv)
+    else:
+        collector_csv = Path(args.collector_csv) if args.collector_csv else out_dir / "collector_events.csv"
+        if args.collector_adt:
+            convert_adt(args.collector_adt, collector_csv, Path(args.adt_to_csv))
 
-    workload_sqls = load_workload(args.workload)
-    official_rows = [normalize_official(row) for row in read_official_tsv(official_path)]
-    collector_rows = [normalize_collector(row) for row in read_collector_csv(collector_csv)]
+    workload_sqls = load_workload(args.workload) if args.workload else []
+    official_rows = read_normalized_csv(args.official_normalized_csv) if args.official_normalized_csv else [normalize_official(row) for row in read_official_tsv(Path(args.official_tsv))]
+    collector_rows = read_normalized_csv(collector_csv) if args.collector_normalized_csv else [normalize_collector(row) for row in read_collector_csv(collector_csv)]
 
     write_csv(out_dir / "official.normalized.csv", official_rows)
     write_csv(out_dir / "collector.normalized.csv", collector_rows)
 
-    result = compare(workload_sqls, official_rows, collector_rows, out_dir / "compare_report.txt", args.max_print, args.mismatches_only)
+    if args.match_mode == "collector-db":
+        result = compare_from_collector(official_rows, collector_rows, args.db_name, out_dir / "compare_report.txt", args.max_print, args.mismatches_only)
+        target_count = result.get("collector_checked", 0)
+        summary_label = "collector_rows"
+    else:
+        result = compare(workload_sqls, official_rows, collector_rows, out_dir / "compare_report.txt", args.max_print, args.mismatches_only)
+        target_count = len(workload_sqls)
+        summary_label = "workload_sql"
 
     fail_count = (len(result["collector_missing"]) + len(result["duplicate_collector"]) +
                   len(result["official_missing"]) + len(result["duplicate_official"]) +
                   len(result["mismatches"]))
     print(color("cyan", ""))
-    print(color("cyan", f"SUMMARY workload_sql={len(workload_sqls)} pass={result['pass']} fail={fail_count} "
+    print(color("cyan", f"SUMMARY {summary_label}={target_count} pass={result['pass']} fail={fail_count} "
                         f"collector_missing={len(result['collector_missing'])} "
                         f"duplicate_collector={len(result['duplicate_collector'])} "
                         f"official_missing={len(result['official_missing'])} "

@@ -3,6 +3,7 @@
 #include "../tools/audit_format.h"
 
 #include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -14,6 +15,14 @@
 #include <mongoc/mongoc.h>
 #else
 #define HAVE_MONGOC 0
+#endif
+
+#if AUDIT_PERF_FIELDS_ENABLED
+static unsigned long long monotonic_ns()
+{
+	return (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 #endif
 
 struct MongoSink::Impl {
@@ -121,7 +130,7 @@ static bool append_text(bson_t *doc, const char *key, const char *data, unsigned
 }
 
 static bool append_event_doc(bson_t *doc, const std::string &agent_id, const std::string &request_server_ip,
-			     const audit_ingest::parsed_audit_event &parsed)
+				     const audit_ingest::parsed_audit_event &parsed, unsigned long long mongo_before_insert_ns = 0)
 {
 	const event *e = parsed.record;
 	std::string event_server_ip = format_ob_addr_for_mongo(e->server_ip, sizeof(e->server_ip));
@@ -147,8 +156,17 @@ static bool append_event_doc(bson_t *doc, const std::string &agent_id, const std
 	BSON_APPEND_INT64(doc, "elapsed_time", e->elapsed_time);
 	BSON_APPEND_INT64(doc, "execute_time", e->execute_time);
 	BSON_APPEND_INT64(doc, "query_sql_len", e->query_sql_len);
-	BSON_APPEND_INT64(doc, "params_value_len", e->params_value_len);
-	BSON_APPEND_INT32(doc, "user_name_len", (int32_t)e->user_name_len);
+		BSON_APPEND_INT64(doc, "params_value_len", e->params_value_len);
+#if AUDIT_PERF_FIELDS_ENABLED
+		BSON_APPEND_INT64(doc, "perf_bpf_entry_ns", (int64_t)e->perf_bpf_entry_ns);
+		BSON_APPEND_INT64(doc, "perf_bpf_before_output_ns", (int64_t)e->perf_bpf_before_output_ns);
+		BSON_APPEND_INT64(doc, "perf_agent_receive_ns", (int64_t)e->perf_agent_receive_ns);
+		BSON_APPEND_INT64(doc, "perf_agent_before_submit_ns", (int64_t)e->perf_agent_before_submit_ns);
+		BSON_APPEND_INT64(doc, "perf_agent_after_submit_ns", (int64_t)e->perf_agent_after_submit_ns);
+		BSON_APPEND_INT64(doc, "perf_collector_receive_ns", (int64_t)e->perf_collector_receive_ns);
+		BSON_APPEND_INT64(doc, "perf_mongo_before_insert_ns", (int64_t)mongo_before_insert_ns);
+#endif
+		BSON_APPEND_INT32(doc, "user_name_len", (int32_t)e->user_name_len);
 	BSON_APPEND_INT32(doc, "proxy_user_name_len", (int32_t)e->proxy_user_name_len);
 	BSON_APPEND_INT32(doc, "tenant_name_len", (int32_t)e->tenant_name_len);
 	BSON_APPEND_INT32(doc, "db_name_len", (int32_t)e->db_name_len);
@@ -378,15 +396,22 @@ bool MongoSink::insert_events(const std::string &agent_id, const std::string &se
 		return false;
 	}
 
-	std::vector<bson_t *> docs(events.size());
-	std::vector<const bson_t *> doc_ptrs(events.size());
-	unsigned long long bytes = 0;
-	for (size_t i = 0; i < events.size(); i++) {
-		docs[i] = bson_new();
-		append_event_doc(docs[i], agent_id, server_ip, events[i]);
-		doc_ptrs[i] = docs[i];
-		bytes += events[i].size;
-	}
+		std::vector<bson_t *> docs(events.size());
+		std::vector<const bson_t *> doc_ptrs(events.size());
+		unsigned long long bytes = 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+		unsigned long long mongo_before_insert_ns = monotonic_ns();
+#endif
+		for (size_t i = 0; i < events.size(); i++) {
+			docs[i] = bson_new();
+#if AUDIT_PERF_FIELDS_ENABLED
+		append_event_doc(docs[i], agent_id, server_ip, events[i], mongo_before_insert_ns);
+#else
+			append_event_doc(docs[i], agent_id, server_ip, events[i]);
+#endif
+			doc_ptrs[i] = docs[i];
+			bytes += events[i].size;
+		}
 
 	bson_t opts;
 	bson_t reply;

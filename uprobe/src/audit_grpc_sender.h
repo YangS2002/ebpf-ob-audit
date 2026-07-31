@@ -32,6 +32,11 @@ struct audit_grpc_stats {
 	uint64_t dropped_records = 0;
 	uint64_t dropped_bytes = 0;
 	uint64_t failed_uploads = 0;
+	uint64_t failed_records = 0;
+	uint64_t failed_bytes = 0;
+	uint64_t last_grpc_roundtrip_ns = 0;
+	uint64_t max_grpc_roundtrip_ns = 0;
+	uint64_t total_grpc_roundtrip_ns = 0;
 };
 
 class AuditGrpcSender {
@@ -45,7 +50,7 @@ public:
 	bool start(const audit_grpc_config &config);
 	bool start(const audit_grpc_config &config, std::unique_ptr<CollectorResolver> resolver);
 	void stop();
-	bool submit(const char *data, size_t size);
+	bool submit(char *data, size_t size);
 	bool enabled() const;
 	std::string current_collector() const;
 	bool wait_ready(uint32_t timeout_ms) const;

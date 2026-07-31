@@ -262,9 +262,12 @@ int handle_uprobe(struct pt_regs *ctx)
 	unsigned int user_name_len = 0;
 	unsigned int proxy_user_name_len = 0;
 	unsigned int tenant_name_len = 0;
-	unsigned int db_name_len = 0;
+		unsigned int db_name_len = 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+		u64 perf_bpf_entry_ns = bpf_ktime_get_ns();
+#endif
 
-	// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
+		// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
 	audit_record = (const void *)PT_REGS_PARM2(ctx);
 	if (!audit_record)
 		return 0;
@@ -312,8 +315,17 @@ int handle_uprobe(struct pt_regs *ctx)
 	e->tid = (u32)id;
 
 	e->query_sql_len = sql_len;
-	e->params_value_len = 0;
-	e->fragment_flags = 0;
+		e->params_value_len = 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+		e->perf_bpf_entry_ns = perf_bpf_entry_ns;
+		e->perf_bpf_before_output_ns = 0;
+		e->perf_agent_receive_ns = 0;
+		e->perf_agent_before_submit_ns = 0;
+		e->perf_agent_after_submit_ns = 0;
+		e->perf_collector_receive_ns = 0;
+		e->perf_mongo_before_insert_ns = 0;
+#endif
+		e->fragment_flags = 0;
 	e->next_fragment_field = FRAG_FIELD_NONE;
 	if (sql_len > AUDIT_MAIN_SQL_PAYLOAD_MAX) {
 		e->fragment_flags |= FRAG_QUERY_SQL_FRAGMENTED;
@@ -420,10 +432,13 @@ int handle_uprobe(struct pt_regs *ctx)
 		/* output 的 size 必须是 verifier 能证明有界的局部变量，
 		 * 不能用从 map 字段读回的 e->total_size。 */
 		unsigned int out_size = event_payload_offset() + payload_len;
-		if (out_size > sizeof(*e))
-			out_size = sizeof(*e);
-		e->total_size = out_size;
-		bpf_ringbuf_output(&rb, e, out_size, 0);
+			if (out_size > sizeof(*e))
+				out_size = sizeof(*e);
+			e->total_size = out_size;
+#if AUDIT_PERF_FIELDS_ENABLED
+			e->perf_bpf_before_output_ns = bpf_ktime_get_ns();
+#endif
+			bpf_ringbuf_output(&rb, e, out_size, 0);
 	}
 	if (main_fragment_flags & FRAG_QUERY_SQL_FRAGMENTED)
 		emit_field_fragments(sql, sql_len, FRAG_FIELD_QUERY_SQL, sql_first_len, main_event_seq,

@@ -33,6 +33,9 @@ MONGO_LDLIBS ?= $(shell pkg-config --libs libmongoc-1.0 libbson-1.0 2>/dev/null)
 GTEST_CXXFLAGS ?= $(shell pkg-config --cflags gtest 2>/dev/null)
 GTEST_LDLIBS ?= $(shell pkg-config --libs gtest_main gtest 2>/dev/null || printf -- '-lgtest_main -lgtest -pthread')
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
+AUDIT_PERF_FIELDS_ENABLED ?= 0
+AUDIT_PERF_DEFINE := -DAUDIT_PERF_FIELDS_ENABLED=$(AUDIT_PERF_FIELDS_ENABLED)
+CXXFLAGS += $(AUDIT_PERF_DEFINE)
 
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
@@ -89,7 +92,7 @@ $(BPFTOOL): | $(BPFTOOL_OUTPUT)
 
 $(OUTPUT)/%.bpf.o: $(SRC_DIR)/%.bpf.c $(LIBBPF_OBJ) $(wildcard $(SRC_DIR)/*.h) $(VMLINUX) | $(OUTPUT)
 	$(call msg,BPF,$@)
-	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
+	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(AUDIT_PERF_DEFINE) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
 	$(Q)$(LLVM_STRIP) -g $@
 
 $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)

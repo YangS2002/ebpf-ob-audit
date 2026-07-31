@@ -24,7 +24,7 @@ from run_one import (
     warn,
 )
 
-DEFAULT_WORKLOAD = TEST_DIR / "sysbench_generated.sql"
+DEFAULT_WORKLOAD = TEST_DIR / "big_sql_test.sql"
 DEFAULT_OUT_DIR = TEST_DIR / "out" / "single"
 
 MONGO_TO_CSV = UPROBE_DIR / "tools" / "mongo_to_csv.py"

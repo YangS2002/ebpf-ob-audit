@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <string>
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
@@ -26,6 +27,15 @@ extern "C" {
 #define PENDING_RINGBUF_SIZE (16 * 1024 * 1024)
 
 static volatile bool exiting = false;
+
+#if AUDIT_PERF_FIELDS_ENABLED
+static unsigned long long monotonic_ns()
+{
+	struct timespec ts = {};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+}
+#endif
 
 struct app_config {
 	std::string agent_id;
@@ -203,9 +213,14 @@ static unsigned int event_names_len(const event *e)
 }
 
 // 变长落地：所有数据经 grpc 发送，不写盘。
-static int emit_record(writer_state *state, const char *data, size_t size)
+static int emit_record(writer_state *state, char *data, size_t size)
 {
-	if (!state->grpc.submit(data, size)) {
+#if AUDIT_PERF_FIELDS_ENABLED
+	event *hdr = reinterpret_cast<event *>(data);
+	hdr->perf_agent_before_submit_ns = monotonic_ns();
+#endif
+	bool submitted = state->grpc.submit(data, size);
+	if (!submitted) {
 		state->dropped_events++;
 		return 0;
 	}
@@ -215,13 +230,16 @@ static int emit_record(writer_state *state, const char *data, size_t size)
 }
 
 // 未分片小事件：值拷贝一份填 server_ip 再发。
-static int append_event(writer_state *state, const event &e)
+static int append_event(writer_state *state, const event &e, unsigned long long agent_receive_ns)
 {
 	if (!event_compact_size_valid(&e))
 		return 0;
 	event out = e;
+#if AUDIT_PERF_FIELDS_ENABLED
+	out.perf_agent_receive_ns = agent_receive_ns;
+#endif
 	std::memcpy(out.server_ip, state->server_ip, sizeof(out.server_ip));
-	return emit_record(state, reinterpret_cast<const char *>(&out), out.total_size);
+	return emit_record(state, reinterpret_cast<char *>(&out), out.total_size);
 }
 
 // 合并完成的变长事件：段可写，直接在段头填 server_ip 再发。
@@ -232,12 +250,12 @@ static int append_merged(writer_state *state, char *seg, size_t size)
 	return emit_record(state, seg, size);
 }
 
-static int handle_main_event(writer_state *state, const event *e)
+static int handle_main_event(writer_state *state, const event *e, unsigned long long agent_receive_ns)
 {
 	if (!event_compact_size_valid(e))
 		return 0;
 	if ((e->fragment_flags & (FRAG_QUERY_SQL_FRAGMENTED | FRAG_PARAMS_VALUE_FRAGMENTED)) == 0)
-		return append_event(state, *e);
+		return append_event(state, *e, agent_receive_ns);
 
 	// 分片事件：按完整长度在 pending 环形缓冲区预分配整段。
 	// 未分片字段用其首片长，分片字段用捕获上限 clamp 后的完整长。
@@ -261,6 +279,9 @@ static int handle_main_event(writer_state *state, const event *e)
 	// 段布局：[event 头][names][完整 query_sql][完整 params_value]。
 	// main 里两字段首片按最终 layout 落位，params 首片跳到完整 sql 之后。
 	state->pending.fill(e->event_seq, 0, e, payoff);
+#if AUDIT_PERF_FIELDS_ENABLED
+	reinterpret_cast<event *>(seg)->perf_agent_receive_ns = agent_receive_ns;
+#endif
 	state->pending.fill(e->event_seq, payoff, e->payload, names_len);
 	state->pending.fill(e->event_seq, (size_t)payoff + names_len,
 			    event_query_sql(e), e->query_sql_payload_len);
@@ -331,6 +352,9 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	auto *state = static_cast<writer_state *>(ctx);
+#if AUDIT_PERF_FIELDS_ENABLED
+	unsigned long long agent_receive_ns = monotonic_ns();
+#endif
 	if (size < sizeof(audit_record_header))
 		return 0;
 
@@ -340,7 +364,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (header->record_type == AUDIT_RECORD_EVENT) {
 		if (size < event_payload_offset() || size > sizeof(event))
 			return 0;
-		return handle_main_event(state, static_cast<const event *>(data));
+#if AUDIT_PERF_FIELDS_ENABLED
+		return handle_main_event(state, static_cast<const event *>(data), agent_receive_ns);
+#else
+		return handle_main_event(state, static_cast<const event *>(data), 0);
+#endif
 	}
 	if (header->record_type == AUDIT_RECORD_FRAGMENT)
 		return handle_fragment_record(state, static_cast<const audit_fragment_record *>(data), size);

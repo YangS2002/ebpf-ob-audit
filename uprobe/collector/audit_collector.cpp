@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,14 @@
 #include "collector_registry.h"
 #include "mongodb_sink.h"
 #include "uprobe.h"
+
+#if AUDIT_PERF_FIELDS_ENABLED
+static unsigned long long monotonic_ns()
+{
+	return (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
 
 class AuditCollectorService final : public audit::AuditCollector::Service {
 public:
@@ -48,20 +57,29 @@ public:
 			reply->set_message("version or event_size mismatch");
 			return grpc::Status::OK;
 		}
-		const std::string &records = request->records();
-		std::vector<audit_ingest::parsed_audit_event> events;
+#if AUDIT_PERF_FIELDS_ENABLED
+			std::string records = request->records();
+#else
+			const std::string &records = request->records();
+#endif
+			std::vector<audit_ingest::parsed_audit_event> events;
 		std::string parse_error;
 		if (!audit_ingest::parse_audit_records(records.data(), records.size(), &events, &parse_error)) {
 			reply->set_ok(false);
 			reply->set_message("invalid audit records: " + parse_error);
 			return grpc::Status::OK;
 		}
-		if (request->record_count() != events.size()) {
-			reply->set_ok(false);
-			reply->set_message("record_count mismatch");
-			return grpc::Status::OK;
-		}
-		if (mongo_sink_ && mongo_sink_->enabled()) {
+			if (request->record_count() != events.size()) {
+				reply->set_ok(false);
+				reply->set_message("record_count mismatch");
+				return grpc::Status::OK;
+			}
+#if AUDIT_PERF_FIELDS_ENABLED
+			unsigned long long collector_receive_ns = monotonic_ns();
+			for (const auto &parsed : events)
+				const_cast<event *>(parsed.record)->perf_collector_receive_ns = collector_receive_ns;
+#endif
+			if (mongo_sink_ && mongo_sink_->enabled()) {
 			unsigned long long accepted_records = 0;
 			unsigned long long accepted_bytes = 0;
 			std::string mongo_error;
