@@ -8,7 +8,11 @@ from pathlib import Path
 
 TEST_DIR = Path(__file__).resolve().parent
 SHARED_TEST_DIR = TEST_DIR.parent / "distributed_sql_test"
+COMMON_TEST_DIR = TEST_DIR.parent / "common"
 sys.path.insert(0, str(SHARED_TEST_DIR))
+sys.path.insert(0, str(COMMON_TEST_DIR))
+
+from ps_sql_resolver import resolve_workload_sqls
 
 from run_one import (
     DEFAULT_OUT_DIR,
@@ -88,6 +92,22 @@ def parse_args():
     return parser.parse_args()
 
 
+def write_ps_resolved_workload(args, out_dir):
+    text = Path(args.workload).read_text(encoding="utf-8", errors="replace")
+    from compare_official_collector import normalize_sql, split_sql_statements
+    resolved = resolve_workload_sqls(split_sql_statements(text))
+    out_path = out_dir / "workload.ps_resolved.sql"
+    lines = []
+    for item in resolved:
+        if item.error:
+            lines.append(item.source_sql.rstrip(";") + ";")
+        else:
+            lines.append(normalize_sql(item.query_sql).rstrip(";") + ";")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ok("ps workload resolved", str(out_path))
+    return out_path
+
+
 def main():
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -99,6 +119,7 @@ def main():
     collector_csv = out_dir / "collector_events.csv"
 
     stage("prepare", f"case={args.case_name or 'single'} workload={args.workload}")
+    original_workload = args.workload
     if not args.no_clear_mongo:
         stage("clear mongo", f"{args.mongo_db}.{args.mongo_collection}")
         clear_mongo(args)
@@ -117,20 +138,22 @@ def main():
     end_time = mysql_scalar(args, "SELECT NOW(6)")
     ok("end_time", end_time)
 
-    if args.mongo_export_wait_seconds > 0:
-        stage("wait mongo", f"{args.mongo_export_wait_seconds}s")
-        time.sleep(args.mongo_export_wait_seconds)
-
     stage("export official", "GV$OB_SQL_AUDIT")
     export_official(args, start_time, end_time, official_tsv)
     ok("official exported", str(official_tsv))
+
+    if args.mongo_export_wait_seconds > 0:
+        stage("wait mongo", f"{args.mongo_export_wait_seconds}s")
+        time.sleep(args.mongo_export_wait_seconds)
 
     stage("export collector", "MongoDB -> CSV")
     export_mongo(args, collector_csv)
     ok("collector exported", str(collector_csv))
 
     stage("compare records")
+    args.workload = str(write_ps_resolved_workload(args, out_dir))
     compare_code = compare_with_official(args, official_tsv, collector_csv, out_dir)
+    args.workload = original_workload
     if compare_code == 0:
         ok("compare passed", str(out_dir / "compare"))
     else:

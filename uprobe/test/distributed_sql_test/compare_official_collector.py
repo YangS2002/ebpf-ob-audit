@@ -26,6 +26,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 UPROBE_DIR = REPO_ROOT / "uprobe"
+TEST_COMMON_DIR = UPROBE_DIR / "test" / "common"
+sys.path.insert(0, str(TEST_COMMON_DIR))
+from ps_sql_resolver import resolve_workload_sqls
+
 DEFAULT_ADT_TO_CSV = UPROBE_DIR / "bin" / "adt_to_csv"
 
 FIELD_MAP = {
@@ -151,32 +155,50 @@ def strip_sql_comments(sql_text):
     return "".join(out)
 
 
+def normalize_split_statement(value):
+    text = normalize_text(strip_sql_comments(value))
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    return text
+
+
 def split_sql_statements(sql_text):
     statements = []
     buf = []
     quote = ""
     escape = False
-    for ch in sql_text:
+    i = 0
+    while i < len(sql_text):
+        ch = sql_text[i]
         buf.append(ch)
         if escape:
             escape = False
+            i += 1
             continue
         if ch == "\\":
             escape = True
+            i += 1
             continue
         if quote:
             if ch == quote:
+                if quote in ("'", '"') and i + 1 < len(sql_text) and sql_text[i + 1] == quote:
+                    buf.append(sql_text[i + 1])
+                    i += 2
+                    continue
                 quote = ""
+            i += 1
             continue
         if ch in ("'", '"', "`"):
             quote = ch
+            i += 1
             continue
         if ch == ";":
-            stmt = normalize_sql("".join(buf))
+            stmt = normalize_split_statement("".join(buf))
             if stmt:
                 statements.append(stmt)
             buf = []
-    tail = normalize_sql("".join(buf))
+        i += 1
+    tail = normalize_split_statement("".join(buf))
     if tail:
         statements.append(tail)
     return statements
@@ -184,13 +206,15 @@ def split_sql_statements(sql_text):
 
 def load_workload(path):
     sql_text = Path(path).read_text(encoding="utf-8", errors="replace")
-    seen = set()
-    statements = []
-    for stmt in split_sql_statements(sql_text):
-        if stmt not in seen:
-            seen.add(stmt)
-            statements.append(stmt)
-    return statements
+    statements = split_sql_statements(sql_text)
+    resolved = resolve_workload_sqls(statements)
+    workload_sqls = []
+    for item in resolved:
+        if item.error:
+            workload_sqls.append(item.source_sql)
+        else:
+            workload_sqls.append(normalize_sql(item.query_sql))
+    return workload_sqls
 
 
 def read_official_tsv(path):
@@ -338,20 +362,6 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
         title = short_sql(sql)
         unit = ["", f"SQL #{idx} {title}"]
         collectors = collector_index.get(sql, [])
-        if len(collectors) > 1:
-            db_names = unique_db_names(collectors)
-            if len(db_names) == 1:
-                collectors = collector_db_index.get((sql, db_names[0]), [])
-            else:
-                filtered = []
-                for db_name in db_names:
-                    rows = collector_db_index.get((sql, db_name), [])
-                    if len(rows) == 1:
-                        filtered = rows
-                        unit.append(f"  DEDUP collector by db_name={db_name} duplicate_rows={len(collectors)} db_names={','.join(db_names)}")
-                        break
-                if filtered:
-                    collectors = filtered
         if not collectors:
             collector_missing.append(sql)
             unit.append("  MISSING collector")
@@ -360,17 +370,8 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
                 print_lines(unit, "red")
                 printed += 1
             continue
-        if len(collectors) > 1:
-            duplicate_collector.append((sql, len(collectors)))
-            unit.append(f"  DUPLICATE collector rows={len(collectors)} unsupported")
-            unit.append("  event_seq=" + ",".join(row.get("event_seq", "") for row in collectors))
-            report.extend(unit)
-            if printed < max_print:
-                print_lines(unit, "yellow")
-                printed += 1
-            continue
 
-        collector = collectors[0]
+        collector = collectors.pop(0)
         trace_id = collector.get("trace_id", "")
         officials = official_matches(official_rows, sql, trace_id)
         unit.append(f"  event_seq={collector.get('event_seq', '')} trace_id={trace_id}")
