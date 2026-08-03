@@ -17,6 +17,11 @@
 #include <grpcpp/grpcpp.h>
 #include "audit_upload.grpc.pb.h"
 
+static constexpr uint32_t DEFAULT_GRPC_BATCH_BYTES = 262144;
+static constexpr uint32_t DEFAULT_GRPC_FLUSH_INTERVAL_MS = 1000;
+static constexpr uint32_t DEFAULT_GRPC_TIMEOUT_MS = 2000;
+static constexpr uint64_t DEFAULT_GRPC_QUEUE_BYTES = 64ULL * 1024 * 1024;
+
 struct AuditGrpcSender::Impl {
 	struct QueuedRecord {
 		std::string data;
@@ -348,10 +353,11 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 		std::lock_guard<std::mutex> lock(impl_->mutex);
 		impl_->config = config;
 		impl_->config.agent_id = impl_->config.agent_id.empty() ? "default-agent" : impl_->config.agent_id;
-		impl_->config.batch_bytes = default_or(impl_->config.batch_bytes, 262144);  // 256 KB
-		impl_->config.flush_interval_ms = default_or(impl_->config.flush_interval_ms, 1000);
-		impl_->config.timeout_ms = default_or(impl_->config.timeout_ms, 2000);
-		impl_->config.queue_bytes = default_or64(impl_->config.queue_bytes, 64ULL * 1024 * 1024); // 64MB
+			// 0 表示配置文件未显式设置，统一回退到 agent 默认值。
+			impl_->config.batch_bytes = default_or(impl_->config.batch_bytes, DEFAULT_GRPC_BATCH_BYTES);
+			impl_->config.flush_interval_ms = default_or(impl_->config.flush_interval_ms, DEFAULT_GRPC_FLUSH_INTERVAL_MS);
+			impl_->config.timeout_ms = default_or(impl_->config.timeout_ms, DEFAULT_GRPC_TIMEOUT_MS);
+			impl_->config.queue_bytes = default_or64(impl_->config.queue_bytes, DEFAULT_GRPC_QUEUE_BYTES);
 		impl_->resolver = std::move(resolver);
 		impl_->enabled = true;
 		impl_->stopping = false;

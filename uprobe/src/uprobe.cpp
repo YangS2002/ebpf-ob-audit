@@ -22,9 +22,16 @@ extern "C" {
 #include "agent_logger.h"
 #include "audit_grpc_sender.h"
 #include "ring_buffer/ring_buffer.h"
+#include "simple_yaml.h"
 
-// pending 环形缓冲区容量。单条合并事件最大约 128KB(sql + params 各 64KB)。
-#define PENDING_RINGBUF_SIZE (16 * 1024 * 1024)
+// agent 侧默认配置值集中在这里，配置文件缺省时使用这些安全默认值。
+static constexpr size_t DEFAULT_PENDING_RINGBUF_BYTES = 16ULL * 1024 * 1024;
+static constexpr unsigned int DEFAULT_GRPC_BATCH_BYTES = 262144;
+static constexpr unsigned int DEFAULT_GRPC_FLUSH_INTERVAL_MS = 1000;
+static constexpr unsigned int DEFAULT_GRPC_TIMEOUT_MS = 2000;
+static constexpr unsigned long long DEFAULT_GRPC_QUEUE_BYTES = 64ULL * 1024 * 1024;
+static constexpr unsigned int DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
+static constexpr unsigned int DEFAULT_GRPC_RETRY_MAX_MS = 500;
 
 static volatile bool exiting = false;
 
@@ -45,16 +52,19 @@ struct app_config {
 	std::string collector_discovery_service_name;
 	std::string collector_discovery_selection_policy;
 	bool collector_discovery = false;
-	unsigned int grpc_batch_bytes = 0;
-	unsigned int grpc_flush_interval_ms = 0;
-	unsigned int grpc_timeout_ms = 0;
-	unsigned long long grpc_queue_bytes = 0;
-	unsigned int grpc_retry_initial_ms = 0;
-	unsigned int grpc_retry_max_ms = 0;
+	size_t pending_ringbuf_bytes = DEFAULT_PENDING_RINGBUF_BYTES;
+	unsigned int grpc_batch_bytes = DEFAULT_GRPC_BATCH_BYTES;
+	unsigned int grpc_flush_interval_ms = DEFAULT_GRPC_FLUSH_INTERVAL_MS;
+	unsigned int grpc_timeout_ms = DEFAULT_GRPC_TIMEOUT_MS;
+	unsigned long long grpc_queue_bytes = DEFAULT_GRPC_QUEUE_BYTES;
+	unsigned int grpc_retry_initial_ms = DEFAULT_GRPC_RETRY_INITIAL_MS;
+	unsigned int grpc_retry_max_ms = DEFAULT_GRPC_RETRY_MAX_MS;
 };
 
 struct writer_state {
-	VarlenRingBuffer<unsigned long long> pending{PENDING_RINGBUF_SIZE};
+	explicit writer_state(size_t pending_ringbuf_bytes) : pending(pending_ringbuf_bytes) {}
+
+	VarlenRingBuffer<unsigned long long> pending;
 	unsigned long long consumed_events = 0;
 	unsigned long long consumed_bytes = 0;
 	unsigned long long dropped_events = 0;
@@ -89,61 +99,30 @@ static bool fill_ipv4_string(char *dst, const char *ip)
 	return true;
 }
 
-static std::string trim(std::string value)
-{
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
-		value.erase(value.begin());
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
-		value.pop_back();
-	return value;
-}
-
 static bool load_config(const char *path, app_config *config)
 {
-	if (!path || !*path)
-		return false;
-	FILE *file = fopen(path, "r");
-	if (!file)
+	if (!path || !*path || !config)
 		return false;
 
-	char line[512];
-	while (fgets(line, sizeof(line), file)) {
-		std::string text = trim(line);
-		if (text.empty() || text[0] == '#')
-			continue;
-		size_t pos = text.find('=');
-		if (pos == std::string::npos)
-			continue;
-		std::string key = trim(text.substr(0, pos));
-		std::string value = trim(text.substr(pos + 1));
-		if (key == "server_ip")
-			config->server_ip_text = value;
-		else if (key == "agent_id")
-			config->agent_id = value;
-		else if (key == "collector_addr")
-			config->collector_addr = value;
-		else if (key == "collector_discovery_enabled")
-			config->collector_discovery = value == "true" || value == "1" || value == "yes";
-		else if (key == "collector_discovery_etcd_endpoints")
-			config->collector_discovery_etcd_endpoints = value;
-		else if (key == "collector_discovery_service_name")
-			config->collector_discovery_service_name = value;
-		else if (key == "collector_discovery_selection_policy")
-			config->collector_discovery_selection_policy = value;
-		else if (key == "grpc_batch_bytes")
-			config->grpc_batch_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-		else if (key == "grpc_flush_interval_ms")
-			config->grpc_flush_interval_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-		else if (key == "grpc_timeout_ms")
-			config->grpc_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-		else if (key == "grpc_queue_bytes")
-			config->grpc_queue_bytes = strtoull(value.c_str(), nullptr, 10);
-		else if (key == "grpc_retry_initial_ms")
-			config->grpc_retry_initial_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-		else if (key == "grpc_retry_max_ms")
-			config->grpc_retry_max_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-	}
-	fclose(file);
+	SimpleYaml yaml;
+	if (!yaml.load(path))
+		return false;
+
+	// 运行时只读取部署脚本生成的 agent.yaml。部署层负责 global/node/override 合并。
+	config->agent_id = yaml.get_string("agent.id", config->agent_id);
+	config->server_ip_text = yaml.get_string("agent.server_ip", config->server_ip_text);
+	config->collector_addr = yaml.get_string("collector.addr", config->collector_addr);
+	config->collector_discovery = yaml.get_bool("collector.discovery.enabled", config->collector_discovery);
+	config->collector_discovery_etcd_endpoints = yaml.get_string("collector.discovery.etcd_endpoints", config->collector_discovery_etcd_endpoints);
+	config->collector_discovery_service_name = yaml.get_string("collector.discovery.service_name", config->collector_discovery_service_name);
+	config->collector_discovery_selection_policy = yaml.get_string("collector.discovery.selection_policy", config->collector_discovery_selection_policy);
+	config->pending_ringbuf_bytes = static_cast<size_t>(yaml.get_u64("buffer.pending_ringbuf_bytes", config->pending_ringbuf_bytes));
+	config->grpc_batch_bytes = yaml.get_u32("grpc.batch_bytes", config->grpc_batch_bytes);
+	config->grpc_flush_interval_ms = yaml.get_u32("grpc.flush_interval_ms", config->grpc_flush_interval_ms);
+	config->grpc_timeout_ms = yaml.get_u32("grpc.timeout_ms", config->grpc_timeout_ms);
+	config->grpc_queue_bytes = yaml.get_u64("grpc.queue_bytes", config->grpc_queue_bytes);
+	config->grpc_retry_initial_ms = yaml.get_u32("grpc.retry_initial_ms", config->grpc_retry_initial_ms);
+	config->grpc_retry_max_ms = yaml.get_u32("grpc.retry_max_ms", config->grpc_retry_max_ms);
 	return true;
 }
 
@@ -177,13 +156,16 @@ static void print_startup_status(const char *target, unsigned long long offset,
 					 const char *config_file, const app_config &config, const writer_state &state)
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
-	agent_log_info("event=agent_config agent_id=%s server_ip=%s grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu discovery=%s",
+	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
 	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
-	       config.grpc_batch_bytes ? config.grpc_batch_bytes : 262144,
-	       config.grpc_flush_interval_ms ? config.grpc_flush_interval_ms : 1000,
-	       config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000,
-	       config.grpc_queue_bytes ? config.grpc_queue_bytes : 64ULL * 1024 * 1024,
+	       state.pending.capacity(),
+	       config.grpc_batch_bytes,
+	       config.grpc_flush_interval_ms,
+	       config.grpc_timeout_ms,
+	       config.grpc_queue_bytes,
+	       config.grpc_retry_initial_ms,
+	       config.grpc_retry_max_ms,
 	       config.collector_discovery ? "true" : "false");
 	if (!state.grpc.enabled()) {
 		agent_log_error("event=collector_disabled reason=no_collector_available");
@@ -196,7 +178,7 @@ static void print_startup_status(const char *target, unsigned long long offset,
 		: current_collector.c_str();
 	agent_log_info("event=collector_connect discovery=%s target=%s",
 	       config.collector_discovery ? "etcd" : "static", target_addr);
-	bool ready = state.grpc.wait_ready(config.grpc_timeout_ms ? config.grpc_timeout_ms : 2000);
+	bool ready = state.grpc.wait_ready(config.grpc_timeout_ms);
 	agent_log_info("event=collector_state state=%s", ready ? "READY" : "NOT_READY");
 	if (!ready)
 		agent_log_error("event=collector_not_ready action=capture_local");
@@ -398,7 +380,7 @@ int main(int argc, char **argv)
 
 	const char *target = argv[1];
 	unsigned long long offset = parse_offset(argv[2]);
-	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "uprobe.conf");
+	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "agent.yaml");
 	const char *log_file = getenv("UPROBE_LOG_FILE");
 	if (!log_file || !*log_file)
 		log_file = "agent.log";
@@ -406,16 +388,22 @@ int main(int argc, char **argv)
 	uprobe_bpf *skel = nullptr;
 	bpf_link *link = nullptr;
 	ring_buffer *rb = nullptr;
-	writer_state state;
 	app_config config;
 	int err = 0;
-
 	load_config(config_file, &config);
+
+	std::unique_ptr<writer_state> state(new (std::nothrow) writer_state(config.pending_ringbuf_bytes));
+	if (!state || !state->pending.valid()) {
+		agent_log_error("event=pending_ringbuf_alloc_failed bytes=%zu", config.pending_ringbuf_bytes);
+		err = 1;
+		goto cleanup;
+	}
+
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
-	fill_ipv4_string(state.server_ip, config.server_ip_text.c_str());
-	init_grpc_sender(&state.grpc, config);
-	print_startup_status(target, offset, config_file, config, state);
+	fill_ipv4_string(state->server_ip, config.server_ip_text.c_str());
+	init_grpc_sender(&state->grpc, config);
+	print_startup_status(target, offset, config_file, config, *state);
 
 	// 打开、加载并通过 verifier 校验 BPF 程序。
 	skel = uprobe_bpf__open_and_load();
@@ -434,7 +422,7 @@ int main(int argc, char **argv)
 
 	// 绑定 BPF ringbuf map，用户态通过 poll 读取内核提交的事件。
 	// 注册handle_event事件回调函数
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &state, nullptr);
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, state.get(), nullptr);
 	if (!rb) {
 		err = -1;
 		agent_log_error("event=ring_buffer_create_failed");
@@ -457,7 +445,8 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
-	state.grpc.stop();
+	if (state)
+		state->grpc.stop();
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);

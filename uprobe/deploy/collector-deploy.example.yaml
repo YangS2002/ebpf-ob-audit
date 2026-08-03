@@ -1,34 +1,47 @@
 user:
+  # SSH 登录用户。部署脚本通过该用户把 collector 包复制到 collector 节点。
   username: yangshuo17
+  # SSH 端口。
   port: 32200
+  # SSH 密码；如果已配置免密登录，可以留空。
   password: ""
 
 collector:
   global:
+    # collector 部署目录。
     deploy_home: /home/yangshuo17/ebpf-ob-audit-collector
-    storage: mongodb
 
-    registry_enabled: true
-    registry_etcd_endpoints: http://7.27.43.139:2379
-    registry_service_name: audit-collector
-    registry_lease_ttl_sec: 10
-    registry_keepalive_interval_sec: 3
+    # collector 运行时配置。部署脚本会把本段和实例 override 合并成远端 conf/collector-<port>.yaml。
+    runtime:
+      collector:
+        registry:
+          # 是否把 collector 实例注册到 etcd，供 agent 服务发现。
+          enabled: true
+          etcd_endpoints: http://7.27.43.139:2379
+          service_name: audit-collector
+          lease_ttl_sec: 10
+          keepalive_interval_sec: 3
+      storage:
+        # 当前 collector 存储后端。
+        type: mongodb
+      mongodb:
+        uri: mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit
+        database: ob_audit
+        collection: audit_events
+        app_name: ebpf-ob-audit-collector
+        write_concern: w1
+        connect_timeout_ms: 2000
+        server_selection_timeout_ms: 3000
+        socket_timeout_ms: 5000
+        pool_min_size: 1
+        pool_max_size: 4
+        insert_concurrency: 2
+        bulk_max_records: 1000
+        bulk_max_bytes: 4194304
+        ordered_insert: false
 
-    mongodb_uri: mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit
-    mongodb_database: ob_audit
-    mongodb_collection: audit_events
-    mongodb_app_name: ebpf-ob-audit-collector
-    mongodb_write_concern: w1
-    mongodb_connect_timeout_ms: 2000
-    mongodb_server_selection_timeout_ms: 3000
-    mongodb_socket_timeout_ms: 5000
-    mongodb_pool_min_size: 1
-    mongodb_pool_max_size: 4
-    mongodb_insert_concurrency: 2
-    mongodb_bulk_max_records: 1000
-    mongodb_bulk_max_bytes: 4194304
-    mongodb_ordered_insert: false
-
+  # collector 实例列表。节点级字段只覆盖 collector 自己的监听、注册、存储配置。
+  # 不要在这里放 agent uprobe offset、pending buffer、grpc queue 等配置。
   servers:
     - name: collector-50051
       ip: 7.27.43.138
@@ -42,3 +55,7 @@ collector:
       ip: 7.27.43.138
       listen_port: 50053
       instance_id: collector-50053
+      # 示例：只给该实例覆盖 Mongo bulk 大小。
+      # override:
+      #   mongodb:
+      #     bulk_max_records: 2000

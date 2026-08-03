@@ -13,6 +13,7 @@
 #include "audit_event_parser.h"
 #include "collector_registry.h"
 #include "mongodb_sink.h"
+#include "simple_yaml.h"
 #include "uprobe.h"
 
 #if AUDIT_PERF_FIELDS_ENABLED
@@ -130,84 +131,39 @@ struct collector_app_config {
 	mongodb_config mongodb;
 };
 
-static std::string trim(std::string value)
-{
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
-		value.erase(value.begin());
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
-		value.pop_back();
-	return value;
-}
-
-static bool parse_bool(const std::string &value)
-{
-	return value == "true" || value == "1" || value == "yes";
-}
-
 static bool load_config_file(const char *path, collector_app_config *config)
 {
-	FILE *file = fopen(path, "r");
-	if (!file)
+	if (!path || !*path || !config)
 		return false;
 
-	char line[512];
-	while (fgets(line, sizeof(line), file)) {
-		std::string text = trim(line);
-		if (text.empty() || text[0] == '#')
-			continue;
-		size_t pos = text.find('=');
-		if (pos == std::string::npos)
-			continue;
-		std::string key = trim(text.substr(0, pos));
-		std::string value = trim(text.substr(pos + 1));
-			if (key == "collector_listen_addr")
-				config->listen_addr = value;
-			else if (key == "collector_storage")
-				config->storage = value;
-			else if (key == "collector_registry_enabled")
-			config->registry_enabled = parse_bool(value);
-		else if (key == "collector_registry_etcd_endpoints")
-			config->registry.etcd_endpoint = value;
-		else if (key == "collector_registry_service_name")
-			config->registry.service_name = value;
-		else if (key == "collector_registry_instance_id")
-			config->registry.collector_id = value;
-		else if (key == "collector_registry_advertise_addr")
-			config->registry.advertise_addr = value;
-		else if (key == "collector_registry_lease_ttl_sec")
-			config->registry.lease_ttl_sec = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "collector_registry_keepalive_interval_sec")
-				config->registry.keepalive_interval_sec = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_uri")
-				config->mongodb.uri = value;
-			else if (key == "mongodb_database")
-				config->mongodb.database = value;
-			else if (key == "mongodb_collection")
-				config->mongodb.collection = value;
-			else if (key == "mongodb_app_name")
-				config->mongodb.app_name = value;
-			else if (key == "mongodb_write_concern")
-				config->mongodb.write_concern = value;
-			else if (key == "mongodb_connect_timeout_ms")
-				config->mongodb.connect_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_server_selection_timeout_ms")
-				config->mongodb.server_selection_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_socket_timeout_ms")
-				config->mongodb.socket_timeout_ms = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_pool_min_size")
-				config->mongodb.pool_min_size = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_pool_max_size")
-				config->mongodb.pool_max_size = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_insert_concurrency")
-				config->mongodb.insert_concurrency = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_bulk_max_records")
-				config->mongodb.bulk_max_records = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_bulk_max_bytes")
-				config->mongodb.bulk_max_bytes = static_cast<unsigned int>(strtoul(value.c_str(), nullptr, 10));
-			else if (key == "mongodb_ordered_insert")
-				config->mongodb.ordered_insert = parse_bool(value);
-	}
-	fclose(file);
+	SimpleYaml yaml;
+	if (!yaml.load(path))
+		return false;
+
+	// 运行时只读取部署脚本生成的 collector.yaml。部署层负责 global/node/override 合并。
+	config->listen_addr = yaml.get_string("collector.listen_addr", config->listen_addr);
+	config->storage = yaml.get_string("storage.type", config->storage);
+	config->registry_enabled = yaml.get_bool("collector.registry.enabled", config->registry_enabled);
+	config->registry.etcd_endpoint = yaml.get_string("collector.registry.etcd_endpoints", config->registry.etcd_endpoint);
+	config->registry.service_name = yaml.get_string("collector.registry.service_name", config->registry.service_name);
+	config->registry.collector_id = yaml.get_string("collector.registry.instance_id", config->registry.collector_id);
+	config->registry.advertise_addr = yaml.get_string("collector.registry.advertise_addr", config->registry.advertise_addr);
+	config->registry.lease_ttl_sec = yaml.get_u32("collector.registry.lease_ttl_sec", config->registry.lease_ttl_sec);
+	config->registry.keepalive_interval_sec = yaml.get_u32("collector.registry.keepalive_interval_sec", config->registry.keepalive_interval_sec);
+	config->mongodb.uri = yaml.get_string("mongodb.uri", config->mongodb.uri);
+	config->mongodb.database = yaml.get_string("mongodb.database", config->mongodb.database);
+	config->mongodb.collection = yaml.get_string("mongodb.collection", config->mongodb.collection);
+	config->mongodb.app_name = yaml.get_string("mongodb.app_name", config->mongodb.app_name);
+	config->mongodb.write_concern = yaml.get_string("mongodb.write_concern", config->mongodb.write_concern);
+	config->mongodb.connect_timeout_ms = yaml.get_u32("mongodb.connect_timeout_ms", config->mongodb.connect_timeout_ms);
+	config->mongodb.server_selection_timeout_ms = yaml.get_u32("mongodb.server_selection_timeout_ms", config->mongodb.server_selection_timeout_ms);
+	config->mongodb.socket_timeout_ms = yaml.get_u32("mongodb.socket_timeout_ms", config->mongodb.socket_timeout_ms);
+	config->mongodb.pool_min_size = yaml.get_u32("mongodb.pool_min_size", config->mongodb.pool_min_size);
+	config->mongodb.pool_max_size = yaml.get_u32("mongodb.pool_max_size", config->mongodb.pool_max_size);
+	config->mongodb.insert_concurrency = yaml.get_u32("mongodb.insert_concurrency", config->mongodb.insert_concurrency);
+	config->mongodb.bulk_max_records = yaml.get_u32("mongodb.bulk_max_records", config->mongodb.bulk_max_records);
+	config->mongodb.bulk_max_bytes = yaml.get_u32("mongodb.bulk_max_bytes", config->mongodb.bulk_max_bytes);
+	config->mongodb.ordered_insert = yaml.get_bool("mongodb.ordered_insert", config->mongodb.ordered_insert);
 	return true;
 }
 
@@ -217,7 +173,7 @@ static const char *config_path_from_args(int argc, char **argv)
 		if (strcmp(argv[i], "--config") == 0)
 			return argv[i + 1];
 	}
-	return "uprobe.conf";
+	return "collector.yaml";
 }
 
 int main(int argc, char **argv)

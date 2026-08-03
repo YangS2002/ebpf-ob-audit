@@ -31,6 +31,7 @@ class Node:
     observer_path: str = ""
     offset: str = ""
     output_file: str = "out.adt"
+    runtime: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -50,6 +51,10 @@ class DeployConfig:
     grpc_batch_bytes: int
     grpc_flush_interval_ms: int
     grpc_timeout_ms: int
+    grpc_queue_bytes: int
+    grpc_retry_initial_ms: int
+    grpc_retry_max_ms: int
+    pending_ringbuf_bytes: int
     observer_path: str
     offset: str
     output_file: str
@@ -189,6 +194,102 @@ def parse_yaml_subset(path: Path) -> Dict[str, Any]:
     return root
 
 
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def to_yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text == "" or any(ch in text for ch in [":", "#", " ", "\t"]):
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def dump_yaml(data: Dict[str, Any], indent: int = 0) -> List[str]:
+    lines: List[str] = []
+    prefix = " " * indent
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.extend(dump_yaml(value, indent + 2))
+        else:
+            lines.append(f"{prefix}{key}: {to_yaml_scalar(value)}")
+    return lines
+
+
+def default_agent_runtime() -> Dict[str, Any]:
+    return {
+        "collector": {
+            "addr": "",
+            "discovery": {
+                "enabled": True,
+                "etcd_endpoints": "http://7.27.43.139:2379",
+                "service_name": "audit-collector",
+                "selection_policy": "hash_agent",
+            },
+        },
+        "buffer": {
+            "pending_ringbuf_bytes": 16 * 1024 * 1024,
+        },
+        "grpc": {
+            "batch_bytes": 262144,
+            "flush_interval_ms": 1000,
+            "timeout_ms": 2000,
+            "queue_bytes": 64 * 1024 * 1024,
+            "retry_initial_ms": 100,
+            "retry_max_ms": 500,
+        },
+        "uprobe": {
+            "observer_path": "",
+            "offset": "",
+            "output_file": "out.adt",
+        },
+    }
+
+
+def legacy_agent_runtime(agent_global: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = default_agent_runtime()
+    runtime = deep_merge(runtime, {
+        "collector": {
+            "addr": agent_global.get("collector_addr", runtime["collector"]["addr"]),
+            "discovery": {
+                "enabled": agent_global.get("collector_discovery_enabled", runtime["collector"]["discovery"]["enabled"]),
+                "etcd_endpoints": agent_global.get("collector_discovery_etcd_endpoints", runtime["collector"]["discovery"]["etcd_endpoints"]),
+                "service_name": agent_global.get("collector_discovery_service_name", runtime["collector"]["discovery"]["service_name"]),
+                "selection_policy": agent_global.get("collector_discovery_selection_policy", runtime["collector"]["discovery"]["selection_policy"]),
+            },
+        },
+        "buffer": {
+            "pending_ringbuf_bytes": agent_global.get("pending_ringbuf_bytes", runtime["buffer"]["pending_ringbuf_bytes"]),
+        },
+        "grpc": {
+            "batch_bytes": agent_global.get("grpc_batch_bytes", runtime["grpc"]["batch_bytes"]),
+            "flush_interval_ms": agent_global.get("grpc_flush_interval_ms", runtime["grpc"]["flush_interval_ms"]),
+            "timeout_ms": agent_global.get("grpc_timeout_ms", runtime["grpc"]["timeout_ms"]),
+            "queue_bytes": agent_global.get("grpc_queue_bytes", runtime["grpc"]["queue_bytes"]),
+            "retry_initial_ms": agent_global.get("grpc_retry_initial_ms", runtime["grpc"]["retry_initial_ms"]),
+            "retry_max_ms": agent_global.get("grpc_retry_max_ms", runtime["grpc"]["retry_max_ms"]),
+        },
+        "uprobe": {
+            "observer_path": agent_global.get("observer_path", runtime["uprobe"]["observer_path"]),
+            "offset": agent_global.get("offset", runtime["uprobe"]["offset"]),
+            "output_file": agent_global.get("output_file", runtime["uprobe"]["output_file"]),
+        },
+    })
+    runtime = deep_merge(runtime, agent_global.get("runtime", {}) if isinstance(agent_global.get("runtime", {}), dict) else {})
+    return runtime
+
+
 def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
     current: Any = data
     for part in dotted.split("."):
@@ -210,24 +311,12 @@ def parse_config(path: Path) -> DeployConfig:
     password = str(user.get("password", ""))
     sudo_password = str(user.get("sudo_password", user.get("user_password", "")))
     deploy_home = str(agent_global.get("deploy_home", "~/ebpf-ob-audit-agent"))
-    collector_addr = str(agent_global.get("collector_addr", ""))
-    collector_discovery_enabled = bool(agent_global.get("collector_discovery_enabled", True))
-    collector_discovery_etcd_endpoints = str(agent_global.get("collector_discovery_etcd_endpoints", "http://7.27.43.139:2379"))
-    collector_discovery_service_name = str(agent_global.get("collector_discovery_service_name", "audit-collector"))
-    collector_discovery_watch = bool(agent_global.get("collector_discovery_watch", True))
-    collector_discovery_retry_interval_ms = int(agent_global.get("collector_discovery_retry_interval_ms", 3000))
-    collector_discovery_selection_policy = str(agent_global.get("collector_discovery_selection_policy", "hash_agent"))
-    grpc_batch_bytes = int(agent_global.get("grpc_batch_bytes", 262144))
-    grpc_flush_interval_ms = int(agent_global.get("grpc_flush_interval_ms", 1000))
-    grpc_timeout_ms = int(agent_global.get("grpc_timeout_ms", 2000))
-    observer_path = str(agent_global.get("observer_path", ""))
-    offset = str(agent_global.get("offset", ""))
-    output_file = str(agent_global.get("output_file", "out.adt"))
+    runtime_global = legacy_agent_runtime(agent_global)
 
-    if not observer_path:
+    if not get_path(runtime_global, "uprobe.observer_path", ""):
         home_path = str(ob_global.get("home_path", ""))
         if home_path:
-            observer_path = f"{home_path}/bin/observer"
+            runtime_global = deep_merge(runtime_global, {"uprobe": {"observer_path": f"{home_path}/bin/observer"}})
 
     nodes: List[Node] = []
     if isinstance(servers, list):
@@ -237,20 +326,49 @@ def parse_config(path: Path) -> DeployConfig:
             name = str(server.get("name", f"node{idx + 1}"))
             ip = str(server.get("ip", ""))
             node_cfg = get_path(data, f"agent.{name}", {}) or {}
+            node_runtime = deep_merge(runtime_global, node_cfg.get("runtime", {}) if isinstance(node_cfg.get("runtime", {}), dict) else {})
+            if "observer_path" in node_cfg or "offset" in node_cfg or "output_file" in node_cfg:
+                node_runtime = deep_merge(node_runtime, {"uprobe": {
+                    "observer_path": node_cfg.get("observer_path", get_path(node_runtime, "uprobe.observer_path", "")),
+                    "offset": node_cfg.get("offset", get_path(node_runtime, "uprobe.offset", "")),
+                    "output_file": node_cfg.get("output_file", get_path(node_runtime, "uprobe.output_file", "out.adt")),
+                }})
+            node_runtime = deep_merge(node_runtime, node_cfg.get("override", {}) if isinstance(node_cfg.get("override", {}), dict) else {})
             nodes.append(Node(
                 name=name,
                 ip=ip,
                 deploy_home=str(node_cfg.get("deploy_home", deploy_home)),
-                observer_path=str(node_cfg.get("observer_path", observer_path)),
-                offset=str(node_cfg.get("offset", offset)),
-                output_file=str(node_cfg.get("output_file", output_file)),
+                observer_path=str(get_path(node_runtime, "uprobe.observer_path", "")),
+                offset=str(get_path(node_runtime, "uprobe.offset", "")),
+                output_file=str(get_path(node_runtime, "uprobe.output_file", "out.adt")),
+                runtime=node_runtime,
             ))
 
-    config = DeployConfig(username, port, password, sudo_password, deploy_home, collector_addr,
-                          collector_discovery_enabled, collector_discovery_etcd_endpoints,
-                          collector_discovery_service_name, collector_discovery_watch,
-                          collector_discovery_retry_interval_ms, collector_discovery_selection_policy,
-                          grpc_batch_bytes, grpc_flush_interval_ms, grpc_timeout_ms, observer_path, offset, output_file, nodes)
+    config = DeployConfig(
+        username=username,
+        port=port,
+        password=password,
+        sudo_password=sudo_password,
+        deploy_home=deploy_home,
+        collector_addr=str(get_path(runtime_global, "collector.addr", "")),
+        collector_discovery_enabled=bool(get_path(runtime_global, "collector.discovery.enabled", True)),
+        collector_discovery_etcd_endpoints=str(get_path(runtime_global, "collector.discovery.etcd_endpoints", "")),
+        collector_discovery_service_name=str(get_path(runtime_global, "collector.discovery.service_name", "audit-collector")),
+        collector_discovery_watch=True,
+        collector_discovery_retry_interval_ms=3000,
+        collector_discovery_selection_policy=str(get_path(runtime_global, "collector.discovery.selection_policy", "hash_agent")),
+        grpc_batch_bytes=int(get_path(runtime_global, "grpc.batch_bytes", 262144)),
+        grpc_flush_interval_ms=int(get_path(runtime_global, "grpc.flush_interval_ms", 1000)),
+        grpc_timeout_ms=int(get_path(runtime_global, "grpc.timeout_ms", 2000)),
+        grpc_queue_bytes=int(get_path(runtime_global, "grpc.queue_bytes", 64 * 1024 * 1024)),
+        grpc_retry_initial_ms=int(get_path(runtime_global, "grpc.retry_initial_ms", 100)),
+        grpc_retry_max_ms=int(get_path(runtime_global, "grpc.retry_max_ms", 500)),
+        pending_ringbuf_bytes=int(get_path(runtime_global, "buffer.pending_ringbuf_bytes", 16 * 1024 * 1024)),
+        observer_path=str(get_path(runtime_global, "uprobe.observer_path", "")),
+        offset=str(get_path(runtime_global, "uprobe.offset", "")),
+        output_file=str(get_path(runtime_global, "uprobe.output_file", "out.adt")),
+        nodes=nodes,
+    )
     validate_config(config)
     return config
 
@@ -322,26 +440,12 @@ def write_text(path: Path, content: str, mode: Optional[int] = None) -> None:
         path.chmod(mode)
 
 
-def render_uprobe_conf(config: DeployConfig, node: Node) -> str:
+def render_agent_yaml(node: Node) -> str:
+    runtime = deep_merge(node.runtime, {"agent": {"id": f"agent-{node.name}-{node.ip}", "server_ip": node.ip}})
     return "\n".join([
-        "# generated by uprobe/deploy/deploy_agent.py",
-        f"server_ip={node.ip}",
-        f"agent_id=agent-{node.name}-{node.ip}",
-        "",
-        f"collector_addr={config.collector_addr}",
-        f"collector_discovery_enabled={str(config.collector_discovery_enabled).lower()}",
-        f"collector_discovery_etcd_endpoints={config.collector_discovery_etcd_endpoints}",
-        f"collector_discovery_service_name={config.collector_discovery_service_name}",
-        f"collector_discovery_watch={str(config.collector_discovery_watch).lower()}",
-        f"collector_discovery_retry_interval_ms={config.collector_discovery_retry_interval_ms}",
-        f"collector_discovery_selection_policy={config.collector_discovery_selection_policy}",
-        "",
-        f"grpc_batch_bytes={config.grpc_batch_bytes}",
-        f"grpc_flush_interval_ms={config.grpc_flush_interval_ms}",
-        f"grpc_timeout_ms={config.grpc_timeout_ms}",
-        "grpc_queue_bytes=262144",
-        "grpc_retry_initial_ms=100",
-        "grpc_retry_max_ms=500",
+        "# agent 运行时配置，由 deploy_agent.py 根据 agent-deploy YAML 生成。",
+        "# 请不要手工修改远端该文件；需要变更时修改部署 YAML 的 global、节点字段或 override。",
+        *dump_yaml(runtime),
         "",
     ])
 
@@ -356,9 +460,9 @@ set -euo pipefail
 DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
 mkdir -p "$DEPLOY_HOME/logs"
-	export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
-	: > "$UPROBE_LOG_FILE"
-	{incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/uprobe.conf"
+export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
+: > "$UPROBE_LOG_FILE"
+{incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/agent.yaml"
 """
 
 
@@ -404,9 +508,9 @@ def remote(config: DeployConfig, node: Node, command: str, dry_run: bool = False
 
 def deploy_node(config: DeployConfig, node: Node, archive: Path, dry_run: bool) -> NodeResult:
     remote_tmp = f"/tmp/{archive.name}"
-    conf_path = archive.parent / f"uprobe-{node.name}-{node.ip}.conf"
-    write_text(conf_path, render_uprobe_conf(config, node))
-    remote_conf = f"{node.deploy_home}/conf/uprobe.conf"
+    conf_path = archive.parent / f"agent-{node.name}-{node.ip}.yaml"
+    write_text(conf_path, render_agent_yaml(node))
+    remote_conf = f"{node.deploy_home}/conf/agent.yaml"
     require_cmd(ssh_base(config, node.ip) + [f"mkdir -p {quote_arg(node.deploy_home)} {quote_arg(node.deploy_home + '/conf')}"], dry_run=dry_run)
     require_cmd(scp_base(config, archive, node.ip, remote_tmp), dry_run=dry_run)
     unpack_cmd = f"tar -xzf {quote_arg(remote_tmp)} -C {quote_arg(node.deploy_home)} && rm -f {quote_arg(remote_tmp)}"
