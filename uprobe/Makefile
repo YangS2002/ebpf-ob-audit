@@ -157,6 +157,13 @@ $(BINDIR)/collector_connection_test: $(TEST_DIR)/collector_connection_test.cpp $
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) $< $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
 
+.PHONY: agent-sender-e2e-test
+agent-sender-e2e-test: $(BINDIR)/agent_sender_e2e_test
+
+$(BINDIR)/agent_sender_e2e_test: $(TEST_DIR)/e2e_agent_sender/audit_grpc_sender_e2e_test.cpp $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(GTEST_LDLIBS) -o $@
+
 .PHONY: event-size
 event-size: $(BINDIR)/event_size
 

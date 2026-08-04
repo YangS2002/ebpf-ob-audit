@@ -29,7 +29,9 @@ static constexpr size_t DEFAULT_PENDING_RINGBUF_BYTES = 16ULL * 1024 * 1024;
 static constexpr unsigned int DEFAULT_GRPC_BATCH_BYTES = 262144;
 static constexpr unsigned int DEFAULT_GRPC_FLUSH_INTERVAL_MS = 1000;
 static constexpr unsigned int DEFAULT_GRPC_TIMEOUT_MS = 2000;
-static constexpr unsigned long long DEFAULT_GRPC_QUEUE_BYTES = 64ULL * 1024 * 1024;
+static constexpr unsigned long long DEFAULT_GRPC_POOL_BYTES = 64ULL * 1024 * 1024;
+static constexpr unsigned int DEFAULT_GRPC_UPLOAD_CONCURRENCY = 2;
+static constexpr unsigned int DEFAULT_GRPC_MAX_RETRIES = 3;
 static constexpr unsigned int DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
 static constexpr unsigned int DEFAULT_GRPC_RETRY_MAX_MS = 500;
 
@@ -56,7 +58,9 @@ struct app_config {
 	unsigned int grpc_batch_bytes = DEFAULT_GRPC_BATCH_BYTES;
 	unsigned int grpc_flush_interval_ms = DEFAULT_GRPC_FLUSH_INTERVAL_MS;
 	unsigned int grpc_timeout_ms = DEFAULT_GRPC_TIMEOUT_MS;
-	unsigned long long grpc_queue_bytes = DEFAULT_GRPC_QUEUE_BYTES;
+	unsigned long long grpc_pool_bytes = DEFAULT_GRPC_POOL_BYTES;
+	unsigned int grpc_upload_concurrency = DEFAULT_GRPC_UPLOAD_CONCURRENCY;
+	unsigned int grpc_max_retries = DEFAULT_GRPC_MAX_RETRIES;
 	unsigned int grpc_retry_initial_ms = DEFAULT_GRPC_RETRY_INITIAL_MS;
 	unsigned int grpc_retry_max_ms = DEFAULT_GRPC_RETRY_MAX_MS;
 };
@@ -120,13 +124,15 @@ static bool load_config(const char *path, app_config *config)
 	config->grpc_batch_bytes = yaml.get_u32("grpc.batch_bytes", config->grpc_batch_bytes);
 	config->grpc_flush_interval_ms = yaml.get_u32("grpc.flush_interval_ms", config->grpc_flush_interval_ms);
 	config->grpc_timeout_ms = yaml.get_u32("grpc.timeout_ms", config->grpc_timeout_ms);
-	config->grpc_queue_bytes = yaml.get_u64("grpc.queue_bytes", config->grpc_queue_bytes);
+	config->grpc_pool_bytes = yaml.get_u64("grpc.pool_bytes", config->grpc_pool_bytes);
+	config->grpc_upload_concurrency = yaml.get_u32("grpc.upload_concurrency", config->grpc_upload_concurrency);
+	config->grpc_max_retries = yaml.get_u32("grpc.max_retries", config->grpc_max_retries);
 	config->grpc_retry_initial_ms = yaml.get_u32("grpc.retry_initial_ms", config->grpc_retry_initial_ms);
 	config->grpc_retry_max_ms = yaml.get_u32("grpc.retry_max_ms", config->grpc_retry_max_ms);
 	return true;
 }
 
-static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
+static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 {
 	audit_grpc_config grpc_config;
 	grpc_config.agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
@@ -137,7 +143,9 @@ static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 	grpc_config.batch_bytes = config.grpc_batch_bytes;
 	grpc_config.flush_interval_ms = config.grpc_flush_interval_ms;
 	grpc_config.timeout_ms = config.grpc_timeout_ms;
-	grpc_config.queue_bytes = config.grpc_queue_bytes;
+	grpc_config.pool_bytes = config.grpc_pool_bytes;
+	grpc_config.upload_concurrency = config.grpc_upload_concurrency;
+	grpc_config.max_retries = config.grpc_max_retries;
 	grpc_config.retry_initial_ms = config.grpc_retry_initial_ms;
 	grpc_config.retry_max_ms = config.grpc_retry_max_ms;
 	if (config.collector_discovery && !config.collector_discovery_etcd_endpoints.empty()) {
@@ -146,24 +154,25 @@ static void init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 			config.collector_discovery_service_name.empty() ? "audit-collector" : config.collector_discovery_service_name,
 			grpc_config.agent_id,
 			config.collector_discovery_selection_policy.empty() ? "first" : config.collector_discovery_selection_policy));
-		sender->start(grpc_config, std::move(resolver));
-		return;
+		return sender->start(grpc_config, std::move(resolver));
 	}
-	sender->start(grpc_config);
+	return sender->start(grpc_config);
 }
 
 static void print_startup_status(const char *target, unsigned long long offset,
 					 const char *config_file, const app_config &config, const writer_state &state)
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
-	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_queue_bytes=%llu grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
+	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_pool_bytes=%llu grpc_upload_concurrency=%u grpc_max_retries=%u grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
 	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       state.pending.capacity(),
 	       config.grpc_batch_bytes,
 	       config.grpc_flush_interval_ms,
 	       config.grpc_timeout_ms,
-	       config.grpc_queue_bytes,
+	       config.grpc_pool_bytes,
+	       config.grpc_upload_concurrency,
+	       config.grpc_max_retries,
 	       config.grpc_retry_initial_ms,
 	       config.grpc_retry_max_ms,
 	       config.collector_discovery ? "true" : "false");
@@ -315,7 +324,6 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	if (fragment->next_fragment_seq != 0 && (fragment->record_flags & AUDIT_RECORD_FLAG_LAST_FRAGMENT) == 0)
 		// 非最后一个分片，等待后续分片
 		return 0;
-
 	// 尾片到达且记录完整：补齐段头，进发送队列，释放段。
 	unsigned int full_params = (hdr->fragment_flags & FRAG_PARAMS_VALUE_FRAGMENTED)
 					   ? clamp_capture(hdr->params_value_len, AUDIT_PARAMS_CAPTURE_MAX)
@@ -402,7 +410,11 @@ int main(int argc, char **argv)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state->server_ip, config.server_ip_text.c_str());
-	init_grpc_sender(&state->grpc, config);
+	if (!init_grpc_sender(&state->grpc, config)) {
+		agent_log_error("event=grpc_sender_start_failed");
+		err = 1;
+		goto cleanup;
+	}
 	print_startup_status(target, offset, config_file, config, *state);
 
 	// 打开、加载并通过 verifier 校验 BPF 程序。

@@ -241,12 +241,12 @@ def dump_yaml(data: Dict[str, Any], indent: int = 0) -> List[str]:
 def default_collector_runtime() -> Dict[str, Any]:
     return {
         "collector": {
-            "listen_addr": "0.0.0.0:50051",
+            "listen_addr": "",
             "registry": {
                 "enabled": True,
-                "etcd_endpoints": "http://7.27.43.139:2379",
-                "service_name": "audit-collector",
-                "instance_id": "collector-1",
+                "etcd_endpoints": "",
+                "service_name": "",
+                "instance_id": "",
                 "advertise_addr": "",
                 "lease_ttl_sec": 10,
                 "keepalive_interval_sec": 3,
@@ -254,9 +254,9 @@ def default_collector_runtime() -> Dict[str, Any]:
         },
         "storage": {"type": "mongodb"},
         "mongodb": {
-            "uri": "mongodb://7.27.43.139:27017",
-            "database": "ob_audit",
-            "collection": "audit_events",
+            "uri": "",
+            "database": "",
+            "collection": "",
             "app_name": "ebpf-ob-audit-collector",
             "write_concern": "w1",
             "connect_timeout_ms": 2000,
@@ -270,38 +270,6 @@ def default_collector_runtime() -> Dict[str, Any]:
             "ordered_insert": False,
         },
     }
-
-
-def legacy_collector_runtime(global_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    runtime = default_collector_runtime()
-    runtime = deep_merge(runtime, {
-        "storage": {"type": global_cfg.get("storage", get_path(runtime, "storage.type", "mongodb"))},
-        "collector": {"registry": {
-            "enabled": global_cfg.get("registry_enabled", get_path(runtime, "collector.registry.enabled", True)),
-            "etcd_endpoints": global_cfg.get("registry_etcd_endpoints", get_path(runtime, "collector.registry.etcd_endpoints", "")),
-            "service_name": global_cfg.get("registry_service_name", get_path(runtime, "collector.registry.service_name", "audit-collector")),
-            "lease_ttl_sec": global_cfg.get("registry_lease_ttl_sec", get_path(runtime, "collector.registry.lease_ttl_sec", 10)),
-            "keepalive_interval_sec": global_cfg.get("registry_keepalive_interval_sec", get_path(runtime, "collector.registry.keepalive_interval_sec", 3)),
-        }},
-        "mongodb": {
-            "uri": global_cfg.get("mongodb_uri", get_path(runtime, "mongodb.uri", "")),
-            "database": global_cfg.get("mongodb_database", get_path(runtime, "mongodb.database", "ob_audit")),
-            "collection": global_cfg.get("mongodb_collection", get_path(runtime, "mongodb.collection", "audit_events")),
-            "app_name": global_cfg.get("mongodb_app_name", get_path(runtime, "mongodb.app_name", "ebpf-ob-audit-collector")),
-            "write_concern": global_cfg.get("mongodb_write_concern", get_path(runtime, "mongodb.write_concern", "w1")),
-            "connect_timeout_ms": global_cfg.get("mongodb_connect_timeout_ms", get_path(runtime, "mongodb.connect_timeout_ms", 2000)),
-            "server_selection_timeout_ms": global_cfg.get("mongodb_server_selection_timeout_ms", get_path(runtime, "mongodb.server_selection_timeout_ms", 3000)),
-            "socket_timeout_ms": global_cfg.get("mongodb_socket_timeout_ms", get_path(runtime, "mongodb.socket_timeout_ms", 5000)),
-            "pool_min_size": global_cfg.get("mongodb_pool_min_size", get_path(runtime, "mongodb.pool_min_size", 1)),
-            "pool_max_size": global_cfg.get("mongodb_pool_max_size", get_path(runtime, "mongodb.pool_max_size", 4)),
-            "insert_concurrency": global_cfg.get("mongodb_insert_concurrency", get_path(runtime, "mongodb.insert_concurrency", 2)),
-            "bulk_max_records": global_cfg.get("mongodb_bulk_max_records", get_path(runtime, "mongodb.bulk_max_records", 1000)),
-            "bulk_max_bytes": global_cfg.get("mongodb_bulk_max_bytes", get_path(runtime, "mongodb.bulk_max_bytes", 4194304)),
-            "ordered_insert": global_cfg.get("mongodb_ordered_insert", get_path(runtime, "mongodb.ordered_insert", False)),
-        },
-    })
-    runtime = deep_merge(runtime, global_cfg.get("runtime", {}) if isinstance(global_cfg.get("runtime", {}), dict) else {})
-    return runtime
 
 
 def bool_value(value: Any) -> bool:
@@ -327,7 +295,7 @@ def parse_config(path: Path) -> DeployConfig:
     port = int(user.get("port", 22))
     password = str(user.get("password", ""))
     deploy_home = str(global_cfg.get("deploy_home", "/home/yangshuo17/ebpf-ob-audit-collector"))
-    runtime_global = legacy_collector_runtime(global_cfg)
+    runtime_global = deep_merge(default_collector_runtime(), global_cfg.get("runtime", {}) if isinstance(global_cfg.get("runtime", {}), dict) else {})
 
     config = DeployConfig(
         username=username,
@@ -337,12 +305,12 @@ def parse_config(path: Path) -> DeployConfig:
         storage=str(get_path(runtime_global, "storage.type", "mongodb")),
         registry_enabled=bool_value(get_path(runtime_global, "collector.registry.enabled", True)),
         registry_etcd_endpoints=str(get_path(runtime_global, "collector.registry.etcd_endpoints", "")),
-        registry_service_name=str(get_path(runtime_global, "collector.registry.service_name", "audit-collector")),
+        registry_service_name=str(get_path(runtime_global, "collector.registry.service_name", "")),
         registry_lease_ttl_sec=int(get_path(runtime_global, "collector.registry.lease_ttl_sec", 10)),
         registry_keepalive_interval_sec=int(get_path(runtime_global, "collector.registry.keepalive_interval_sec", 3)),
         mongodb_uri=str(get_path(runtime_global, "mongodb.uri", "")),
-        mongodb_database=str(get_path(runtime_global, "mongodb.database", "ob_audit")),
-        mongodb_collection=str(get_path(runtime_global, "mongodb.collection", "audit_events")),
+        mongodb_database=str(get_path(runtime_global, "mongodb.database", "")),
+        mongodb_collection=str(get_path(runtime_global, "mongodb.collection", "")),
         mongodb_app_name=str(get_path(runtime_global, "mongodb.app_name", "ebpf-ob-audit-collector")),
         mongodb_write_concern=str(get_path(runtime_global, "mongodb.write_concern", "w1")),
         mongodb_connect_timeout_ms=int(get_path(runtime_global, "mongodb.connect_timeout_ms", 2000)),
@@ -401,6 +369,35 @@ def validate_config(config: DeployConfig) -> None:
             missing.append(f"collector.servers[{node.name}].advertise_addr")
     if missing:
         raise DeployError("missing required config fields: " + ", ".join(missing))
+
+
+def is_empty_required(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) == 0
+    return False
+
+
+def add_required_error(errors: List[str], kind: str, node: CollectorNode, field: str) -> None:
+    value = get_path(node.runtime, field)
+    if is_empty_required(value):
+        errors.append(f"CONFIG ERROR {kind} {node.name} {node.ip}: missing runtime.{field}")
+
+
+def validate_collector_runtime(config: DeployConfig) -> None:
+    errors: List[str] = []
+    for node in config.collectors:
+        add_required_error(errors, "collector", node, "collector.listen_addr")
+        add_required_error(errors, "collector", node, "storage.type")
+        if get_path(node.runtime, "storage.type", "") == "mongodb":
+            add_required_error(errors, "collector", node, "mongodb.uri")
+            add_required_error(errors, "collector", node, "mongodb.database")
+            add_required_error(errors, "collector", node, "mongodb.collection")
+    if errors:
+        raise DeployError("\n".join(errors))
 
 
 def build_collector(skip_build: bool) -> None:
@@ -701,6 +698,8 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action in ("start", "deploy-start"):
+            validate_collector_runtime(config)
         if config.password:
             print("INFO using user.password for SSH via sshpass.")
         build_dir.mkdir(parents=True, exist_ok=True)

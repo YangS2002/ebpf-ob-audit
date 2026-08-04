@@ -9,7 +9,9 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -20,16 +22,85 @@
 static constexpr uint32_t DEFAULT_GRPC_BATCH_BYTES = 262144;
 static constexpr uint32_t DEFAULT_GRPC_FLUSH_INTERVAL_MS = 1000;
 static constexpr uint32_t DEFAULT_GRPC_TIMEOUT_MS = 2000;
-static constexpr uint64_t DEFAULT_GRPC_QUEUE_BYTES = 64ULL * 1024 * 1024;
+static constexpr uint64_t DEFAULT_GRPC_POOL_BYTES = 64ULL * 1024 * 1024;
+static constexpr uint32_t DEFAULT_GRPC_UPLOAD_CONCURRENCY = 2;
+static constexpr uint32_t DEFAULT_GRPC_MAX_RETRIES = 3;
+static constexpr uint32_t DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
+static constexpr uint32_t DEFAULT_GRPC_RETRY_MAX_MS = 500;
+static constexpr uint32_t MAX_GRPC_UPLOAD_CONCURRENCY = 8;
 
 struct AuditGrpcSender::Impl {
-	struct QueuedRecord {
-		std::string data;
+	struct Batch {
+		char *data = nullptr;
+		uint32_t capacity = 0;
+		uint32_t used = 0;
+		uint32_t record_count = 0;
+		std::chrono::steady_clock::time_point first_record_time;
 	};
 
-	struct LocalBatch {
-		std::string records;
-		uint64_t record_count = 0;
+	struct BatchPool {
+		std::unique_ptr<char[]> memory;
+		std::unique_ptr<Batch[]> batches;
+		std::vector<uint32_t> free_indexes;
+		std::vector<bool> free_flags;
+		uint32_t batch_count = 0;
+		uint32_t batch_bytes = 0;
+
+		bool init(uint64_t pool_bytes, uint32_t batch_size, uint32_t min_batches)
+		{
+			if (batch_size == 0)
+				return false;
+			uint64_t count = pool_bytes / batch_size;
+			if (count < min_batches || count > UINT32_MAX)
+				return false;
+			memory.reset(new (std::nothrow) char[count * batch_size]);
+			batches.reset(new (std::nothrow) Batch[count]);
+			if (!memory || !batches)
+				return false;
+			free_indexes.clear();
+			free_indexes.reserve((size_t)count);
+			free_flags.assign((size_t)count, true);
+			batch_count = (uint32_t)count;
+			batch_bytes = batch_size;
+			for (uint32_t i = 0; i < batch_count; i++) {
+				batches[i].data = memory.get() + (uint64_t)i * batch_bytes;
+				batches[i].capacity = batch_bytes;
+				batches[i].used = 0;
+				batches[i].record_count = 0;
+				free_indexes.push_back(batch_count - 1 - i);
+			}
+			return true;
+		}
+
+		Batch *acquire()
+		{
+			if (free_indexes.empty())
+				return nullptr;
+			uint32_t idx = free_indexes.back();
+			free_indexes.pop_back();
+			free_flags[idx] = false;
+			Batch *batch = &batches[idx];
+			batch->used = 0;
+			batch->record_count = 0;
+			batch->first_record_time = std::chrono::steady_clock::time_point();
+			return batch;
+		}
+
+		void release(Batch *batch)
+		{
+			if (!batch || !batches)
+				return;
+			uint32_t idx = (uint32_t)(batch - batches.get());
+			if (idx >= batch_count || free_flags[idx])
+				return;
+			batch->used = 0;
+			batch->record_count = 0;
+			batch->first_record_time = std::chrono::steady_clock::time_point();
+			free_flags[idx] = true;
+			free_indexes.push_back(idx);
+		}
+
+		uint32_t free_count() const { return (uint32_t)free_indexes.size(); }
 	};
 
 	bool enabled = false;
@@ -41,15 +112,15 @@ struct AuditGrpcSender::Impl {
 	std::string current_addr;
 	std::shared_ptr<grpc::Channel> channel;
 	std::unique_ptr<audit::AuditCollector::Stub> stub;
-	std::thread worker;
+	std::vector<std::thread> workers;
 	mutable std::mutex mutex;
 	std::condition_variable cond;
-	std::deque<QueuedRecord> queue;
-	uint64_t queued_bytes = 0;
-	FILE *failed_file = nullptr;
-};
-
-static const char *FAILED_RECORD_FILE = "audit_grpc_failed.adt";
+	BatchPool pool;
+		Batch *current_batch = nullptr;
+		std::deque<Batch *> ready_batches;
+		uint64_t queued_records = 0;
+		uint64_t queued_bytes = 0;
+	};
 
 static uint32_t default_or(uint32_t value, uint32_t default_value)
 {
@@ -74,6 +145,46 @@ AuditGrpcSender::AuditGrpcSender() : impl_(new Impl)
 AuditGrpcSender::~AuditGrpcSender()
 {
 	stop();
+}
+
+static void update_pool_stats_locked(AuditGrpcSender::Impl *impl)
+{
+	impl->stats.queued_records = impl->queued_records;
+	impl->stats.queued_bytes = impl->queued_bytes;
+	impl->stats.pool_total_batches = impl->pool.batch_count;
+	impl->stats.pool_free_batches = impl->pool.free_count();
+	impl->stats.ready_batches = (uint32_t)impl->ready_batches.size();
+}
+
+static void sub_queued_locked(AuditGrpcSender::Impl *impl, const AuditGrpcSender::Impl::Batch *batch)
+{
+	impl->queued_records -= batch->record_count;
+	impl->queued_bytes -= batch->used;
+	update_pool_stats_locked(impl);
+}
+
+static void reset_queue_counters_locked(AuditGrpcSender::Impl *impl)
+{
+	impl->queued_records = 0;
+	impl->queued_bytes = 0;
+	update_pool_stats_locked(impl);
+}
+
+static bool current_batch_expired_locked(AuditGrpcSender::Impl *impl, std::chrono::steady_clock::time_point now)
+{
+	return impl->current_batch && impl->current_batch->record_count > 0 &&
+		impl->config.flush_interval_ms > 0 &&
+		now - impl->current_batch->first_record_time >= std::chrono::milliseconds(impl->config.flush_interval_ms);
+}
+
+static void seal_current_batch_locked(AuditGrpcSender::Impl *impl)
+{
+	if (!impl->current_batch || impl->current_batch->record_count == 0)
+		return;
+	impl->ready_batches.push_back(impl->current_batch);
+	impl->current_batch = nullptr;
+	update_pool_stats_locked(impl);
+	impl->cond.notify_one();
 }
 
 static bool connect_current_collector(AuditGrpcSender::Impl *impl)
@@ -127,108 +238,50 @@ static bool switch_collector(AuditGrpcSender::Impl *impl)
 	return true;
 }
 
-static std::string db_name_from_records(const std::string &records)
+#if AUDIT_PERF_FIELDS_ENABLED
+static std::string db_name_from_records(const char *records, size_t size)
 {
-	if (records.size() < event_payload_offset())
+	if (size < event_payload_offset())
 		return "";
-	const event *e = reinterpret_cast<const event *>(records.data());
+	const event *e = reinterpret_cast<const event *>(records);
 	if (!event_compact_size_valid(e))
 		return "";
 	return std::string(event_db_name(e), e->db_name_len);
 }
+#endif
 
-static FILE *failed_file(AuditGrpcSender::Impl *impl)
+static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batch *local_batch)
 {
-	if (impl->failed_file)
-		return impl->failed_file;
-	impl->failed_file = fopen(FAILED_RECORD_FILE, "ab+");
-	if (!impl->failed_file) {
-		fprintf(stderr, "grpc failed record open failed: file=%s error=%s\n",
-			FAILED_RECORD_FILE, strerror(errno));
-		return nullptr;
-	}
-	if (fseek(impl->failed_file, 0, SEEK_END) == 0 && ftell(impl->failed_file) == 0) {
-		audit_file_header header = {};
-		memcpy(header.magic, AUDIT_FILE_MAGIC, sizeof(AUDIT_FILE_MAGIC));
-		header.version = AUDIT_FILE_VERSION;
-		header.header_size = sizeof(header);
-		header.event_size = sizeof(event);
-		if (fwrite(&header, sizeof(header), 1, impl->failed_file) != 1)
-			fprintf(stderr, "grpc failed record header write failed: file=%s error=%s\n",
-				FAILED_RECORD_FILE, strerror(errno));
-	}
-	return impl->failed_file;
-}
-
-static void write_failed_records(AuditGrpcSender::Impl *impl, const std::string &records,
-				 uint64_t record_count, const char *reason)
-{
-	if (records.empty() || record_count == 0)
-		return;
-	FILE *file = failed_file(impl);
-	bool written = false;
-	if (file) {
-		written = fwrite(records.data(), 1, records.size(), file) == records.size();
-		fflush(file);
-	}
-	{
-		std::lock_guard<std::mutex> lock(impl->mutex);
-		impl->stats.failed_records += record_count;
-		impl->stats.failed_bytes += records.size();
-	}
-	fprintf(stderr,
-		"grpc failed records: reason=%s records=%llu bytes=%zu file=%s persisted=%s\n",
-		reason, (unsigned long long)record_count, records.size(), FAILED_RECORD_FILE,
-		written ? "true" : "false");
-}
-
-static void append_record(AuditGrpcSender::Impl::LocalBatch *batch,
-			  AuditGrpcSender::Impl::QueuedRecord &&record)
-{
-	batch->records.append(record.data.data(), record.data.size());
-	batch->record_count++;
-}
-
-static bool batch_full(const AuditGrpcSender::Impl::LocalBatch &batch, size_t next_size,
-		       uint32_t batch_bytes)
-{
-	return batch.record_count > 0 && batch_bytes > 0 && batch.records.size() + next_size > batch_bytes;
-}
-
-static bool upload_batch(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::LocalBatch &local_batch)
-{
-	if (local_batch.records.empty())
+	if (!local_batch || local_batch->used == 0 || local_batch->record_count == 0)
 		return true;
-	if (!impl->stub && !connect_current_collector(impl)) {
-		write_failed_records(impl, local_batch.records, local_batch.record_count, "connect_failed");
-		return false;
-	}
-
-	std::unique_ptr<audit::AuditCollector::Stub> stub;
 	std::string current_addr;
 	{
 		std::lock_guard<std::mutex> lock(impl->mutex);
-		if (!impl->enabled) {
-			write_failed_records(impl, local_batch.records, local_batch.record_count, "disabled");
-			return false;
-		}
-		if (!impl->stub) {
-			write_failed_records(impl, local_batch.records, local_batch.record_count, "no_stub");
-			return false;
-		}
-		stub = std::move(impl->stub);
 		current_addr = impl->current_addr;
 	}
+	if (current_addr.empty()) {
+		if (!connect_current_collector(impl))
+			return false;
+		std::lock_guard<std::mutex> lock(impl->mutex);
+		current_addr = impl->current_addr;
+		if (current_addr.empty())
+			return false;
+	}
+	{
+		std::lock_guard<std::mutex> lock(impl->mutex);
+		if (!impl->enabled)
+			return false;
+	}
+	auto channel = grpc::CreateChannel(current_addr, grpc::InsecureChannelCredentials());
+	auto stub = audit::AuditCollector::NewStub(channel);
 
 	audit::AuditBatch batch;
 	batch.set_agent_id(impl->config.agent_id);
 	batch.set_server_ip(impl->config.server_ip);
 	batch.set_file_version(impl->config.file_version);
 	batch.set_event_size(impl->config.event_size);
-	batch.set_record_count(local_batch.record_count);
-	const size_t record_bytes = local_batch.records.size();
-	std::string db_name = db_name_from_records(local_batch.records);
-	batch.mutable_records()->swap(local_batch.records);
+	batch.set_record_count(local_batch->record_count);
+	batch.set_records(local_batch->data, local_batch->used);
 
 	audit::UploadReply reply;
 	grpc::ClientContext context;
@@ -240,23 +293,18 @@ static bool upload_batch(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Loc
 	const uint64_t grpc_roundtrip_ns = monotonic_ns() - upload_start_ns;
 	{
 		std::lock_guard<std::mutex> lock(impl->mutex);
-		if (impl->current_addr == current_addr) {
-			impl->stub = std::move(stub);
-			if (!status.ok() || !reply.ok())
-				impl->stub.reset();
-		}
+		if (impl->current_addr == current_addr && (!status.ok() || !reply.ok()))
+			impl->stub.reset();
 	}
 	if (!status.ok() || !reply.ok()) {
-		fprintf(stderr, "grpc upload failed: collector=%s records=%llu bytes=%zu %s %s\n",
-			current_addr.c_str(), (unsigned long long)local_batch.record_count, record_bytes,
+		fprintf(stderr, "grpc upload failed: collector=%s records=%u bytes=%u %s %s\n",
+			current_addr.c_str(), local_batch->record_count, local_batch->used,
 			status.error_message().c_str(), reply.message().c_str());
 		{
 			std::lock_guard<std::mutex> lock(impl->mutex);
 			impl->stats.failed_uploads++;
 		}
-		write_failed_records(impl, batch.records(), local_batch.record_count, "upload_failed");
 		switch_collector(impl);
-		local_batch.record_count = 0;
 		return false;
 	}
 
@@ -266,74 +314,100 @@ static bool upload_batch(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Loc
 		impl->stats.total_grpc_roundtrip_ns += grpc_roundtrip_ns;
 		impl->stats.max_grpc_roundtrip_ns = std::max(impl->stats.max_grpc_roundtrip_ns, grpc_roundtrip_ns);
 		impl->stats.sent_batches++;
-		impl->stats.sent_records += local_batch.record_count;
-		impl->stats.sent_bytes += record_bytes;
+		impl->stats.sent_records += local_batch->record_count;
+		impl->stats.sent_bytes += local_batch->used;
 	}
+#if AUDIT_PERF_FIELDS_ENABLED
+	std::string db_name = db_name_from_records(local_batch->data, local_batch->used);
 	fprintf(stderr,
-		"grpc upload perf: collector=%s db_name=%s records=%llu bytes=%zu roundtrip_us=%.3f\n",
-		current_addr.c_str(), db_name.c_str(), (unsigned long long)local_batch.record_count, record_bytes,
+		"grpc upload perf: collector=%s db_name=%s records=%u bytes=%u roundtrip_us=%.3f\n",
+		current_addr.c_str(), db_name.c_str(), local_batch->record_count, local_batch->used,
 		(double)grpc_roundtrip_ns / 1000.0);
-	local_batch.records.clear();
-	local_batch.record_count = 0;
+#endif
 	return true;
 }
 
-static bool build_local_batch(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::LocalBatch *batch)
+static uint32_t retry_delay_ms(const audit_grpc_config &config, uint32_t retry_index)
+{
+	uint64_t delay = default_or(config.retry_initial_ms, DEFAULT_GRPC_RETRY_INITIAL_MS);
+	uint32_t max_delay = default_or(config.retry_max_ms, DEFAULT_GRPC_RETRY_MAX_MS);
+	for (uint32_t i = 0; i < retry_index; i++)
+		delay = std::min<uint64_t>(delay * 2, max_delay);
+	return (uint32_t)std::min<uint64_t>(delay, max_delay);
+}
+
+static void upload_with_retries(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batch *batch)
+{
+	for (uint32_t attempt = 0; attempt <= impl->config.max_retries; attempt++) {
+		if (attempt > 0) {
+			{
+				std::lock_guard<std::mutex> lock(impl->mutex);
+				impl->stats.retry_uploads++;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms(impl->config, attempt - 1)));
+		}
+		if (upload_once(impl, batch))
+			return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(impl->mutex);
+		impl->stats.dropped_after_retries_batches++;
+		impl->stats.dropped_after_retries_records += batch->record_count;
+		impl->stats.dropped_after_retries_bytes += batch->used;
+		impl->stats.failed_records += batch->record_count;
+		impl->stats.failed_bytes += batch->used;
+	}
+	fprintf(stderr, "grpc drop batch after retries: records=%u bytes=%u attempts=%u\n",
+		batch->record_count, batch->used, impl->config.max_retries + 1);
+}
+
+static AuditGrpcSender::Impl::Batch *pop_ready_batch(AuditGrpcSender::Impl *impl)
 {
 	std::unique_lock<std::mutex> lock(impl->mutex);
-	impl->cond.wait(lock, [&] { return impl->stopping || !impl->queue.empty(); });
-	if (impl->queue.empty())
-		return false;
-
-	const uint32_t batch_bytes = impl->config.batch_bytes;
-	const auto deadline = std::chrono::steady_clock::now() +
-		std::chrono::milliseconds(impl->config.flush_interval_ms);
-
 	while (true) {
-		while (!impl->queue.empty()) {
-			const size_t next_size = impl->queue.front().data.size();
-			if (batch_full(*batch, next_size, batch_bytes))
-				goto done;
-			AuditGrpcSender::Impl::QueuedRecord record = std::move(impl->queue.front());
-			impl->queue.pop_front();
-			impl->queued_bytes -= next_size;
-			append_record(batch, std::move(record));
-			if (batch_bytes > 0 && batch->records.size() >= batch_bytes)
-				goto done;
+		auto now = std::chrono::steady_clock::now();
+		if (current_batch_expired_locked(impl, now))
+			seal_current_batch_locked(impl);
+		if (!impl->ready_batches.empty()) {
+			AuditGrpcSender::Impl::Batch *batch = impl->ready_batches.front();
+			impl->ready_batches.pop_front();
+			sub_queued_locked(impl, batch);
+			return batch;
 		}
-		if (impl->stopping || batch->record_count == 0 || impl->config.flush_interval_ms == 0)
-			goto done;
-		if (!impl->cond.wait_until(lock, deadline, [&] { return impl->stopping || !impl->queue.empty(); }))
-			goto done;
-		if (impl->stopping && impl->queue.empty())
-			goto done;
+		if (impl->stopping) {
+			seal_current_batch_locked(impl);
+			if (impl->ready_batches.empty())
+				return nullptr;
+			continue;
+		}
+		if (impl->current_batch && impl->current_batch->record_count > 0 && impl->config.flush_interval_ms > 0) {
+			auto deadline = impl->current_batch->first_record_time +
+				std::chrono::milliseconds(impl->config.flush_interval_ms);
+			impl->cond.wait_until(lock, deadline);
+		} else {
+			impl->cond.wait(lock);
+		}
 	}
-
-done:
-	impl->stats.queued_records = impl->queue.size();
-	impl->stats.queued_bytes = impl->queued_bytes;
-	return batch->record_count > 0;
 }
 
 static void sender_worker(AuditGrpcSender::Impl *impl)
 {
 	while (true) {
-		AuditGrpcSender::Impl::LocalBatch batch;
-		if (!build_local_batch(impl, &batch)) {
-			std::lock_guard<std::mutex> lock(impl->mutex);
-			if (impl->stopping && impl->queue.empty())
-				break;
-			continue;
-		}
-		bool stopping = false;
+		AuditGrpcSender::Impl::Batch *batch = pop_ready_batch(impl);
+		if (!batch)
+			break;
 		{
 			std::lock_guard<std::mutex> lock(impl->mutex);
-			stopping = impl->stopping;
+			impl->stats.active_workers++;
 		}
-		if (stopping)
-			write_failed_records(impl, batch.records, batch.record_count, "stopping");
-		else
-			upload_batch(impl, batch);
+		upload_with_retries(impl, batch);
+		{
+			std::lock_guard<std::mutex> lock(impl->mutex);
+			impl->stats.active_workers--;
+			impl->pool.release(batch);
+			update_pool_stats_locked(impl);
+		}
+		impl->cond.notify_all();
 	}
 }
 
@@ -349,22 +423,39 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 	if (!resolver || !resolver->start())
 		return false;
 
+	audit_grpc_config normalized = config;
+	normalized.agent_id = normalized.agent_id.empty() ? "default-agent" : normalized.agent_id;
+	normalized.batch_bytes = default_or(normalized.batch_bytes, DEFAULT_GRPC_BATCH_BYTES);
+	normalized.flush_interval_ms = default_or(normalized.flush_interval_ms, DEFAULT_GRPC_FLUSH_INTERVAL_MS);
+	normalized.timeout_ms = default_or(normalized.timeout_ms, DEFAULT_GRPC_TIMEOUT_MS);
+	normalized.pool_bytes = default_or64(normalized.pool_bytes, DEFAULT_GRPC_POOL_BYTES);
+	normalized.upload_concurrency = std::min(default_or(normalized.upload_concurrency, DEFAULT_GRPC_UPLOAD_CONCURRENCY),
+					       MAX_GRPC_UPLOAD_CONCURRENCY);
+	normalized.max_retries = default_or(normalized.max_retries, DEFAULT_GRPC_MAX_RETRIES);
+	normalized.retry_initial_ms = default_or(normalized.retry_initial_ms, DEFAULT_GRPC_RETRY_INITIAL_MS);
+	normalized.retry_max_ms = default_or(normalized.retry_max_ms, DEFAULT_GRPC_RETRY_MAX_MS);
+
+	uint32_t min_batches = normalized.upload_concurrency + 2;
 	{
 		std::lock_guard<std::mutex> lock(impl_->mutex);
-		impl_->config = config;
-		impl_->config.agent_id = impl_->config.agent_id.empty() ? "default-agent" : impl_->config.agent_id;
-			// 0 表示配置文件未显式设置，统一回退到 agent 默认值。
-			impl_->config.batch_bytes = default_or(impl_->config.batch_bytes, DEFAULT_GRPC_BATCH_BYTES);
-			impl_->config.flush_interval_ms = default_or(impl_->config.flush_interval_ms, DEFAULT_GRPC_FLUSH_INTERVAL_MS);
-			impl_->config.timeout_ms = default_or(impl_->config.timeout_ms, DEFAULT_GRPC_TIMEOUT_MS);
-			impl_->config.queue_bytes = default_or64(impl_->config.queue_bytes, DEFAULT_GRPC_QUEUE_BYTES);
+		impl_->config = normalized;
+		if (!impl_->pool.init(normalized.pool_bytes, normalized.batch_bytes, min_batches)) {
+			fprintf(stderr, "grpc batch pool init failed: pool_bytes=%llu batch_bytes=%u min_batches=%u\n",
+				(unsigned long long)normalized.pool_bytes, normalized.batch_bytes, min_batches);
+			return false;
+		}
+		impl_->ready_batches.clear();
+		impl_->current_batch = nullptr;
 		impl_->resolver = std::move(resolver);
 		impl_->enabled = true;
 		impl_->stopping = false;
 		impl_->started = true;
+		impl_->stats = audit_grpc_stats();
+		reset_queue_counters_locked(impl_.get());
 	}
 	connect_current_collector(impl_.get());
-	impl_->worker = std::thread(sender_worker, impl_.get());
+	for (uint32_t i = 0; i < normalized.upload_concurrency; i++)
+		impl_->workers.emplace_back(sender_worker, impl_.get());
 	return true;
 }
 
@@ -375,27 +466,32 @@ void AuditGrpcSender::stop()
 		if (!impl_->started)
 			return;
 		impl_->stopping = true;
+		seal_current_batch_locked(impl_.get());
 	}
 	impl_->cond.notify_all();
-	if (impl_->worker.joinable())
-		impl_->worker.join();
+	for (auto &worker : impl_->workers) {
+		if (worker.joinable())
+			worker.join();
+	}
 	std::unique_ptr<CollectorResolver> resolver;
-	FILE *failed_file = nullptr;
 	{
 		std::lock_guard<std::mutex> lock(impl_->mutex);
+		impl_->workers.clear();
 		impl_->started = false;
 		impl_->enabled = false;
 		resolver = std::move(impl_->resolver);
 		impl_->current_addr.clear();
 		impl_->channel.reset();
 		impl_->stub.reset();
-		impl_->queue.clear();
-		impl_->queued_bytes = 0;
-		failed_file = impl_->failed_file;
-		impl_->failed_file = nullptr;
+		if (impl_->current_batch) {
+			impl_->pool.release(impl_->current_batch);
+			impl_->current_batch = nullptr;
+		}
+		for (auto *batch : impl_->ready_batches)
+			impl_->pool.release(batch);
+		impl_->ready_batches.clear();
+		reset_queue_counters_locked(impl_.get());
 	}
-	if (failed_file)
-		fclose(failed_file);
 	if (resolver)
 		resolver->stop();
 }
@@ -409,18 +505,44 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 	event *hdr = reinterpret_cast<event *>(data);
 	hdr->perf_agent_after_submit_ns = monotonic_ns();
 #endif
-	std::string record(data, size);
-
 	std::lock_guard<std::mutex> lock(impl_->mutex);
-	if (impl_->stopping || impl_->queued_bytes + record.size() > impl_->config.queue_bytes) {
+	if (impl_->stopping) {
 		impl_->stats.dropped_records++;
 		impl_->stats.dropped_bytes += size;
 		return false;
 	}
-	impl_->queue.push_back(Impl::QueuedRecord{std::move(record)});
+	if (size > impl_->config.batch_bytes) {
+		impl_->stats.dropped_records++;
+		impl_->stats.dropped_bytes += size;
+		impl_->stats.dropped_oversize_records++;
+		impl_->stats.dropped_oversize_bytes += size;
+		return false;
+	}
+	if (current_batch_expired_locked(impl_.get(), std::chrono::steady_clock::now()))
+		seal_current_batch_locked(impl_.get());
+	if (impl_->current_batch && impl_->current_batch->used + size > impl_->current_batch->capacity)
+		seal_current_batch_locked(impl_.get());
+	if (!impl_->current_batch) {
+		impl_->current_batch = impl_->pool.acquire();
+		if (!impl_->current_batch) {
+			impl_->stats.dropped_records++;
+			impl_->stats.dropped_bytes += size;
+			impl_->stats.dropped_no_batch_records++;
+			impl_->stats.dropped_no_batch_bytes += size;
+			update_pool_stats_locked(impl_.get());
+			return false;
+		}
+	}
+	if (impl_->current_batch->record_count == 0)
+		impl_->current_batch->first_record_time = std::chrono::steady_clock::now();
+	memcpy(impl_->current_batch->data + impl_->current_batch->used, data, size);
+	impl_->current_batch->used += (uint32_t)size;
+	impl_->current_batch->record_count++;
+	impl_->queued_records++;
 	impl_->queued_bytes += size;
-	impl_->stats.queued_records = impl_->queue.size();
-	impl_->stats.queued_bytes = impl_->queued_bytes;
+	if (impl_->current_batch->used >= impl_->current_batch->capacity)
+		seal_current_batch_locked(impl_.get());
+	update_pool_stats_locked(impl_.get());
 	impl_->cond.notify_one();
 	return true;
 }

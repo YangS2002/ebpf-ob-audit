@@ -51,7 +51,7 @@ class DeployConfig:
     grpc_batch_bytes: int
     grpc_flush_interval_ms: int
     grpc_timeout_ms: int
-    grpc_queue_bytes: int
+    grpc_pool_bytes: int
     grpc_retry_initial_ms: int
     grpc_retry_max_ms: int
     pending_ringbuf_bytes: int
@@ -233,8 +233,8 @@ def default_agent_runtime() -> Dict[str, Any]:
             "addr": "",
             "discovery": {
                 "enabled": True,
-                "etcd_endpoints": "http://7.27.43.139:2379",
-                "service_name": "audit-collector",
+                "etcd_endpoints": "",
+                "service_name": "",
                 "selection_policy": "hash_agent",
             },
         },
@@ -245,7 +245,9 @@ def default_agent_runtime() -> Dict[str, Any]:
             "batch_bytes": 262144,
             "flush_interval_ms": 1000,
             "timeout_ms": 2000,
-            "queue_bytes": 64 * 1024 * 1024,
+            "pool_bytes": 64 * 1024 * 1024,
+            "upload_concurrency": 2,
+            "max_retries": 3,
             "retry_initial_ms": 100,
             "retry_max_ms": 500,
         },
@@ -257,39 +259,6 @@ def default_agent_runtime() -> Dict[str, Any]:
     }
 
 
-def legacy_agent_runtime(agent_global: Dict[str, Any]) -> Dict[str, Any]:
-    runtime = default_agent_runtime()
-    runtime = deep_merge(runtime, {
-        "collector": {
-            "addr": agent_global.get("collector_addr", runtime["collector"]["addr"]),
-            "discovery": {
-                "enabled": agent_global.get("collector_discovery_enabled", runtime["collector"]["discovery"]["enabled"]),
-                "etcd_endpoints": agent_global.get("collector_discovery_etcd_endpoints", runtime["collector"]["discovery"]["etcd_endpoints"]),
-                "service_name": agent_global.get("collector_discovery_service_name", runtime["collector"]["discovery"]["service_name"]),
-                "selection_policy": agent_global.get("collector_discovery_selection_policy", runtime["collector"]["discovery"]["selection_policy"]),
-            },
-        },
-        "buffer": {
-            "pending_ringbuf_bytes": agent_global.get("pending_ringbuf_bytes", runtime["buffer"]["pending_ringbuf_bytes"]),
-        },
-        "grpc": {
-            "batch_bytes": agent_global.get("grpc_batch_bytes", runtime["grpc"]["batch_bytes"]),
-            "flush_interval_ms": agent_global.get("grpc_flush_interval_ms", runtime["grpc"]["flush_interval_ms"]),
-            "timeout_ms": agent_global.get("grpc_timeout_ms", runtime["grpc"]["timeout_ms"]),
-            "queue_bytes": agent_global.get("grpc_queue_bytes", runtime["grpc"]["queue_bytes"]),
-            "retry_initial_ms": agent_global.get("grpc_retry_initial_ms", runtime["grpc"]["retry_initial_ms"]),
-            "retry_max_ms": agent_global.get("grpc_retry_max_ms", runtime["grpc"]["retry_max_ms"]),
-        },
-        "uprobe": {
-            "observer_path": agent_global.get("observer_path", runtime["uprobe"]["observer_path"]),
-            "offset": agent_global.get("offset", runtime["uprobe"]["offset"]),
-            "output_file": agent_global.get("output_file", runtime["uprobe"]["output_file"]),
-        },
-    })
-    runtime = deep_merge(runtime, agent_global.get("runtime", {}) if isinstance(agent_global.get("runtime", {}), dict) else {})
-    return runtime
-
-
 def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
     current: Any = data
     for part in dotted.split("."):
@@ -297,6 +266,12 @@ def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
             return default
         current = current[part]
     return current
+
+
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes")
 
 
 def parse_config(path: Path) -> DeployConfig:
@@ -311,7 +286,7 @@ def parse_config(path: Path) -> DeployConfig:
     password = str(user.get("password", ""))
     sudo_password = str(user.get("sudo_password", user.get("user_password", "")))
     deploy_home = str(agent_global.get("deploy_home", "~/ebpf-ob-audit-agent"))
-    runtime_global = legacy_agent_runtime(agent_global)
+    runtime_global = deep_merge(default_agent_runtime(), agent_global.get("runtime", {}) if isinstance(agent_global.get("runtime", {}), dict) else {})
 
     if not get_path(runtime_global, "uprobe.observer_path", ""):
         home_path = str(ob_global.get("home_path", ""))
@@ -327,12 +302,6 @@ def parse_config(path: Path) -> DeployConfig:
             ip = str(server.get("ip", ""))
             node_cfg = get_path(data, f"agent.{name}", {}) or {}
             node_runtime = deep_merge(runtime_global, node_cfg.get("runtime", {}) if isinstance(node_cfg.get("runtime", {}), dict) else {})
-            if "observer_path" in node_cfg or "offset" in node_cfg or "output_file" in node_cfg:
-                node_runtime = deep_merge(node_runtime, {"uprobe": {
-                    "observer_path": node_cfg.get("observer_path", get_path(node_runtime, "uprobe.observer_path", "")),
-                    "offset": node_cfg.get("offset", get_path(node_runtime, "uprobe.offset", "")),
-                    "output_file": node_cfg.get("output_file", get_path(node_runtime, "uprobe.output_file", "out.adt")),
-                }})
             node_runtime = deep_merge(node_runtime, node_cfg.get("override", {}) if isinstance(node_cfg.get("override", {}), dict) else {})
             nodes.append(Node(
                 name=name,
@@ -341,7 +310,7 @@ def parse_config(path: Path) -> DeployConfig:
                 observer_path=str(get_path(node_runtime, "uprobe.observer_path", "")),
                 offset=str(get_path(node_runtime, "uprobe.offset", "")),
                 output_file=str(get_path(node_runtime, "uprobe.output_file", "out.adt")),
-                runtime=node_runtime,
+                runtime=deep_merge(node_runtime, {"agent": {"id": f"agent-{name}-{ip}", "server_ip": ip}}),
             ))
 
     config = DeployConfig(
@@ -351,16 +320,16 @@ def parse_config(path: Path) -> DeployConfig:
         sudo_password=sudo_password,
         deploy_home=deploy_home,
         collector_addr=str(get_path(runtime_global, "collector.addr", "")),
-        collector_discovery_enabled=bool(get_path(runtime_global, "collector.discovery.enabled", True)),
+        collector_discovery_enabled=bool_value(get_path(runtime_global, "collector.discovery.enabled", True)),
         collector_discovery_etcd_endpoints=str(get_path(runtime_global, "collector.discovery.etcd_endpoints", "")),
-        collector_discovery_service_name=str(get_path(runtime_global, "collector.discovery.service_name", "audit-collector")),
+        collector_discovery_service_name=str(get_path(runtime_global, "collector.discovery.service_name", "")),
         collector_discovery_watch=True,
         collector_discovery_retry_interval_ms=3000,
         collector_discovery_selection_policy=str(get_path(runtime_global, "collector.discovery.selection_policy", "hash_agent")),
         grpc_batch_bytes=int(get_path(runtime_global, "grpc.batch_bytes", 262144)),
         grpc_flush_interval_ms=int(get_path(runtime_global, "grpc.flush_interval_ms", 1000)),
         grpc_timeout_ms=int(get_path(runtime_global, "grpc.timeout_ms", 2000)),
-        grpc_queue_bytes=int(get_path(runtime_global, "grpc.queue_bytes", 64 * 1024 * 1024)),
+        grpc_pool_bytes=int(get_path(runtime_global, "grpc.pool_bytes", 64 * 1024 * 1024)),
         grpc_retry_initial_ms=int(get_path(runtime_global, "grpc.retry_initial_ms", 100)),
         grpc_retry_max_ms=int(get_path(runtime_global, "grpc.retry_max_ms", 500)),
         pending_ringbuf_bytes=int(get_path(runtime_global, "buffer.pending_ringbuf_bytes", 16 * 1024 * 1024)),
@@ -384,6 +353,39 @@ def validate_config(config: DeployConfig) -> None:
             missing.append(f"oceanbase-ce.servers[{node.name}].ip")
     if missing:
         raise DeployError("missing required config fields: " + ", ".join(missing))
+
+
+def is_empty_required(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) == 0
+    return False
+
+
+def add_required_error(errors: List[str], kind: str, node: Node, field: str) -> None:
+    value = get_path(node.runtime, field)
+    if is_empty_required(value):
+        errors.append(f"CONFIG ERROR {kind} {node.name} {node.ip}: missing runtime.{field}")
+
+
+def validate_agent_runtime(config: DeployConfig) -> None:
+    errors: List[str] = []
+    for node in config.nodes:
+        add_required_error(errors, "agent", node, "agent.id")
+        add_required_error(errors, "agent", node, "agent.server_ip")
+        discovery_enabled = bool_value(get_path(node.runtime, "collector.discovery.enabled", True))
+        if discovery_enabled:
+            add_required_error(errors, "agent", node, "collector.discovery.etcd_endpoints")
+            add_required_error(errors, "agent", node, "collector.discovery.service_name")
+        else:
+            add_required_error(errors, "agent", node, "collector.addr")
+        add_required_error(errors, "agent", node, "uprobe.observer_path")
+        add_required_error(errors, "agent", node, "uprobe.offset")
+    if errors:
+        raise DeployError("\n".join(errors))
 
 
 def build_agent(skip_build: bool) -> None:
@@ -441,11 +443,10 @@ def write_text(path: Path, content: str, mode: Optional[int] = None) -> None:
 
 
 def render_agent_yaml(node: Node) -> str:
-    runtime = deep_merge(node.runtime, {"agent": {"id": f"agent-{node.name}-{node.ip}", "server_ip": node.ip}})
     return "\n".join([
         "# agent 运行时配置，由 deploy_agent.py 根据 agent-deploy YAML 生成。",
         "# 请不要手工修改远端该文件；需要变更时修改部署 YAML 的 global、节点字段或 override。",
-        *dump_yaml(runtime),
+        *dump_yaml(node.runtime),
         "",
     ])
 
@@ -661,7 +662,7 @@ def print_start_command(node: Node) -> None:
         if not node.offset:
             missing.append("offset")
         print(f"START {node.name} {node.ip}: incomplete, missing {', '.join(missing)}")
-        print(f"       edit {node.deploy_home}/conf/uprobe.conf if needed, then run {node.deploy_home}/run/start_agent.sh")
+        print(f"       edit deploy YAML runtime fields, then re-run deploy/start")
 
 
 def print_summary(results: List[NodeResult]) -> None:
@@ -722,6 +723,8 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action in ("start", "deploy-start"):
+            validate_agent_runtime(config)
         if config.password:
             print("INFO using user.password for SSH via sshpass. If sshpass is missing, install requirements/system dependency or configure passwordless SSH.")
         if config.sudo_password:
