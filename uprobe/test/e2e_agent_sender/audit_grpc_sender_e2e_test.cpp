@@ -5,8 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -54,6 +57,10 @@ public:
 			while (mode_ == Mode::Block && !unblock_)
 				cond_.wait(lock);
 		}
+
+		int64_t delay_us = delay_us_.load();
+		if (delay_us > 0)
+			std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
 
 		bool ok = mode_ == Mode::AlwaysOk || (mode_ == Mode::FailThenOk && call > failures_before_ok_);
 		{
@@ -115,10 +122,13 @@ public:
 
 	int upload_calls() const { return upload_calls_.load(); }
 
+	void set_response_delay_us(int64_t us) { delay_us_ = us; }
+
 private:
 	Mode mode_;
 	int failures_before_ok_ = 0;
 	std::atomic<int> upload_calls_{0};
+	std::atomic<int64_t> delay_us_{0};
 	mutable std::mutex mutex_;
 	std::condition_variable cond_;
 	std::vector<ReceivedBatch> received_;
@@ -185,6 +195,28 @@ std::vector<char> record(size_t size, char value)
 void submit_record(AuditGrpcSender &sender, std::vector<char> &data)
 {
 	ASSERT_TRUE(sender.submit(data.data(), data.size()));
+}
+
+uint64_t monotonic_ns()
+{
+	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void upload_batch(audit::AuditCollector::Stub *stub, const std::vector<char> &payload)
+{
+	audit::AuditBatch batch;
+	batch.set_agent_id("bench-agent");
+	batch.set_server_ip("127.0.0.1");
+	batch.set_file_version(1);
+	batch.set_event_size(64);
+	batch.set_record_count(payload.size() / 64);
+	batch.set_records(payload.data(), payload.size());
+
+	audit::UploadReply reply;
+	grpc::ClientContext context;
+	ASSERT_TRUE(stub->Upload(&context, batch, &reply).ok());
+	ASSERT_TRUE(reply.ok());
 }
 
 } // namespace
@@ -294,6 +326,124 @@ TEST(AuditGrpcSenderE2E, DropsAfterRetryExhaustion)
 	EXPECT_EQ(stats.sent_batches, 0U);
 }
 
+TEST(AuditGrpcSenderE2E, ChannelReuseBenchmark)
+{
+	FakeCollectorServer server;
+	ASSERT_TRUE(server.valid());
+
+	constexpr int warmup_batches = 20;
+	constexpr int bench_batches = 500;
+	const auto payload = record(64 * 64, 'x');
+
+	for (int i = 0; i < warmup_batches; i++) {
+		auto channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+		auto stub = audit::AuditCollector::NewStub(channel);
+		upload_batch(stub.get(), payload);
+	}
+
+	uint64_t recreate_start_ns = monotonic_ns();
+	for (int i = 0; i < bench_batches; i++) {
+		auto channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+		auto stub = audit::AuditCollector::NewStub(channel);
+		upload_batch(stub.get(), payload);
+	}
+	uint64_t recreate_ns = monotonic_ns() - recreate_start_ns;
+
+	auto channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+	for (int i = 0; i < warmup_batches; i++) {
+		auto stub = audit::AuditCollector::NewStub(channel);
+		upload_batch(stub.get(), payload);
+	}
+
+	uint64_t reuse_start_ns = monotonic_ns();
+	for (int i = 0; i < bench_batches; i++) {
+		auto stub = audit::AuditCollector::NewStub(channel);
+		upload_batch(stub.get(), payload);
+	}
+	uint64_t reuse_ns = monotonic_ns() - reuse_start_ns;
+
+	fprintf(stderr,
+		"channel benchmark: batches=%d payload_bytes=%zu recreate_total_ms=%.3f recreate_avg_us=%.3f reuse_total_ms=%.3f reuse_avg_us=%.3f speedup=%.2fx\n",
+		bench_batches, payload.size(), recreate_ns / 1000000.0, recreate_ns / 1000.0 / bench_batches,
+		reuse_ns / 1000000.0, reuse_ns / 1000.0 / bench_batches, (double)recreate_ns / (double)reuse_ns);
+
+	EXPECT_EQ(server.collector().received_records(), (uint64_t)(warmup_batches * 2 + bench_batches * 2) * 64);
+}
+
+TEST(AuditGrpcSenderE2E, ConcurrentChannelReuseBenchmark)
+{
+	FakeCollectorServer server;
+	ASSERT_TRUE(server.valid());
+
+	constexpr int worker_count = 4;
+	constexpr int batches_per_worker = 200;
+	constexpr size_t record_size = 64;
+	const size_t records_per_batch = 256 * 1024 / record_size;
+	const auto payload = record(records_per_batch * record_size, 'x');
+
+	auto run_workers = [&](const std::function<void()> &body) {
+		std::vector<std::thread> workers;
+		for (int i = 0; i < worker_count; i++)
+			workers.emplace_back(body);
+		for (auto &worker : workers)
+			worker.join();
+	};
+
+	// A: each batch creates its own channel + stub, mirroring current upload_once()
+	uint64_t recreate_start_ns = monotonic_ns();
+	run_workers([&] {
+		for (int i = 0; i < batches_per_worker; i++) {
+			auto channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+			auto stub = audit::AuditCollector::NewStub(channel);
+			upload_batch(stub.get(), payload);
+		}
+	});
+	uint64_t recreate_ns = monotonic_ns() - recreate_start_ns;
+
+	// B: one shared channel across all workers, each RPC only creates a stub
+	auto shared_channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+	{
+		auto warmup_stub = audit::AuditCollector::NewStub(shared_channel);
+		upload_batch(warmup_stub.get(), payload);
+	}
+	uint64_t reuse_start_ns = monotonic_ns();
+	run_workers([&] {
+		for (int i = 0; i < batches_per_worker; i++) {
+			auto stub = audit::AuditCollector::NewStub(shared_channel);
+			upload_batch(stub.get(), payload);
+		}
+	});
+	uint64_t reuse_ns = monotonic_ns() - reuse_start_ns;
+
+	// C: one reused channel per worker (channel pool sized to concurrency)
+	std::vector<std::shared_ptr<grpc::Channel>> worker_channels(worker_count);
+	for (auto &channel : worker_channels) {
+		channel = grpc::CreateChannel(server.addr(), grpc::InsecureChannelCredentials());
+		auto warmup_stub = audit::AuditCollector::NewStub(channel);
+		upload_batch(warmup_stub.get(), payload);
+	}
+	std::atomic<int> worker_index{0};
+	uint64_t pool_start_ns = monotonic_ns();
+	run_workers([&] {
+		auto channel = worker_channels[worker_index++];
+		for (int i = 0; i < batches_per_worker; i++) {
+			auto stub = audit::AuditCollector::NewStub(channel);
+			upload_batch(stub.get(), payload);
+		}
+	});
+	uint64_t pool_ns = monotonic_ns() - pool_start_ns;
+
+	const int total_batches = worker_count * batches_per_worker;
+	fprintf(stderr,
+		"concurrent channel benchmark: workers=%d batches=%d payload_bytes=%zu recreate_avg_us=%.3f shared_reuse_avg_us=%.3f pool_reuse_avg_us=%.3f shared_speedup=%.2fx pool_speedup=%.2fx\n",
+		worker_count, total_batches, payload.size(), recreate_ns / 1000.0 / total_batches,
+		reuse_ns / 1000.0 / total_batches, pool_ns / 1000.0 / total_batches,
+		(double)recreate_ns / (double)reuse_ns, (double)recreate_ns / (double)pool_ns);
+
+	EXPECT_EQ(server.collector().received_records(),
+		  (uint64_t)(total_batches * 3 + 1 + worker_count) * records_per_batch);
+}
+
 TEST(AuditGrpcSenderE2E, SingleSubmitterUsesMultipleWorkers)
 {
 	FakeCollectorServer server;
@@ -318,6 +468,108 @@ TEST(AuditGrpcSenderE2E, SingleSubmitterUsesMultipleWorkers)
 	audit_grpc_stats stats = sender.stats();
 	EXPECT_EQ(stats.sent_records, (uint64_t)record_count);
 	EXPECT_EQ(stats.dropped_records, 0U);
+}
+
+// 压测:单生产者 submit,回答两问
+//   Q1 8 worker 是否浪费  -> max_active_workers / max_ready_batches
+//   Q2 submit 单线程是否瓶颈 -> submit_qps / avg_submit_us
+// env 可调:
+//   BENCH_RECORDS     总记录数(默认 500000)
+//   BENCH_RTT_US      collector 每次 Upload 注入延迟 us(默认 0,模拟网络RTT+处理)
+//   BENCH_TARGET_QPS  submit 限速(0=不限速,测最大吞吐;>0=按目标qps灌,测worker够不够)
+//   BENCH_WORKERS     上传并发(默认 8)
+// 结果同时打印到 stderr 并追加到 grpc_submit_bench.txt
+TEST(AuditGrpcSenderE2E, SubmitThroughputBenchmark)
+{
+	auto env_ll = [](const char *name, int64_t def) -> int64_t {
+		const char *v = std::getenv(name);
+		return v ? std::atoll(v) : def;
+	};
+	const int total_records = (int)env_ll("BENCH_RECORDS", 500000);
+	const int64_t rtt_us = env_ll("BENCH_RTT_US", 0);
+	const int64_t target_qps = env_ll("BENCH_TARGET_QPS", 0);
+	const uint32_t workers = (uint32_t)env_ll("BENCH_WORKERS", 8);
+
+	FakeCollectorServer server;
+	ASSERT_TRUE(server.valid());
+	server.collector().set_response_delay_us(rtt_us);
+
+	AuditGrpcSender sender;
+	auto config = base_config(server.addr());
+	config.event_size = 256;
+	config.batch_bytes = 262144;
+	config.pool_bytes = 64ULL * 1024 * 1024;
+	config.flush_interval_ms = 1000;
+	config.timeout_ms = 2000;
+	config.upload_concurrency = workers;
+	config.max_retries = 0;
+	ASSERT_TRUE(sender.start(config));
+
+	auto data = record(256, 'x');
+	const uint64_t start_ns = monotonic_ns();
+	const double target_interval_ns = target_qps > 0 ? 1e9 / (double)target_qps : 0;
+	for (int i = 0; i < total_records; i++) {
+		sender.submit(data.data(), data.size());
+		if (target_qps > 0) {
+			double expected_ns = (double)(i + 1) * target_interval_ns;
+			double elapsed_ns = (double)(monotonic_ns() - start_ns);
+			if (elapsed_ns < expected_ns)
+				std::this_thread::sleep_for(
+					std::chrono::nanoseconds((int64_t)(expected_ns - elapsed_ns)));
+		}
+	}
+	const uint64_t submit_done_ns = monotonic_ns();
+	sender.stop();
+	const uint64_t drain_done_ns = monotonic_ns();
+
+	audit_grpc_stats stats = sender.stats();
+	double submit_secs = (submit_done_ns - start_ns) / 1e9;
+	double submit_qps = submit_secs > 0 ? total_records / submit_secs : 0;
+#if AUDIT_GRPC_TIMING_ENABLED
+	double avg_submit_us = stats.submit_calls
+		? (double)stats.total_submit_ns / stats.submit_calls / 1000.0 : 0;
+	double avg_rtt_us = stats.sent_batches
+		? (double)stats.total_grpc_roundtrip_ns / stats.sent_batches / 1000.0 : 0;
+#endif
+
+	char line[1024];
+#if AUDIT_GRPC_TIMING_ENABLED
+	snprintf(line, sizeof(line),
+		"submit_bench rtt_us=%lld target_qps=%lld workers=%u records=%d "
+		"submit_qps=%.0f submit_wall_s=%.3f drain_extra_s=%.3f "
+		"avg_submit_us=%.3f max_submit_us=%.3f "
+		"sent_records=%llu dropped_records=%llu dropped_no_batch=%llu "
+		"max_active_workers=%u max_ready_batches=%u sent_batches=%llu "
+		"avg_rtt_us=%.3f max_rtt_us=%.3f\n",
+		(long long)rtt_us, (long long)target_qps, workers, total_records,
+		submit_qps, submit_secs, (drain_done_ns - submit_done_ns) / 1e9,
+		avg_submit_us, stats.max_submit_ns / 1000.0,
+		(unsigned long long)stats.sent_records,
+		(unsigned long long)stats.dropped_records,
+		(unsigned long long)stats.dropped_no_batch_records,
+		stats.max_active_workers, stats.max_ready_batches,
+		(unsigned long long)stats.sent_batches,
+		avg_rtt_us, stats.max_grpc_roundtrip_ns / 1000.0);
+#else
+	snprintf(line, sizeof(line),
+		"submit_bench rtt_us=%lld target_qps=%lld workers=%u records=%d "
+		"submit_qps=%.0f submit_wall_s=%.3f drain_extra_s=%.3f "
+		"sent_records=%llu dropped_records=%llu dropped_no_batch=%llu "
+		"max_active_workers=%u max_ready_batches=%u sent_batches=%llu\n",
+		(long long)rtt_us, (long long)target_qps, workers, total_records,
+		submit_qps, submit_secs, (drain_done_ns - submit_done_ns) / 1e9,
+		(unsigned long long)stats.sent_records,
+		(unsigned long long)stats.dropped_records,
+		(unsigned long long)stats.dropped_no_batch_records,
+		stats.max_active_workers, stats.max_ready_batches,
+		(unsigned long long)stats.sent_batches);
+#endif
+	fputs(line, stderr);
+	FILE *f = fopen("grpc_submit_bench.txt", "a");
+	if (f) {
+		fputs(line, f);
+		fclose(f);
+	}
 }
 
 TEST(AuditGrpcSenderE2E, StopDrainsPendingBatch)

@@ -9,6 +9,10 @@
 
 #include "collector_resolver.h"
 
+#ifndef AUDIT_GRPC_TIMING_ENABLED
+#define AUDIT_GRPC_TIMING_ENABLED 0
+#endif
+
 struct audit_grpc_config {
 	std::string agent_id;
 	std::string server_ip;
@@ -42,15 +46,25 @@ struct audit_grpc_stats {
 	uint64_t dropped_after_retries_records = 0;
 	uint64_t dropped_after_retries_bytes = 0;
 	uint32_t active_workers = 0;
+	uint32_t max_active_workers = 0;
 	uint32_t pool_total_batches = 0;
 	uint32_t pool_free_batches = 0;
 	uint32_t ready_batches = 0;
+	uint32_t max_ready_batches = 0;
 	uint64_t failed_uploads = 0;
 	uint64_t failed_records = 0;
 	uint64_t failed_bytes = 0;
+#if AUDIT_GRPC_TIMING_ENABLED
+	uint64_t submit_calls = 0;
+	uint64_t total_submit_ns = 0;
+	uint64_t max_submit_ns = 0;
 	uint64_t last_grpc_roundtrip_ns = 0;
 	uint64_t max_grpc_roundtrip_ns = 0;
 	uint64_t total_grpc_roundtrip_ns = 0;
+	uint64_t median_grpc_roundtrip_ns = 0;
+#endif
+	uint64_t stub_rebuilds = 0;
+	uint64_t channel_switches = 0;
 };
 
 class AuditGrpcSender {

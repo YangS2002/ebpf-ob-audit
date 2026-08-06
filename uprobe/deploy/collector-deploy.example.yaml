@@ -17,7 +17,7 @@ collector:
         registry:
           # 是否把 collector 实例注册到 etcd，供 agent 服务发现。
           enabled: true
-          etcd_endpoints: http://7.27.43.139:2379
+          etcd_endpoints: http://7.27.43.145:2379
           service_name: audit-collector
           lease_ttl_sec: 10
           keepalive_interval_sec: 3
@@ -25,7 +25,7 @@ collector:
         # 当前 collector 存储后端。
         type: mongodb
       mongodb:
-        uri: mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit
+        uri: mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit
         database: ob_audit
         collection: audit_events
         app_name: ebpf-ob-audit-collector
@@ -44,15 +44,15 @@ collector:
   # 不要在这里放 agent uprobe offset、pending buffer、grpc queue 等配置。
   servers:
     - name: collector-50051
-      ip: 7.27.43.138
+      ip: 7.27.43.139
       listen_port: 50051
       instance_id: collector-50051
     - name: collector-50052
-      ip: 7.27.43.138
+      ip: 7.27.43.139
       listen_port: 50052
       instance_id: collector-50052
     - name: collector-50053
-      ip: 7.27.43.138
+      ip: 7.27.43.139
       listen_port: 50053
       instance_id: collector-50053
       # 示例：只给该实例覆盖 Mongo bulk 大小。

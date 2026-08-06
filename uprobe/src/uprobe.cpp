@@ -160,7 +160,7 @@ static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 }
 
 static void print_startup_status(const char *target, unsigned long long offset,
-					 const char *config_file, const app_config &config, const writer_state &state)
+						 const char *config_file, const app_config &config, const writer_state &state)
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
 	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_pool_bytes=%llu grpc_upload_concurrency=%u grpc_max_retries=%u grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
@@ -192,6 +192,36 @@ static void print_startup_status(const char *target, unsigned long long offset,
 	if (!ready)
 		agent_log_error("event=collector_not_ready action=capture_local");
 }
+
+#if AUDIT_GRPC_TIMING_ENABLED
+static void print_grpc_timing_stats(const writer_state &state)
+{
+	audit_grpc_stats stats = state.grpc.stats();
+	double avg_rtt_us = stats.sent_batches
+		? (double)stats.total_grpc_roundtrip_ns / stats.sent_batches / 1000.0 : 0;
+	double avg_submit_us = stats.submit_calls
+		? (double)stats.total_submit_ns / stats.submit_calls / 1000.0 : 0;
+
+	agent_log_info("event=agent_metrics sent_batches=%llu sent_records=%llu sent_bytes=%llu failed_uploads=%llu retry_uploads=%llu dropped_records=%llu dropped_after_retries_batches=%llu avg_rtt_us=%.3f median_rtt_us=%.3f max_rtt_us=%.3f last_rtt_us=%.3f avg_submit_us=%.3f max_submit_us=%.3f max_active_workers=%u max_ready_batches=%u pool_total_batches=%u pool_free_batches=%u",
+	       (unsigned long long)stats.sent_batches,
+	       (unsigned long long)stats.sent_records,
+	       (unsigned long long)stats.sent_bytes,
+	       (unsigned long long)stats.failed_uploads,
+	       (unsigned long long)stats.retry_uploads,
+	       (unsigned long long)stats.dropped_records,
+	       (unsigned long long)stats.dropped_after_retries_batches,
+	       avg_rtt_us,
+	       stats.median_grpc_roundtrip_ns / 1000.0,
+	       stats.max_grpc_roundtrip_ns / 1000.0,
+	       stats.last_grpc_roundtrip_ns / 1000.0,
+	       avg_submit_us,
+	       stats.max_submit_ns / 1000.0,
+	       stats.max_active_workers,
+	       stats.max_ready_batches,
+	       stats.pool_total_batches,
+	       stats.pool_free_batches);
+}
+#endif
 
 static unsigned int clamp_capture(unsigned int len, unsigned int max_len)
 {
@@ -456,9 +486,13 @@ int main(int argc, char **argv)
 		}
 	}
 
-cleanup:
-	if (state)
+	cleanup:
+	if (state) {
+#if AUDIT_GRPC_TIMING_ENABLED
+		print_grpc_timing_stats(*state);
+#endif
 		state->grpc.stop();
+	}
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);

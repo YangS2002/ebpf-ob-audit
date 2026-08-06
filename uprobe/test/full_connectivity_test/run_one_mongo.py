@@ -28,7 +28,7 @@ from run_one import (
     warn,
 )
 
-DEFAULT_WORKLOAD = TEST_DIR / "big_sql_test.sql"
+DEFAULT_WORKLOAD = TEST_DIR / "workload.sql"
 DEFAULT_OUT_DIR = TEST_DIR / "out" / "single"
 
 MONGO_TO_CSV = UPROBE_DIR / "tools" / "mongo_to_csv.py"
@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument("--ob-host", default="7.27.43.136")
     parser.add_argument("--ob-port", type=int, default=2881)
     parser.add_argument("--mysql-force", action="store_true")
-    parser.add_argument("--mongo-uri", default="mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit")
+    parser.add_argument("--mongo-uri", default="mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit")
     parser.add_argument("--mongo-db", default="ob_audit")
     parser.add_argument("--mongo-collection", default="audit_events")
     parser.add_argument("--mongo-query", default="{}")

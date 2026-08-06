@@ -4,6 +4,7 @@
 
 #include <condition_variable>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -17,12 +18,18 @@
 #define HAVE_MONGOC 0
 #endif
 
-#if AUDIT_PERF_FIELDS_ENABLED
+#if AUDIT_PERF_FIELDS_ENABLED || AUDIT_GRPC_TIMING_ENABLED
 static unsigned long long monotonic_ns()
 {
 	return (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#endif
+
+#if AUDIT_GRPC_TIMING_ENABLED
+#define AUDIT_TIMING_NOW() monotonic_ns()
+#else
+#define AUDIT_TIMING_NOW() 0ULL
 #endif
 
 struct MongoSink::Impl {
@@ -237,6 +244,37 @@ static bool duplicate_only(const bson_t *reply)
 	return true;
 }
 
+static bool parse_write_concern_w(const std::string &value, int32_t *w)
+{
+	if (!w || value.empty())
+		return false;
+	const char *text = value.c_str();
+	if ((text[0] == 'w' || text[0] == 'W') && text[1] != '\0')
+		text++;
+	for (const char *p = text; *p; p++) {
+		if (!std::isdigit(static_cast<unsigned char>(*p)))
+			return false;
+	}
+	*w = (int32_t)std::strtol(text, nullptr, 10);
+	return true;
+}
+
+static bool append_write_concern(bson_t *opts, const std::string &value)
+{
+	if (!opts || value.empty())
+		return true;
+	bson_t wc;
+	BSON_APPEND_DOCUMENT_BEGIN(opts, "writeConcern", &wc);
+	int32_t w = 0;
+	if (parse_write_concern_w(value, &w)) {
+		BSON_APPEND_INT32(&wc, "w", w);
+	} else {
+		BSON_APPEND_UTF8(&wc, "w", value.c_str());
+	}
+	bson_append_document_end(opts, &wc);
+	return true;
+}
+
 #endif
 
 MongoSink::MongoSink()
@@ -342,9 +380,13 @@ bool MongoSink::enabled() const
 }
 
 bool MongoSink::insert_events(const std::string &agent_id, const std::string &server_ip,
-			      const std::vector<audit_ingest::parsed_audit_event> &events,
-			      unsigned long long *accepted_records, unsigned long long *accepted_bytes,
-			      std::string *error)
+				      const std::vector<audit_ingest::parsed_audit_event> &events,
+				      unsigned long long *accepted_records, unsigned long long *accepted_bytes,
+				      std::string *error
+#if AUDIT_GRPC_TIMING_ENABLED
+				      , mongodb_insert_stats *insert_stats
+#endif
+				      )
 {
 	if (accepted_records)
 		*accepted_records = 0;
@@ -363,12 +405,29 @@ bool MongoSink::insert_events(const std::string &agent_id, const std::string &se
 		return false;
 	}
 
+#if AUDIT_GRPC_TIMING_ENABLED
+	mongodb_insert_stats local_stats;
+	mongodb_insert_stats *stats = insert_stats ? insert_stats : &local_stats;
+	*stats = mongodb_insert_stats();
+	const unsigned long long total_start_ns = AUDIT_TIMING_NOW();
+#endif
 	{
 		std::unique_lock<std::mutex> lock(impl_->mutex);
 		unsigned int limit = impl_->config.insert_concurrency ? impl_->config.insert_concurrency : 1;
+#if AUDIT_GRPC_TIMING_ENABLED
+		stats->inflight_before_wait = impl_->inflight;
+		const unsigned long long wait_start_ns = AUDIT_TIMING_NOW();
+#endif
 		impl_->cv.wait(lock, [&] { return impl_->inflight < limit; });
+#if AUDIT_GRPC_TIMING_ENABLED
+		stats->wait_inflight_ns = AUDIT_TIMING_NOW() - wait_start_ns;
+#endif
 		impl_->inflight++;
+#if AUDIT_GRPC_TIMING_ENABLED
+		stats->inflight_after_acquire = impl_->inflight;
+#endif
 	}
+
 	mongoc_client_t *client = mongoc_client_pool_pop(impl_->pool);
 	if (!client) {
 		{
@@ -381,6 +440,7 @@ bool MongoSink::insert_events(const std::string &agent_id, const std::string &se
 			*error = "failed to pop MongoDB client";
 		return false;
 	}
+
 	mongoc_collection_t *collection = mongoc_client_get_collection(
 		client, impl_->config.database.c_str(), impl_->config.collection.c_str());
 	if (!collection) {
@@ -396,37 +456,51 @@ bool MongoSink::insert_events(const std::string &agent_id, const std::string &se
 		return false;
 	}
 
-		std::vector<bson_t *> docs(events.size());
-		std::vector<const bson_t *> doc_ptrs(events.size());
-		unsigned long long bytes = 0;
+	std::vector<bson_t> docs(events.size());
+	std::vector<const bson_t *> doc_ptrs(events.size());
+	unsigned long long bytes = 0;
 #if AUDIT_PERF_FIELDS_ENABLED
-		unsigned long long mongo_before_insert_ns = monotonic_ns();
+	unsigned long long mongo_before_insert_ns = monotonic_ns();
 #endif
-		for (size_t i = 0; i < events.size(); i++) {
-			docs[i] = bson_new();
+#if AUDIT_GRPC_TIMING_ENABLED
+	const unsigned long long build_docs_start_ns = AUDIT_TIMING_NOW();
+#endif
+	for (size_t i = 0; i < events.size(); i++) {
+		bson_init(&docs[i]);
 #if AUDIT_PERF_FIELDS_ENABLED
-		append_event_doc(docs[i], agent_id, server_ip, events[i], mongo_before_insert_ns);
+		append_event_doc(&docs[i], agent_id, server_ip, events[i], mongo_before_insert_ns);
 #else
-			append_event_doc(docs[i], agent_id, server_ip, events[i]);
+		append_event_doc(&docs[i], agent_id, server_ip, events[i]);
 #endif
-			doc_ptrs[i] = docs[i];
-			bytes += events[i].size;
-		}
+		doc_ptrs[i] = &docs[i];
+		bytes += events[i].size;
+	}
+#if AUDIT_GRPC_TIMING_ENABLED
+	stats->build_docs_ns = AUDIT_TIMING_NOW() - build_docs_start_ns;
+#endif
 
 	bson_t opts;
 	bson_t reply;
 	bson_error_t bson_error;
 	bson_init(&opts);
 	BSON_APPEND_BOOL(&opts, "ordered", impl_->config.ordered_insert);
+	append_write_concern(&opts, impl_->config.write_concern);
+#if AUDIT_GRPC_TIMING_ENABLED
+	const unsigned long long insert_many_start_ns = AUDIT_TIMING_NOW();
+#endif
 	bool ok = mongoc_collection_insert_many(collection, doc_ptrs.data(), doc_ptrs.size(), &opts, &reply, &bson_error);
+#if AUDIT_GRPC_TIMING_ENABLED
+	stats->insert_many_ns = AUDIT_TIMING_NOW() - insert_many_start_ns;
+	stats->total_ns = AUDIT_TIMING_NOW() - total_start_ns;
+#endif
 	bool accepted = ok || duplicate_only(&reply);
 	if (!accepted && error)
 		*error = bson_error.message;
 
 	bson_destroy(&reply);
 	bson_destroy(&opts);
-	for (bson_t *doc : docs)
-		bson_destroy(doc);
+	for (bson_t &doc : docs)
+		bson_destroy(&doc);
 	mongoc_collection_destroy(collection);
 	mongoc_client_pool_push(impl_->pool, client);
 	{

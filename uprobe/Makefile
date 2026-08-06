@@ -35,7 +35,9 @@ GTEST_LDLIBS ?= $(shell pkg-config --libs gtest_main gtest 2>/dev/null || printf
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 AUDIT_PERF_FIELDS_ENABLED ?= 0
 AUDIT_PERF_DEFINE := -DAUDIT_PERF_FIELDS_ENABLED=$(AUDIT_PERF_FIELDS_ENABLED)
-CXXFLAGS += $(AUDIT_PERF_DEFINE)
+AUDIT_GRPC_TIMING_ENABLED ?= 0
+AUDIT_GRPC_TIMING_DEFINE := -DAUDIT_GRPC_TIMING_ENABLED=$(AUDIT_GRPC_TIMING_ENABLED)
+CXXFLAGS += $(AUDIT_PERF_DEFINE) $(AUDIT_GRPC_TIMING_DEFINE)
 
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
@@ -142,11 +144,19 @@ $(OUTPUT)/collector_resolver.o: $(SRC_DIR)/collector_resolver.cpp $(SRC_DIR)/col
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $< -o $@
 
-$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+$(OUTPUT)/collector_timing.o: collector/collector_timing.cpp collector/collector_timing.h $(SRC_DIR)/mongodb_sink.h | $(OUTPUT)
 	$(call msg,CXX,$@)
-	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) -c $< -o $@
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp collector/mongo_insert_worker.h collector/collector_timing.h $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
+
+$(OUTPUT)/mongo_insert_worker.o: collector/mongo_insert_worker.cpp collector/mongo_insert_worker.h $(SRC_DIR)/bounded_mpmc_queue.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
+
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) -o $@
 
@@ -157,8 +167,15 @@ $(BINDIR)/collector_connection_test: $(TEST_DIR)/collector_connection_test.cpp $
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) $< $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
 
-.PHONY: agent-sender-e2e-test
+	.PHONY: agent-sender-e2e-test
 agent-sender-e2e-test: $(BINDIR)/agent_sender_e2e_test
+
+.PHONY: bounded-mpmc-queue-test
+bounded-mpmc-queue-test: $(BINDIR)/bounded_mpmc_queue_test
+
+$(BINDIR)/bounded_mpmc_queue_test: $(TEST_DIR)/bounded_mpmc_queue_test.cpp $(SRC_DIR)/bounded_mpmc_queue.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) -I$(SRC_DIR) $< $(GTEST_LDLIBS) -pthread -o $@
 
 $(BINDIR)/agent_sender_e2e_test: $(TEST_DIR)/e2e_agent_sender/audit_grpc_sender_e2e_test.cpp $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,CXX,$@)

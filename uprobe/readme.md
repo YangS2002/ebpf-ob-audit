@@ -53,10 +53,10 @@ etcd \
   --name node1 \
   --data-dir /home/yangshuo17/etcd-data \
   --listen-client-urls http://0.0.0.0:2379 \
-  --advertise-client-urls http://7.27.43.139:2379 \
+  --advertise-client-urls http://7.27.43.145:2379 \
   --listen-peer-urls http://0.0.0.0:2381 \
-  --initial-advertise-peer-urls http://7.27.43.139:2381 \
-  --initial-cluster node1=http://7.27.43.139:2381 \
+  --initial-advertise-peer-urls http://7.27.43.145:2381 \
+  --initial-cluster node1=http://7.27.43.145:2381 \
   --initial-cluster-state new
 ```
 
