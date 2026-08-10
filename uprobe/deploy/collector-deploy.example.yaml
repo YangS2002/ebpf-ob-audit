@@ -28,8 +28,15 @@ collector:
         uri: mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit
         database: ob_audit
         collection: audit_events
+        # 存放 schema 版本字典的集合（_id=version），下游按记录 sv 拉取解码。
+        schema_collection: audit_schemas
+        # 字段编码 schema 文件（JSON：{version, fields:{数字键: 全名}}）。
+        # 启动时加载、校验并写入 schema_collection；每条记录带 sv 版本标记。
+        schema_file_path: audit_schema.json
         app_name: ebpf-ob-audit-collector
         write_concern: w1
+        # 写关注确认超时（毫秒）；副本集迟迟不确认时按此超时失败，避免 worker 无限阻塞。
+        write_concern_wtimeout_ms: 2000
         connect_timeout_ms: 2000
         server_selection_timeout_ms: 3000
         socket_timeout_ms: 5000
@@ -47,14 +54,14 @@ collector:
       ip: 7.27.43.139
       listen_port: 50051
       instance_id: collector-50051
-    - name: collector-50052
-      ip: 7.27.43.139
-      listen_port: 50052
-      instance_id: collector-50052
-    - name: collector-50053
-      ip: 7.27.43.139
-      listen_port: 50053
-      instance_id: collector-50053
+    # - name: collector-50052
+    #   ip: 7.27.43.139
+    #   listen_port: 50052
+    #   instance_id: collector-50052
+    # - name: collector-50053
+    #   ip: 7.27.43.139
+    #   listen_port: 50053
+    #   instance_id: collector-50053
       # 示例：只给该实例覆盖 Mongo bulk 大小。
       # override:
       #   mongodb:

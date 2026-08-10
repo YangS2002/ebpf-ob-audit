@@ -180,8 +180,11 @@ static bool load_config_file(const char *path, collector_app_config *config)
 	config->mongodb.uri = yaml.get_string("mongodb.uri", config->mongodb.uri);
 	config->mongodb.database = yaml.get_string("mongodb.database", config->mongodb.database);
 	config->mongodb.collection = yaml.get_string("mongodb.collection", config->mongodb.collection);
+	config->mongodb.schema_collection = yaml.get_string("mongodb.schema_collection", config->mongodb.schema_collection);
+	config->mongodb.schema_file_path = yaml.get_string("mongodb.schema_file_path", config->mongodb.schema_file_path);
 	config->mongodb.app_name = yaml.get_string("mongodb.app_name", config->mongodb.app_name);
 	config->mongodb.write_concern = yaml.get_string("mongodb.write_concern", config->mongodb.write_concern);
+	config->mongodb.write_concern_wtimeout_ms = yaml.get_u32("mongodb.write_concern_wtimeout_ms", config->mongodb.write_concern_wtimeout_ms);
 	config->mongodb.connect_timeout_ms = yaml.get_u32("mongodb.connect_timeout_ms", config->mongodb.connect_timeout_ms);
 	config->mongodb.server_selection_timeout_ms = yaml.get_u32("mongodb.server_selection_timeout_ms", config->mongodb.server_selection_timeout_ms);
 	config->mongodb.socket_timeout_ms = yaml.get_u32("mongodb.socket_timeout_ms", config->mongodb.socket_timeout_ms);

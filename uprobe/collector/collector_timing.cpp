@@ -48,15 +48,12 @@ struct collector_timing_stats {
 	unsigned long long records = 0;
 	unsigned long long bytes = 0;
 	unsigned long long parse_ns = 0;
-	unsigned long long wait_inflight_ns = 0;
 	unsigned long long build_docs_ns = 0;
 	unsigned long long insert_many_ns = 0;
 	unsigned long long mongo_total_ns = 0;
 	unsigned long long upload_total_ns = 0;
 	unsigned long long max_upload_total_ns = 0;
 	unsigned long long max_insert_many_ns = 0;
-	unsigned int max_inflight_before = 0;
-	unsigned int max_inflight_after = 0;
 	unsigned long long last_log_ns = 0;
 	std::mutex mutex;
 };
@@ -81,7 +78,6 @@ void record_collector_timing(const std::string &collector_id, const std::string 
 	g_timing_stats.records += records;
 	g_timing_stats.bytes += bytes;
 	g_timing_stats.parse_ns += parse_ns;
-	g_timing_stats.wait_inflight_ns += insert_stats.wait_inflight_ns;
 	g_timing_stats.build_docs_ns += insert_stats.build_docs_ns;
 	g_timing_stats.insert_many_ns += insert_stats.insert_many_ns;
 	g_timing_stats.mongo_total_ns += insert_stats.total_ns;
@@ -90,10 +86,6 @@ void record_collector_timing(const std::string &collector_id, const std::string 
 		g_timing_stats.max_upload_total_ns = upload_total_ns;
 	if (insert_stats.insert_many_ns > g_timing_stats.max_insert_many_ns)
 		g_timing_stats.max_insert_many_ns = insert_stats.insert_many_ns;
-	if (insert_stats.inflight_before_wait > g_timing_stats.max_inflight_before)
-		g_timing_stats.max_inflight_before = insert_stats.inflight_before_wait;
-	if (insert_stats.inflight_after_acquire > g_timing_stats.max_inflight_after)
-		g_timing_stats.max_inflight_after = insert_stats.inflight_after_acquire;
 
 	const unsigned long long now_ns = collector_timing_now_ns();
 	if (g_timing_stats.last_log_ns != 0 && now_ns - g_timing_stats.last_log_ns < 1000000000ULL)
@@ -101,21 +93,18 @@ void record_collector_timing(const std::string &collector_id, const std::string 
 	g_timing_stats.last_log_ns = now_ns;
 
 	audit_timing_log(
-		"event=collector_metrics collector_id=%s listen=%s batches=%llu records=%llu bytes=%llu avg_records=%.3f avg_bytes=%.3f avg_parse_us=%.3f avg_wait_inflight_us=%.3f avg_build_docs_us=%.3f avg_insert_many_us=%.3f avg_mongo_total_us=%.3f avg_upload_total_us=%.3f max_insert_many_us=%.3f max_upload_total_us=%.3f max_inflight_before=%u max_inflight_after=%u\n",
+		"event=collector_metrics collector_id=%s listen=%s batches=%llu records=%llu bytes=%llu avg_records=%.3f avg_bytes=%.3f avg_parse_us=%.3f avg_build_docs_us=%.3f avg_insert_many_us=%.3f avg_mongo_total_us=%.3f avg_upload_total_us=%.3f max_insert_many_us=%.3f max_upload_total_us=%.3f\n",
 		collector_id.c_str(), listen_addr.c_str(),
 		g_timing_stats.batches, g_timing_stats.records, g_timing_stats.bytes,
 		(double)g_timing_stats.records / (double)g_timing_stats.batches,
 		(double)g_timing_stats.bytes / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.parse_ns) / (double)g_timing_stats.batches,
-		ns_to_us(g_timing_stats.wait_inflight_ns) / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.build_docs_ns) / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.insert_many_ns) / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.mongo_total_ns) / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.upload_total_ns) / (double)g_timing_stats.batches,
 		ns_to_us(g_timing_stats.max_insert_many_ns),
-		ns_to_us(g_timing_stats.max_upload_total_ns),
-		g_timing_stats.max_inflight_before,
-		g_timing_stats.max_inflight_after);
+		ns_to_us(g_timing_stats.max_upload_total_ns));
 }
 
 #endif

@@ -505,6 +505,12 @@ def make_package(binary: Path, work_dir: Path) -> Path:
     for subdir in ("bin", "lib", "run", "logs", "conf"):
         (package_root / subdir).mkdir(parents=True)
     shutil.copy2(binary, package_root / "bin" / "audit_collector")
+    # Field-encoding schema file; collector reads it at startup (default cwd-relative
+    # path resolves to deploy_home, matching where start_collector.sh launches).
+    schema_file = UPROBE_DIR / "audit_schema.json"
+    if not schema_file.exists():
+        raise DeployError(f"schema file not found: {schema_file}")
+    shutil.copy2(schema_file, package_root / "audit_schema.json")
     write_text(package_root / "run" / "start_collector.sh", render_start_script(), 0o755)
     collect_libraries(binary, package_root / "lib")
     archive = work_dir / "uprobe-collector-common.tar.gz"
@@ -554,9 +560,13 @@ def start_node(config: DeployConfig, node: CollectorNode, dry_run: bool) -> Node
     pid_file = f"run/collector-{node.listen_port}.pid"
     cmd = (
         f"cd {quote_arg(node.deploy_home)} && mkdir -p logs run && "
+        # 强制重启: 先杀掉该端口已存在的旧实例, 保证是全新进程(累计指标从零开始)。
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
-        f"if [ -n \"$pids\" ]; then state=already_running; "
-        f"else nohup ./run/start_collector.sh {quote_arg('conf/collector-' + str(node.listen_port) + '.yaml')} > /dev/null 2>&1 < /dev/null & echo $! > {quote_arg(pid_file)}; state=started; fi; "
+        f"if [ -n \"$pids\" ]; then kill $pids; sleep 1; "
+        f"left=$(pgrep -f {quote_arg(pattern)} || true); if [ -n \"$left\" ]; then kill -9 $left; fi; fi; "
+        # 无条件清空共享 logs 目录(collector.log / collector_timing.log), 避免旧数据污染下一次统计。
+        f"rm -f logs/*; "
+        f"nohup ./run/start_collector.sh {quote_arg('conf/collector-' + str(node.listen_port) + '.yaml')} > /dev/null 2>&1 < /dev/null & echo $! > {quote_arg(pid_file)}; state=started; "
         f"sleep 3; "
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if ss -ltn sport = :{node.listen_port} 2>/dev/null | tail -n +2 | grep -q .; then listening=yes; else listening=no; fi; "

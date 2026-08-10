@@ -223,9 +223,24 @@ def parse_metric_line(line: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     return event, kv
 
 
+def instance_name(role: str, name: str, values: Dict[str, Any]) -> str:
+    # collector 多实例共用一份 timing 日志: 用行内 collector_id / listen 端口区分,
+    # 否则所有实例会被文件名(单一 source_name)揉成一个 key。
+    if role == "collector":
+        cid = values.get("collector_id")
+        if cid:
+            return str(cid)
+        listen = values.get("listen")
+        if listen:
+            port = str(listen).rsplit(":", 1)[-1]
+            if port:
+                return f"collector-{port}"
+    return name
+
+
 def parse_logs(local_files: List[Tuple[RemoteFile, Path]]) -> List[MetricRow]:
     rows: List[MetricRow] = []
-    seq_by_role: Dict[str, int] = defaultdict(int)
+    seq_by_source: Dict[Tuple[str, str], int] = defaultdict(int)
     for remote, path in local_files:
         if not path.exists():
             continue
@@ -235,14 +250,16 @@ def parse_logs(local_files: List[Tuple[RemoteFile, Path]]) -> List[MetricRow]:
                 if not parsed:
                     continue
                 event, values = parsed
-                seq_by_role[remote.role] += 1
+                source_name = instance_name(remote.role, remote.name, values)
+                seq_key = (remote.role, source_name)
+                seq_by_source[seq_key] += 1
                 rows.append(MetricRow(
                     role=remote.role,
-                    source_name=remote.name,
+                    source_name=source_name,
                     source_ip=remote.ip,
                     local_path=str(path),
                     line_no=line_no,
-                    seq=seq_by_role[remote.role],
+                    seq=seq_by_source[seq_key],
                     ts=str(values.get("ts") or ""),
                     event=event,
                     values=values,

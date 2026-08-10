@@ -156,7 +156,7 @@ $(OUTPUT)/mongo_insert_worker.o: collector/mongo_insert_worker.cpp collector/mon
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) -o $@
 

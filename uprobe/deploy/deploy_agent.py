@@ -461,6 +461,7 @@ set -euo pipefail
 DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
 mkdir -p "$DEPLOY_HOME/logs"
+rm -f "$DEPLOY_HOME"/logs/*
 export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
 : > "$UPROBE_LOG_FILE"
 {incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/agent.yaml"

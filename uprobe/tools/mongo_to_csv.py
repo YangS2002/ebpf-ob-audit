@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uri", default="mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit", help="MongoDB URI")
     parser.add_argument("--db", default="ob_audit", help="MongoDB database")
     parser.add_argument("--collection", default="audit_events", help="MongoDB collection")
+    parser.add_argument("--schema-collection", default="audit_schemas", help="MongoDB schema collection (version -> field map)")
     parser.add_argument("--output", required=True, help="Output CSV path")
     parser.add_argument("--query", default="{}", help="MongoDB filter JSON")
     parser.add_argument("--limit", type=int, default=0, help="Max documents to export; 0 means all")
@@ -102,6 +103,31 @@ def clean_text(value: Any) -> str:
     else:
         text = str(value)
     return "".join(" " if ch in "\r\n\t" else ch for ch in text if ch >= " " or ch in "\r\n\t")
+
+
+def load_schema_versions(schemas_collection) -> Dict[int, Dict[str, str]]:
+    """Return {version -> {numeric_key -> full_field_name}} from the schema collection."""
+    versions: Dict[int, Dict[str, str]] = {}
+    for doc in schemas_collection.find({}):
+        version = doc.get("_id")
+        fields = doc.get("fields")
+        if isinstance(version, int) and isinstance(fields, dict):
+            versions[version] = {key: full for key, full in fields.items()}
+    if not versions:
+        raise SystemExit(
+            "no schema documents found in schema collection; "
+            "cannot decode numeric field keys"
+        )
+    return versions
+
+
+def decode_doc(doc: Dict[str, Any], key_to_full: Dict[str, str]) -> Dict[str, Any]:
+    restored: Dict[str, Any] = {}
+    for key, value in doc.items():
+        if key in ("_id", "sv"):
+            continue
+        restored[key_to_full.get(key, key)] = value
+    return restored
 
 
 def value_for_field(doc: Dict[str, Any], field: str) -> str:
@@ -137,13 +163,28 @@ def main() -> int:
 
     MongoClient = import_pymongo()
     client = MongoClient(args.uri)
-    collection = client[args.db][args.collection]
-    cursor = collection.find(query, {field: 1 for field in set(CSV_FIELDS + ["plan_type_value", "trans_status_value"])})
+    events = client[args.db][args.collection]
+    schemas = client[args.db][args.schema_collection]
+
+    versions = load_schema_versions(schemas)
+    newest = max(versions)
+    # Sort field is a full name; translate to the numeric key used on disk.
+    full_to_key = {full: key for key, full in versions[newest].items()}
+
+    cursor = events.find(query)
     if args.sort:
-        cursor = cursor.sort(args.sort, -1 if args.sort_desc else 1)
+        sort_key = full_to_key.get(args.sort, args.sort)
+        cursor = cursor.sort(sort_key, -1 if args.sort_desc else 1)
     if args.limit > 0:
         cursor = cursor.limit(args.limit)
-    count = export_csv(cursor, Path(args.output))
+
+    def decoded_docs() -> Iterable[Dict[str, Any]]:
+        for doc in cursor:
+            version = doc.get("sv", newest)
+            key_to_full = versions.get(version) or versions[newest]
+            yield decode_doc(doc, key_to_full)
+
+    count = export_csv(decoded_docs(), Path(args.output))
     print(f"exported={count} output={args.output}")
     return 0
 
