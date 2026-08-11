@@ -395,10 +395,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 
 	const auto *header = static_cast<const audit_record_header *>(data);
-	if (header->total_size != size)
+	if (header->total_size > size)
 		return 0;
 	if (header->record_type == AUDIT_RECORD_EVENT) {
-		if (size < event_payload_offset() || size > sizeof(event))
+		if (header->total_size < event_payload_offset() || header->total_size > sizeof(event))
 			return 0;
 		const event *e = static_cast<const event *>(data);
 		state->agent_received_records++;
@@ -410,7 +410,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	#endif
 	}
 	if (header->record_type == AUDIT_RECORD_FRAGMENT)
-		return handle_fragment_record(state, static_cast<const audit_fragment_record *>(data), size);
+		return handle_fragment_record(state, static_cast<const audit_fragment_record *>(data), header->total_size);
 	return 0;
 }
 
@@ -467,13 +467,16 @@ int main(int argc, char **argv)
 	print_startup_status(target, offset, config_file, config, *state);
 
 	// 打开、加载并通过 verifier 校验 BPF 程序。
+	agent_log_info("event=bpf_load_begin");
 	skel = uprobe_bpf__open_and_load();
 	if (!skel) {
-		agent_log_error("event=bpf_load_failed");
+		agent_log_error("event=bpf_load_failed errno=%d", errno);
 		err = 1;
 		goto cleanup;
 	}
+	agent_log_info("event=bpf_load_success");
 	// pid = -1 表示对所有进程生效；target + offset 指定被 hook 的用户态函数入口。
+	agent_log_info("event=attach_begin target=%s offset=0x%llx", target, offset);
 	link = bpf_program__attach_uprobe(skel->progs.handle_uprobe, false, -1, target, offset);
 	if (!link) {
 		err = -errno;

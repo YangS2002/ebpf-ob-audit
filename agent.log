@@ -1,0 +1,2 @@
+ts=2026-08-11T15:16:47+0800 level=ERROR event=grpc_sender_start_failed
+ts=2026-08-11T15:16:47+0800 level=INFO event=agent_loss_metrics kernel_ringbuf_full_dropped_records=0 agent_received_records=0 agent_pending_dropped_records_overflow=0 agent_pending_dropped_records_expired=0 agent_send_buffer_dropped_records=0 agent_upload_retry_exhausted_records=0 agent_sent_records=0 agent_acknowledged_records=0 event_seq_last=0
