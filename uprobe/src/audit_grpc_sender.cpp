@@ -627,7 +627,8 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 		impl_->stats.dropped_oversize_bytes += size;
 		return false;
 	}
-	if (current_batch_expired_locked(impl_.get(), std::chrono::steady_clock::now()))
+	auto now = std::chrono::steady_clock::now();
+	if (current_batch_expired_locked(impl_.get(), now))
 		seal_current_batch_locked(impl_.get());
 	if (impl_->current_batch && impl_->current_batch->used + size > impl_->current_batch->capacity)
 		seal_current_batch_locked(impl_.get());
@@ -642,17 +643,22 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 			return false;
 		}
 	}
-	if (impl_->current_batch->record_count == 0)
-		impl_->current_batch->first_record_time = std::chrono::steady_clock::now();
+	bool first_record = impl_->current_batch->record_count == 0;
+	if (first_record)
+		impl_->current_batch->first_record_time = now;
 	memcpy(impl_->current_batch->data + impl_->current_batch->used, data, size);
 	impl_->current_batch->used += (uint32_t)size;
 	impl_->current_batch->record_count++;
 	impl_->queued_records++;
 	impl_->queued_bytes += size;
-	if (impl_->current_batch->used >= impl_->current_batch->capacity)
+	bool sealed = impl_->current_batch->used >= impl_->current_batch->capacity;
+	if (sealed)
 		seal_current_batch_locked(impl_.get());
 	update_pool_stats_locked(impl_.get());
-	impl_->cond.notify_one();
+	// seal 已 notify 就绪 batch；否则仅在新 batch 首条记录时唤醒 sender arm flush 截止时间，
+	// 避免每条记录都 notify 造成的调度/futex churn。
+	if (!sealed && first_record)
+		impl_->cond.notify_one();
 #if AUDIT_GRPC_TIMING_ENABLED
 	const uint64_t submit_ns = monotonic_ns() - submit_start_ns;
 	impl_->stats.submit_calls++;

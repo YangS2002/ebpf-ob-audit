@@ -266,17 +266,22 @@ static int emit_record(writer_state *state, char *data, size_t size)
 	return 0;
 }
 
-// 未分片小事件：值拷贝一份填 server_ip 再发。
-static int append_event(writer_state *state, const event &e, unsigned long long agent_receive_ns)
+// 未分片小事件：只拷 total_size 到栈上桶大小缓冲，填 server_ip 再发。
+static int append_event(writer_state *state, const event *e, unsigned long long agent_receive_ns)
 {
-	if (!event_compact_size_valid(&e))
+	if (!event_compact_size_valid(e))
 		return 0;
-	event out = e;
+	unsigned int total = e->total_size;
+	char buf[AUDIT_RINGBUF_BUCKET_MAIN];
+	if (total > sizeof(buf))
+		return 0;
+	std::memcpy(buf, e, total);
+	event *out = reinterpret_cast<event *>(buf);
 #if AUDIT_PERF_FIELDS_ENABLED
-	out.perf_agent_receive_ns = agent_receive_ns;
+	out->perf_agent_receive_ns = agent_receive_ns;
 #endif
-	std::memcpy(out.server_ip, state->server_ip, sizeof(out.server_ip));
-	return emit_record(state, reinterpret_cast<char *>(&out), out.total_size);
+	std::memcpy(out->server_ip, state->server_ip, sizeof(out->server_ip));
+	return emit_record(state, buf, total);
 }
 
 // 合并完成的变长事件：段可写，直接在段头填 server_ip 再发。
@@ -292,7 +297,7 @@ static int handle_main_event(writer_state *state, const event *e, unsigned long 
 	if (!event_compact_size_valid(e))
 		return 0;
 	if ((e->fragment_flags & (FRAG_QUERY_SQL_FRAGMENTED | FRAG_PARAMS_VALUE_FRAGMENTED)) == 0)
-		return append_event(state, *e, agent_receive_ns);
+		return append_event(state, e, agent_receive_ns);
 
 	// 分片事件：按完整长度在 pending 环形缓冲区预分配整段。
 	// 未分片字段用其首片长，分片字段用捕获上限 clamp 后的完整长。
