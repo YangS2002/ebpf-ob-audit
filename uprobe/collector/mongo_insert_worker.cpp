@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include "mongo_insert_worker.h"
 
+#include <chrono>
+#include <thread>
 #include <utility>
 
 #include "bounded_mpmc_queue.h"
 #include "uprobe.h"
 
 MongoInsertTask::MongoInsertTask(std::string agent_id, std::string server_ip, std::string records,
-				 std::vector<audit_ingest::parsed_audit_event> events)
-	: agent_id_(std::move(agent_id)), server_ip_(std::move(server_ip)), records_(std::move(records)), events_(std::move(events))
+					 std::vector<audit_ingest::parsed_audit_event> events,
+					 unsigned long long parse_ns,
+					 unsigned long long upload_total_ns)
+	: agent_id_(std::move(agent_id)), server_ip_(std::move(server_ip)), records_(std::move(records)), events_(std::move(events)),
+	  parse_ns_(parse_ns), upload_total_ns_(upload_total_ns)
 {
 	for (auto &event : events_)
 		event.record = reinterpret_cast<const struct event *>(records_.data() + event.offset);
@@ -32,8 +37,10 @@ mongo_insert_result MongoInsertTask::wait()
 }
 
 struct MongoInsertWorkerPool::Impl {
-	Impl(MongoSink *sink, std::size_t worker_count, std::size_t queue_capacity)
-		: sink(sink), worker_count(worker_count ? worker_count : 1), queue(queue_capacity ? queue_capacity : 1)
+	Impl(MongoSink *sink, std::size_t worker_count, std::size_t queue_capacity,
+	     mongo_insert_complete_cb complete_cb, mongo_insert_attempt_cb attempt_cb)
+		: sink(sink), worker_count(worker_count ? worker_count : 1), queue(queue_capacity ? queue_capacity : 1),
+		  complete_cb(std::move(complete_cb)), attempt_cb(std::move(attempt_cb))
 	{
 	}
 
@@ -42,11 +49,15 @@ struct MongoInsertWorkerPool::Impl {
 	BoundedMpmcQueue<std::shared_ptr<MongoInsertTask>> queue;
 	std::vector<std::thread> workers;
 	std::mutex mutex;
+	mongo_insert_complete_cb complete_cb;
+	mongo_insert_attempt_cb attempt_cb;
 	bool started = false;
 };
 
-MongoInsertWorkerPool::MongoInsertWorkerPool(MongoSink *sink, std::size_t worker_count, std::size_t queue_capacity)
-	: impl_(new Impl(sink, worker_count, queue_capacity))
+MongoInsertWorkerPool::MongoInsertWorkerPool(MongoSink *sink, std::size_t worker_count, std::size_t queue_capacity,
+					       mongo_insert_complete_cb complete_cb,
+					       mongo_insert_attempt_cb attempt_cb)
+	: impl_(new Impl(sink, worker_count, queue_capacity, std::move(complete_cb), std::move(attempt_cb)))
 {
 }
 
@@ -60,7 +71,7 @@ bool MongoInsertWorkerPool::start()
 	std::lock_guard<std::mutex> lock(impl_->mutex);
 	if (impl_->started)
 		return true;
-	if (!impl_->sink || !impl_->sink->enabled())
+	if (!impl_->attempt_cb && (!impl_->sink || !impl_->sink->enabled()))
 		return false;
 	impl_->started = true;
 	impl_->workers.reserve(impl_->worker_count);
@@ -95,23 +106,33 @@ bool MongoInsertWorkerPool::submit(const std::shared_ptr<MongoInsertTask> &task)
 void MongoInsertWorkerPool::worker_loop()
 {
 	std::shared_ptr<MongoInsertTask> task;
-	while (impl_->queue.pop(&task)) {
-		mongo_insert_result result;
-		if (!impl_->sink || !impl_->sink->enabled()) {
-			result.ok = false;
-			result.error = "MongoDB sink is not started";
-			task->complete(std::move(result));
-			continue;
-		}
-#if AUDIT_GRPC_TIMING_ENABLED
-			result.ok = impl_->sink->insert_events(task->agent_id(), task->server_ip(), task->events(),
-							   &result.accepted_records, &result.accepted_bytes,
-							   &result.error, &result.stats);
-#else
-			result.ok = impl_->sink->insert_events(task->agent_id(), task->server_ip(), task->events(),
-							   &result.accepted_records, &result.accepted_bytes,
-							   &result.error);
-#endif
+		while (impl_->queue.pop(&task)) {
+			mongo_insert_result result;
+			for (unsigned int attempt = 0; attempt < 4; attempt++) {
+				result = mongo_insert_result();
+				if (impl_->attempt_cb) {
+					result = impl_->attempt_cb(*task, attempt);
+				} else if (!impl_->sink || !impl_->sink->enabled()) {
+					result.ok = false;
+					result.error = "MongoDB sink is not started";
+				} else {
+		#if AUDIT_GRPC_TIMING_ENABLED
+					result.ok = impl_->sink->insert_events(task->agent_id(), task->server_ip(), task->events(),
+								   &result.accepted_records, &result.accepted_bytes,
+								   &result.error, &result.stats);
+		#else
+					result.ok = impl_->sink->insert_events(task->agent_id(), task->server_ip(), task->events(),
+								   &result.accepted_records, &result.accepted_bytes,
+								   &result.error);
+		#endif
+				}
+				if (result.ok)
+					break;
+				if (attempt < 3)
+					std::this_thread::sleep_for(std::chrono::milliseconds(100U << attempt));
+			}
+		if (impl_->complete_cb)
+			impl_->complete_cb(*task, result);
 		task->complete(std::move(result));
 	}
 }

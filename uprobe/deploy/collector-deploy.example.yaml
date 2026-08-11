@@ -42,7 +42,7 @@ collector:
         socket_timeout_ms: 5000
         pool_min_size: 1
         pool_max_size: 4
-        insert_concurrency: 2
+        insert_concurrency: 4
         bulk_max_records: 1000
         bulk_max_bytes: 4194304
         ordered_insert: false
@@ -51,13 +51,13 @@ collector:
   # 不要在这里放 agent uprobe offset、pending buffer、grpc queue 等配置。
   servers:
     - name: collector-50051
-      ip: 7.27.43.139
+      ip: 7.27.43.145
       listen_port: 50051
       instance_id: collector-50051
-    # - name: collector-50052
-    #   ip: 7.27.43.139
-    #   listen_port: 50052
-    #   instance_id: collector-50052
+    - name: collector-50052
+      ip: 7.27.43.145
+      listen_port: 50052
+      instance_id: collector-50052
     # - name: collector-50053
     #   ip: 7.27.43.139
     #   listen_port: 50053

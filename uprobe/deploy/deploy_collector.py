@@ -490,6 +490,7 @@ if [ -z "${PORT:-}" ]; then
   exit 1
 fi
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${LD_LIBRARY_PATH:-}"
+cd "$DEPLOY_HOME"
 mkdir -p "$DEPLOY_HOME/logs" "$DEPLOY_HOME/run"
 LOG_FILE="$DEPLOY_HOME/logs/collector.log"
 PID_FILE="$DEPLOY_HOME/run/collector-${PORT}.pid"

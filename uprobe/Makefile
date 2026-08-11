@@ -148,7 +148,11 @@ $(OUTPUT)/collector_timing.o: collector/collector_timing.cpp collector/collector
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
-$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp collector/mongo_insert_worker.h collector/collector_timing.h $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+$(OUTPUT)/collector_loss_metrics.o: collector/collector_loss_metrics.cpp collector/collector_loss_metrics.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -Icollector -c $< -o $@
+
+$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp collector/mongo_insert_worker.h collector/collector_timing.h collector/collector_loss_metrics.h $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
@@ -156,7 +160,7 @@ $(OUTPUT)/mongo_insert_worker.o: collector/mongo_insert_worker.cpp collector/mon
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_loss_metrics.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) -o $@
 
@@ -167,7 +171,14 @@ $(BINDIR)/collector_connection_test: $(TEST_DIR)/collector_connection_test.cpp $
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) $< $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
 
-	.PHONY: agent-sender-e2e-test
+.PHONY: collector-async-ack-e2e-test
+collector-async-ack-e2e-test: $(BINDIR)/collector_async_ack_e2e_test
+
+$(BINDIR)/collector_async_ack_e2e_test: $(TEST_DIR)/collector_async_ack_e2e_test.cpp $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_loss_metrics.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) $(GTEST_LDLIBS) -o $@
+
+.PHONY: agent-sender-e2e-test
 agent-sender-e2e-test: $(BINDIR)/agent_sender_e2e_test
 
 .PHONY: bounded-mpmc-queue-test

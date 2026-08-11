@@ -404,9 +404,10 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 #if AUDIT_GRPC_TIMING_ENABLED
 			add_grpc_roundtrip_timing_locked(impl, grpc_roundtrip_ns);
 #endif
-		impl->stats.sent_batches++;
-		impl->stats.sent_records += local_batch->record_count;
-		impl->stats.sent_bytes += local_batch->used;
+			impl->stats.sent_batches++;
+			impl->stats.sent_records += local_batch->record_count;
+			impl->stats.acknowledged_records += reply.accepted_records();
+			impl->stats.sent_bytes += local_batch->used;
 	}
 #if AUDIT_PERF_FIELDS_ENABLED
 	std::string db_name = db_name_from_records(local_batch->data, local_batch->used);

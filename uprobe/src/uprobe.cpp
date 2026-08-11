@@ -21,6 +21,7 @@ extern "C" {
 #include "uprobe.h"
 #include "agent_logger.h"
 #include "audit_grpc_sender.h"
+#include "audit_loss_metrics.h"
 #include "ring_buffer/ring_buffer.h"
 #include "simple_yaml.h"
 
@@ -69,9 +70,11 @@ struct writer_state {
 	explicit writer_state(size_t pending_ringbuf_bytes) : pending(pending_ringbuf_bytes) {}
 
 	VarlenRingBuffer<unsigned long long> pending;
-	unsigned long long consumed_events = 0;
-	unsigned long long consumed_bytes = 0;
-	unsigned long long dropped_events = 0;
+	unsigned long long agent_received_records = 0;
+	unsigned long long pending_overflow_dropped_records = 0;
+	unsigned long long pending_expired_dropped_records = 0;
+	unsigned long long send_buffer_dropped_records = 0;
+	unsigned long long last_event_seq = 0;
 	char server_ip[MAX_IP_LEN] = {};
 	AuditGrpcSender grpc;
 };
@@ -223,6 +226,21 @@ static void print_grpc_timing_stats(const writer_state &state)
 }
 #endif
 
+static void print_agent_loss_metrics(const writer_state &state, const audit_bpf_loss_stats &bpf_stats)
+{
+	audit_grpc_stats grpc_stats = state.grpc.stats();
+	agent_log_info("event=agent_loss_metrics kernel_ringbuf_full_dropped_records=%llu agent_received_records=%llu agent_pending_dropped_records_overflow=%llu agent_pending_dropped_records_expired=%llu agent_send_buffer_dropped_records=%llu agent_upload_retry_exhausted_records=%llu agent_sent_records=%llu agent_acknowledged_records=%llu event_seq_last=%llu",
+	       bpf_stats.ringbuf_full_dropped_records,
+	       state.agent_received_records,
+	       state.pending_overflow_dropped_records,
+	       state.pending_expired_dropped_records,
+	       state.send_buffer_dropped_records,
+	       (unsigned long long)grpc_stats.dropped_after_retries_records,
+	       (unsigned long long)grpc_stats.sent_records,
+	       (unsigned long long)grpc_stats.acknowledged_records,
+	       state.last_event_seq);
+}
+
 static unsigned int clamp_capture(unsigned int len, unsigned int max_len)
 {
 	return len > max_len ? max_len : len;
@@ -242,11 +260,9 @@ static int emit_record(writer_state *state, char *data, size_t size)
 #endif
 	bool submitted = state->grpc.submit(data, size);
 	if (!submitted) {
-		state->dropped_events++;
+		state->send_buffer_dropped_records++;
 		return 0;
 	}
-	state->consumed_events++;
-	state->consumed_bytes += size;
 	return 0;
 }
 
@@ -291,11 +307,11 @@ static int handle_main_event(writer_state *state, const event *e, unsigned long 
 	size_t total = (size_t)payoff + names_len + full_sql + full_params;
 
 	char *seg = static_cast<char *>(state->pending.allocate(e->event_seq, total));
-	if (!seg) {
-		// 空间不足：整条记录从首片起丢弃，后续分片找不到父 seq 也会被丢。
-		state->dropped_events++;
-		return 0;
-	}
+		if (!seg) {
+			// 空间不足：整条记录从首片起丢弃，后续分片找不到父 seq 也会被丢。
+			state->pending_overflow_dropped_records++;
+			return 0;
+		}
 
 	// 段布局：[event 头][names][完整 query_sql][完整 params_value]。
 	// main 里两字段首片按最终 layout 落位，params 首片跳到完整 sql 之后。
@@ -347,7 +363,7 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	if (!state->pending.fill(fragment->parent_event_seq, base + fragment->fragment_offset,
 				 fragment->payload, fragment->payload_len)) {
 		state->pending.erase(fragment->parent_event_seq);
-		state->dropped_events++;
+		state->pending_expired_dropped_records++;
 		return 0;
 	}
 
@@ -384,11 +400,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (header->record_type == AUDIT_RECORD_EVENT) {
 		if (size < event_payload_offset() || size > sizeof(event))
 			return 0;
-#if AUDIT_PERF_FIELDS_ENABLED
-		return handle_main_event(state, static_cast<const event *>(data), agent_receive_ns);
-#else
-		return handle_main_event(state, static_cast<const event *>(data), 0);
-#endif
+		const event *e = static_cast<const event *>(data);
+		state->agent_received_records++;
+		state->last_event_seq = e->event_seq;
+	#if AUDIT_PERF_FIELDS_ENABLED
+		return handle_main_event(state, e, agent_receive_ns);
+	#else
+		return handle_main_event(state, e, 0);
+	#endif
 	}
 	if (header->record_type == AUDIT_RECORD_FRAGMENT)
 		return handle_fragment_record(state, static_cast<const audit_fragment_record *>(data), size);
@@ -487,12 +506,18 @@ int main(int argc, char **argv)
 	}
 
 	cleanup:
-	if (state) {
-#if AUDIT_GRPC_TIMING_ENABLED
-		print_grpc_timing_stats(*state);
-#endif
-		state->grpc.stop();
-	}
+		if (state) {
+			audit_bpf_loss_stats bpf_stats = {};
+			if (skel) {
+				unsigned int key = 0;
+				bpf_map__lookup_elem(skel->maps.loss_stats, &key, sizeof(key), &bpf_stats, sizeof(bpf_stats), 0);
+			}
+			print_agent_loss_metrics(*state, bpf_stats);
+	#if AUDIT_GRPC_TIMING_ENABLED
+			print_grpc_timing_stats(*state);
+	#endif
+			state->grpc.stop();
+		}
 	ring_buffer__free(rb);
 	bpf_link__destroy(link);
 	uprobe_bpf__destroy(skel);

@@ -34,6 +34,7 @@ struct audit_grpc_stats {
 	uint64_t queued_bytes = 0;
 	uint64_t sent_batches = 0;
 	uint64_t sent_records = 0;
+	uint64_t acknowledged_records = 0;
 	uint64_t sent_bytes = 0;
 	uint64_t dropped_records = 0;
 	uint64_t dropped_bytes = 0;

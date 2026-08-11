@@ -3,6 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "uprobe.h"
+#include "audit_loss_metrics.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -18,6 +19,22 @@ struct {
 	__type(key, u32);
 	__type(value, u64);
 } seq SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct audit_bpf_loss_stats);
+} loss_stats SEC(".maps");
+
+static __always_inline void count_ringbuf_full_drop(void)
+{
+	u32 key = 0;
+	struct audit_bpf_loss_stats *stats = bpf_map_lookup_elem(&loss_stats, &key);
+
+	if (stats)
+		__sync_fetch_and_add(&stats->ringbuf_full_dropped_records, 1);
+}
 
 /* per-cpu 临时缓冲。
  * bpf_ringbuf_reserve() 要求 size 为编译期常量，变长记录无法使用。
@@ -215,8 +232,10 @@ static __always_inline void emit_field_fragments(const char *src, long long sour
 			if (out_size > sizeof(*s))
 				out_size = sizeof(*s);
 			s->total_size = out_size;
-			if (bpf_ringbuf_output(&rb, s, out_size, 0))
-				break;
+				if (bpf_ringbuf_output(&rb, s, out_size, 0)) {
+					count_ringbuf_full_drop();
+					break;
+				}
 		}
 
 		if (is_last)
@@ -438,7 +457,10 @@ int handle_uprobe(struct pt_regs *ctx)
 #if AUDIT_PERF_FIELDS_ENABLED
 			e->perf_bpf_before_output_ns = bpf_ktime_get_ns();
 #endif
-			bpf_ringbuf_output(&rb, e, out_size, 0);
+							if (bpf_ringbuf_output(&rb, e, out_size, 0)) {
+					count_ringbuf_full_drop();
+					return 0;
+				}
 	}
 	if (main_fragment_flags & FRAG_QUERY_SQL_FRAGMENTED)
 		emit_field_fragments(sql, sql_len, FRAG_FIELD_QUERY_SQL, sql_first_len, main_event_seq,
