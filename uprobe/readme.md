@@ -43,7 +43,9 @@ observer record_request
 ```
 
 collector 支持 MongoDB 存储。agent 支持 collector 服务发现，默认通过 etcd 服务名 `audit-collector` 选择 collector。
-
+```
+ docker exec -it mongodb8 mongosh 'mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit'
+```
 ## 3. 启动 etcd
 
 collector 注册和 agent 服务发现依赖 etcd。单节点测试可这样启动：

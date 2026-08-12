@@ -48,20 +48,33 @@ static constexpr uint32_t MAX_GRPC_UPLOAD_CONCURRENCY = 8;
 
 struct AuditGrpcSender::Impl {
 	struct Batch {
-		char *data = nullptr;
-		uint32_t capacity = 0;
-		uint32_t used = 0;
+		// Heap std::string owned by the batch. It is temporarily transferred into the
+		// AuditBatch upload message via set_allocated_records() and reclaimed via
+		// release_records(), so it must be an individually `new`-allocated object
+		// (never an array element) to remain compatible with protobuf's delete.
+		std::string *payload = nullptr;
 		uint32_t record_count = 0;
 		std::chrono::steady_clock::time_point first_record_time;
 	};
 
 	struct BatchPool {
-		std::unique_ptr<char[]> memory;
 		std::unique_ptr<Batch[]> batches;
 		std::vector<uint32_t> free_indexes;
 		std::vector<bool> free_flags;
 		uint32_t batch_count = 0;
 		uint32_t batch_bytes = 0;
+
+		~BatchPool() { free_payloads(); }
+
+		void free_payloads()
+		{
+			if (!batches)
+				return;
+			for (uint32_t i = 0; i < batch_count; i++) {
+				delete batches[i].payload;
+				batches[i].payload = nullptr;
+			}
+		}
 
 		bool init(uint64_t pool_bytes, uint32_t batch_size, uint32_t min_batches)
 		{
@@ -70,9 +83,9 @@ struct AuditGrpcSender::Impl {
 			uint64_t count = pool_bytes / batch_size;
 			if (count < min_batches || count > UINT32_MAX)
 				return false;
-			memory.reset(new (std::nothrow) char[count * batch_size]);
+			free_payloads();
 			batches.reset(new (std::nothrow) Batch[count]);
-			if (!memory || !batches)
+			if (!batches)
 				return false;
 			free_indexes.clear();
 			free_indexes.reserve((size_t)count);
@@ -80,9 +93,12 @@ struct AuditGrpcSender::Impl {
 			batch_count = (uint32_t)count;
 			batch_bytes = batch_size;
 			for (uint32_t i = 0; i < batch_count; i++) {
-				batches[i].data = memory.get() + (uint64_t)i * batch_bytes;
-				batches[i].capacity = batch_bytes;
-				batches[i].used = 0;
+				batches[i].payload = new (std::nothrow) std::string();
+				if (!batches[i].payload) {
+					free_payloads();
+					return false;
+				}
+				batches[i].payload->reserve(batch_bytes);
 				batches[i].record_count = 0;
 				free_indexes.push_back(batch_count - 1 - i);
 			}
@@ -97,7 +113,7 @@ struct AuditGrpcSender::Impl {
 			free_indexes.pop_back();
 			free_flags[idx] = false;
 			Batch *batch = &batches[idx];
-			batch->used = 0;
+			batch->payload->clear();
 			batch->record_count = 0;
 			batch->first_record_time = std::chrono::steady_clock::time_point();
 			return batch;
@@ -110,7 +126,8 @@ struct AuditGrpcSender::Impl {
 			uint32_t idx = (uint32_t)(batch - batches.get());
 			if (idx >= batch_count || free_flags[idx])
 				return;
-			batch->used = 0;
+			if (batch->payload)
+				batch->payload->clear();
 			batch->record_count = 0;
 			batch->first_record_time = std::chrono::steady_clock::time_point();
 			free_flags[idx] = true;
@@ -183,7 +200,7 @@ static void update_pool_stats_locked(AuditGrpcSender::Impl *impl)
 static void sub_queued_locked(AuditGrpcSender::Impl *impl, const AuditGrpcSender::Impl::Batch *batch)
 {
 	impl->queued_records -= batch->record_count;
-	impl->queued_bytes -= batch->used;
+	impl->queued_bytes -= batch->payload->size();
 	update_pool_stats_locked(impl);
 }
 
@@ -354,8 +371,10 @@ static std::string db_name_from_records(const char *records, size_t size)
 static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batch *local_batch,
 				WorkerUploadState *worker_state)
 {
-	if (!local_batch || local_batch->used == 0 || local_batch->record_count == 0)
+	if (!local_batch || local_batch->payload->empty() || local_batch->record_count == 0)
 		return true;
+
+	const uint32_t payload_size = (uint32_t)local_batch->payload->size();
 
 	SendTarget target;
 	if (!get_send_target(impl, &target))
@@ -373,7 +392,16 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 	batch.set_file_version(impl->config.file_version);
 	batch.set_event_size(impl->config.event_size);
 	batch.set_record_count(local_batch->record_count);
-	batch.set_records(local_batch->data, local_batch->used);
+	// Zero-copy ownership move: hand the batch payload string to the message
+	// instead of copying it (replaces set_records()). The reclaim guard moves
+	// the pointer back out on every exit path so the batch buffer is reused and
+	// protobuf never frees it.
+	batch.set_allocated_records(local_batch->payload);
+	struct ReclaimGuard {
+		audit::AuditBatch *msg;
+		AuditGrpcSender::Impl::Batch *b;
+		~ReclaimGuard() { b->payload = msg->release_records(); }
+	} reclaim_guard{&batch, local_batch};
 
 	audit::UploadReply reply;
 	grpc::ClientContext context;
@@ -389,7 +417,7 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 #endif
 	if (!status.ok() || !reply.ok()) {
 		fprintf(stderr, "grpc upload failed: collector=%s records=%u bytes=%u %s %s\n",
-			target.addr.c_str(), local_batch->record_count, local_batch->used,
+			target.addr.c_str(), local_batch->record_count, payload_size,
 			status.error_message().c_str(), reply.message().c_str());
 		{
 			std::lock_guard<std::mutex> lock(impl->mutex);
@@ -407,13 +435,13 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 			impl->stats.sent_batches++;
 			impl->stats.sent_records += local_batch->record_count;
 			impl->stats.acknowledged_records += reply.accepted_records();
-			impl->stats.sent_bytes += local_batch->used;
+			impl->stats.sent_bytes += payload_size;
 	}
 #if AUDIT_PERF_FIELDS_ENABLED
-	std::string db_name = db_name_from_records(local_batch->data, local_batch->used);
+	std::string db_name = db_name_from_records(local_batch->payload->data(), payload_size);
 	fprintf(stderr,
 		"grpc upload perf: collector=%s db_name=%s records=%u bytes=%u roundtrip_us=%.3f\n",
-		target.addr.c_str(), db_name.c_str(), local_batch->record_count, local_batch->used,
+		target.addr.c_str(), db_name.c_str(), local_batch->record_count, payload_size,
 		(double)grpc_roundtrip_ns / 1000.0);
 #endif
 	return true;
@@ -444,14 +472,15 @@ static void upload_with_retries(AuditGrpcSender::Impl *impl, AuditGrpcSender::Im
 	}
 	{
 		std::lock_guard<std::mutex> lock(impl->mutex);
+		const uint32_t payload_size = (uint32_t)batch->payload->size();
 		impl->stats.dropped_after_retries_batches++;
 		impl->stats.dropped_after_retries_records += batch->record_count;
-		impl->stats.dropped_after_retries_bytes += batch->used;
+		impl->stats.dropped_after_retries_bytes += payload_size;
 		impl->stats.failed_records += batch->record_count;
-		impl->stats.failed_bytes += batch->used;
+		impl->stats.failed_bytes += payload_size;
 	}
-	fprintf(stderr, "grpc drop batch after retries: records=%u bytes=%u attempts=%u\n",
-		batch->record_count, batch->used, impl->config.max_retries + 1);
+	fprintf(stderr, "grpc drop batch after retries: records=%u bytes=%zu attempts=%u\n",
+		batch->record_count, batch->payload->size(), impl->config.max_retries + 1);
 }
 
 static AuditGrpcSender::Impl::Batch *pop_ready_batch(AuditGrpcSender::Impl *impl)
@@ -630,7 +659,7 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 	auto now = std::chrono::steady_clock::now();
 	if (current_batch_expired_locked(impl_.get(), now))
 		seal_current_batch_locked(impl_.get());
-	if (impl_->current_batch && impl_->current_batch->used + size > impl_->current_batch->capacity)
+	if (impl_->current_batch && impl_->current_batch->payload->size() + size > impl_->pool.batch_bytes)
 		seal_current_batch_locked(impl_.get());
 	if (!impl_->current_batch) {
 		impl_->current_batch = impl_->pool.acquire();
@@ -646,12 +675,11 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 	bool first_record = impl_->current_batch->record_count == 0;
 	if (first_record)
 		impl_->current_batch->first_record_time = now;
-	memcpy(impl_->current_batch->data + impl_->current_batch->used, data, size);
-	impl_->current_batch->used += (uint32_t)size;
+	impl_->current_batch->payload->append(data, size);
 	impl_->current_batch->record_count++;
 	impl_->queued_records++;
 	impl_->queued_bytes += size;
-	bool sealed = impl_->current_batch->used >= impl_->current_batch->capacity;
+	bool sealed = impl_->current_batch->payload->size() >= impl_->pool.batch_bytes;
 	if (sealed)
 		seal_current_batch_locked(impl_.get());
 	update_pool_stats_locked(impl_.get());
