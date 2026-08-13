@@ -6,13 +6,20 @@
 #include <ctime>
 #include <mutex>
 
+static unsigned long long wall_time_ms()
+{
+	return (unsigned long long)time(nullptr) * 1000ULL;
+}
+
 struct collector_loss_stats {
 	std::string collector_id;
 	std::string listen_addr;
 	unsigned long long accepted_records = 0;
+	unsigned long long rejected_records = 0;
 	unsigned long long persisted_records = 0;
-	unsigned long long db_queue_dropped_records = 0;
 	unsigned long long db_retry_exhausted_records = 0;
+	unsigned long long process_start_unix_ms = wall_time_ms();
+	unsigned long long sequence = 0;
 	unsigned long long last_log_sec = 0;
 	std::mutex mutex;
 };
@@ -57,16 +64,16 @@ void collector_loss_metrics_accepted(unsigned long long records)
 	g_loss_stats.accepted_records += records;
 }
 
+void collector_loss_metrics_rejected(unsigned long long records)
+{
+	std::lock_guard<std::mutex> guard(g_loss_stats.mutex);
+	g_loss_stats.rejected_records += records;
+}
+
 void collector_loss_metrics_persisted(unsigned long long records)
 {
 	std::lock_guard<std::mutex> guard(g_loss_stats.mutex);
 	g_loss_stats.persisted_records += records;
-}
-
-void collector_loss_metrics_db_queue_dropped(unsigned long long records)
-{
-	std::lock_guard<std::mutex> guard(g_loss_stats.mutex);
-	g_loss_stats.db_queue_dropped_records += records;
 }
 
 void collector_loss_metrics_db_retry_exhausted(unsigned long long records)
@@ -82,10 +89,29 @@ void collector_loss_metrics_flush()
 	if (g_loss_stats.last_log_sec != 0 && now == g_loss_stats.last_log_sec)
 		return;
 	g_loss_stats.last_log_sec = now;
-	collector_loss_log("event=collector_loss_metrics collector_id=%s listen=%s collector_accepted_records=%llu collector_persisted_records=%llu collector_db_queue_dropped_records=%llu collector_db_retry_exhausted_records=%llu\n",
+	unsigned long long inflight = g_loss_stats.accepted_records - g_loss_stats.persisted_records - g_loss_stats.db_retry_exhausted_records;
+	collector_loss_log("event=collector_audit_accounting collector_id=%s listen=%s accepted_records=%llu rejected_records=%llu persisted_records=%llu db_failed_lost_records=%llu inflight_records=%llu\n",
 			   g_loss_stats.collector_id.c_str(), g_loss_stats.listen_addr.c_str(),
 			   g_loss_stats.accepted_records,
+			   g_loss_stats.rejected_records,
 			   g_loss_stats.persisted_records,
-			   g_loss_stats.db_queue_dropped_records,
-			   g_loss_stats.db_retry_exhausted_records);
+			   g_loss_stats.db_retry_exhausted_records,
+			   inflight);
+}
+
+audit_collector_accounting_snapshot collector_loss_metrics_snapshot()
+{
+	std::lock_guard<std::mutex> guard(g_loss_stats.mutex);
+	audit_collector_accounting_snapshot snapshot;
+	snapshot.source_id = g_loss_stats.collector_id;
+	snapshot.listen_addr = g_loss_stats.listen_addr;
+	snapshot.process_start_unix_ms = g_loss_stats.process_start_unix_ms;
+	snapshot.sequence = ++g_loss_stats.sequence;
+	snapshot.report_unix_ms = wall_time_ms();
+	snapshot.accepted_records = g_loss_stats.accepted_records;
+	snapshot.rejected_records = g_loss_stats.rejected_records;
+	snapshot.persisted_records = g_loss_stats.persisted_records;
+	snapshot.db_failed_lost_records = g_loss_stats.db_retry_exhausted_records;
+	snapshot.inflight_records = g_loss_stats.accepted_records - g_loss_stats.persisted_records - g_loss_stats.db_retry_exhausted_records;
+	return snapshot;
 }

@@ -456,12 +456,17 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 	const uint64_t grpc_roundtrip_ns = monotonic_ns() - upload_start_ns;
 #endif
 	if (!status.ok() || !reply.ok()) {
-		fprintf(stderr, "grpc upload failed: collector=%s records=%u bytes=%u %s %s\n",
+		fprintf(stderr, "grpc upload failed: collector=%s records=%u bytes=%u grpc_status=%s reply_status=%d reply_message=%s\n",
 			target.addr.c_str(), local_batch->record_count, payload_size,
-			status.error_message().c_str(), reply.message().c_str());
+			status.error_message().c_str(), reply.status(), reply.message().c_str());
 		{
 			std::lock_guard<std::mutex> lock(impl->mutex);
 			impl->stats.failed_uploads++;
+			if (status.ok() && !reply.ok()) {
+				impl->stats.collector_rejected_records += local_batch->record_count;
+				if (reply.status() == audit::UPLOAD_STATUS_QUEUE_FULL)
+					impl->stats.collector_queue_full_records += local_batch->record_count;
+			}
 		}
 		// Transient failures are handled by gRPC subchannel health/backoff on
 		// the round_robin channel; batch retry re-reads the current channel.
@@ -743,6 +748,41 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 		impl_->stats.max_submit_ns = submit_ns;
 #endif
 	return true;
+}
+
+bool AuditGrpcSender::report_metrics(const audit_agent_accounting_snapshot &snapshot)
+{
+	SendTarget target;
+	if (!get_send_target(impl_.get(), &target))
+		return false;
+	auto stub = audit::AuditCollector::NewStub(target.channel);
+	audit::MetricsReport report;
+	report.set_source_type("agent");
+	report.set_source_id(snapshot.source_id);
+	report.set_server_ip(snapshot.server_ip);
+	report.set_process_start_unix_ms(snapshot.process_start_unix_ms);
+	report.set_sequence(snapshot.sequence);
+	report.set_report_unix_ms(snapshot.report_unix_ms);
+	audit::AgentAccounting *agent = report.mutable_agent();
+	agent->set_ob_audit_seen_records(snapshot.ob_audit_seen_records);
+	agent->set_ringbuf_lost_records(snapshot.ringbuf_lost_records);
+	agent->set_agent_received_records(snapshot.agent_received_records);
+	agent->set_pending_lost_records(snapshot.pending_lost_records);
+	agent->set_send_enqueue_lost_records(snapshot.send_enqueue_lost_records);
+	agent->set_collector_rejected_records(snapshot.collector_rejected_records);
+	agent->set_collector_queue_full_records(snapshot.collector_queue_full_records);
+	agent->set_upload_retry_exhausted_records(snapshot.upload_retry_exhausted_records);
+	agent->set_agent_lost_records(snapshot.agent_lost_records);
+	agent->set_delivered_records(snapshot.delivered_records);
+	agent->set_acknowledged_records(snapshot.acknowledged_records);
+	agent->set_inflight_records(snapshot.inflight_records);
+	audit::MetricsReply reply;
+	grpc::ClientContext context;
+	if (impl_->config.timeout_ms > 0)
+		context.set_deadline(std::chrono::system_clock::now() +
+				     std::chrono::milliseconds(impl_->config.timeout_ms));
+	grpc::Status status = stub->ReportMetrics(&context, report, &reply);
+	return status.ok() && reply.ok();
 }
 
 bool AuditGrpcSender::enabled() const

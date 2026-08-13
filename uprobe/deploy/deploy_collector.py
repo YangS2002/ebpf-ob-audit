@@ -50,6 +50,9 @@ class DeployConfig:
     mongodb_uri: str
     mongodb_database: str
     mongodb_collection: str
+    mongodb_metrics_collection: str
+    mongodb_event_ttl_days: int
+    mongodb_metrics_ttl_days: int
     mongodb_app_name: str
     mongodb_write_concern: str
     mongodb_connect_timeout_ms: int
@@ -257,6 +260,9 @@ def default_collector_runtime() -> Dict[str, Any]:
             "uri": "",
             "database": "",
             "collection": "",
+            "metrics_collection": "audit_pipeline_metrics",
+            "event_ttl_days": 3,
+            "metrics_ttl_days": 1,
             "app_name": "ebpf-ob-audit-collector",
             "write_concern": "w1",
             "connect_timeout_ms": 2000,
@@ -311,6 +317,9 @@ def parse_config(path: Path) -> DeployConfig:
         mongodb_uri=str(get_path(runtime_global, "mongodb.uri", "")),
         mongodb_database=str(get_path(runtime_global, "mongodb.database", "")),
         mongodb_collection=str(get_path(runtime_global, "mongodb.collection", "")),
+        mongodb_metrics_collection=str(get_path(runtime_global, "mongodb.metrics_collection", "audit_pipeline_metrics")),
+        mongodb_event_ttl_days=int(get_path(runtime_global, "mongodb.event_ttl_days", 3)),
+        mongodb_metrics_ttl_days=int(get_path(runtime_global, "mongodb.metrics_ttl_days", 1)),
         mongodb_app_name=str(get_path(runtime_global, "mongodb.app_name", "ebpf-ob-audit-collector")),
         mongodb_write_concern=str(get_path(runtime_global, "mongodb.write_concern", "w1")),
         mongodb_connect_timeout_ms=int(get_path(runtime_global, "mongodb.connect_timeout_ms", 2000)),

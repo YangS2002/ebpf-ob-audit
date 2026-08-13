@@ -3,6 +3,7 @@
 #define AUDIT_LOSS_METRICS_H
 
 struct audit_bpf_loss_stats {
+	unsigned long long ob_audit_seen_records;
 	unsigned long long ringbuf_full_dropped_records;
 };
 

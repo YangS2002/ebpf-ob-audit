@@ -130,6 +130,41 @@ static bool ensure_unique_index(mongoc_client_t *client, const mongodb_config &c
 	return true;
 }
 
+static bool ensure_ttl_index(mongoc_client_t *client, const std::string &database, const std::string &collection_name,
+				     const char *field, unsigned int ttl_days, std::string *error)
+{
+	if (ttl_days == 0)
+		return true;
+	mongoc_collection_t *collection = mongoc_client_get_collection(client, database.c_str(), collection_name.c_str());
+	if (!collection) {
+		if (error)
+			*error = "failed to get MongoDB collection for TTL index";
+		return false;
+	}
+
+	bson_t keys;
+	bson_init(&keys);
+	BSON_APPEND_INT32(&keys, field, 1);
+
+	bson_error_t bson_error;
+	mongoc_index_opt_t opts;
+	mongoc_index_opt_init(&opts);
+	std::string name = std::string("ttl_") + field;
+	opts.name = name.c_str();
+	opts.expire_after_seconds = (int32_t)ttl_days * 86400;
+
+	bool ok = mongoc_collection_create_index(collection, &keys, &opts, &bson_error);
+	bson_destroy(&keys);
+	mongoc_collection_destroy(collection);
+
+	if (!ok && strstr(bson_error.message, "already exists") == nullptr) {
+		if (error)
+			*error = bson_error.message;
+		return false;
+	}
+	return true;
+}
+
 // Upsert the schema document `{ _id: <version>, version, fields: { key -> full } }`
 // into the dedicated schema collection. Keyed by version so multiple versions
 // coexist; idempotent, so safe to run on every startup.
@@ -318,8 +353,9 @@ static bool append_event_doc(bson_t *doc, const std::vector<emit_entry> &plan, i
 	std::string indexed_server_ip = event_server_ip.empty() ? request_server_ip : event_server_ip;
 
 	bson_init(doc);
-	// `sv` marks which schema version decodes this document; not a mapped field.
-	BSON_APPEND_INT32(doc, "sv", schema_version);
+	// Top-level ingest_time is kept for MongoDB TTL; schema-driven fields below
+	// may also include ingest_time under a compact numeric key for readers.
+	BSON_APPEND_DATE_TIME(doc, "ingest_time", ingest_time_ms);
 
 	append_ctx ctx;
 	ctx.e = e;
@@ -488,14 +524,22 @@ bool MongoSink::start(const mongodb_config &config, std::string *error)
 		return false;
 	}
 
-	if (!ensure_unique_index(client, config, full_to_key, error)) {
-		mongoc_client_pool_push(impl_->pool, client);
-		mongoc_client_pool_destroy(impl_->pool);
-		impl_->pool = nullptr;
-		return false;
-	}
+		if (!ensure_unique_index(client, config, full_to_key, error)) {
+			mongoc_client_pool_push(impl_->pool, client);
+			mongoc_client_pool_destroy(impl_->pool);
+			impl_->pool = nullptr;
+			return false;
+		}
 
-	if (!ensure_schema_dict(client, config, schema, error)) {
+		if (!ensure_ttl_index(client, config.database, config.collection, "ingest_time", config.event_ttl_days, error) ||
+		    !ensure_ttl_index(client, config.database, config.metrics_collection, "ts", config.metrics_ttl_days, error)) {
+			mongoc_client_pool_push(impl_->pool, client);
+			mongoc_client_pool_destroy(impl_->pool);
+			impl_->pool = nullptr;
+			return false;
+		}
+
+		if (!ensure_schema_dict(client, config, schema, error)) {
 		mongoc_client_pool_push(impl_->pool, client);
 		mongoc_client_pool_destroy(impl_->pool);
 		impl_->pool = nullptr;
@@ -659,5 +703,115 @@ bool MongoSink::insert_events(const std::string &agent_id, const std::string &se
 	if (accepted_bytes)
 		*accepted_bytes = bytes;
 	return true;
+#endif
+}
+
+static int64_t unix_ms_now()
+{
+	return (int64_t)time(nullptr) * 1000;
+}
+
+bool MongoSink::insert_agent_metrics(const audit_agent_accounting_snapshot &snapshot, std::string *error)
+{
+#if !HAVE_MONGOC
+	if (error)
+		*error = "libmongoc headers are not available; install libmongoc-dev libbson-dev";
+	return false;
+#else
+	if (!impl_->started || !impl_->pool) {
+		if (error)
+			*error = "MongoDB sink is not started";
+		return false;
+	}
+	mongoc_client_t *client = mongoc_client_pool_pop(impl_->pool);
+	if (!client) {
+		if (error)
+			*error = "failed to pop MongoDB client";
+		return false;
+	}
+	mongoc_collection_t *collection = mongoc_client_get_collection(client, impl_->config.database.c_str(), impl_->config.metrics_collection.c_str());
+	if (!collection) {
+		mongoc_client_pool_push(impl_->pool, client);
+		if (error)
+			*error = "failed to get MongoDB metrics collection";
+		return false;
+	}
+	bson_t doc;
+	bson_init(&doc);
+	BSON_APPEND_DATE_TIME(&doc, "ts", snapshot.report_unix_ms ? (int64_t)snapshot.report_unix_ms : unix_ms_now());
+	BSON_APPEND_UTF8(&doc, "source_type", "agent");
+	BSON_APPEND_UTF8(&doc, "source_id", snapshot.source_id.c_str());
+	BSON_APPEND_UTF8(&doc, "server_ip", snapshot.server_ip.c_str());
+	BSON_APPEND_INT64(&doc, "process_start_unix_ms", (int64_t)snapshot.process_start_unix_ms);
+	BSON_APPEND_INT64(&doc, "sequence", (int64_t)snapshot.sequence);
+	BSON_APPEND_INT64(&doc, "ob_audit_seen_records", (int64_t)snapshot.ob_audit_seen_records);
+	BSON_APPEND_INT64(&doc, "ringbuf_lost_records", (int64_t)snapshot.ringbuf_lost_records);
+	BSON_APPEND_INT64(&doc, "agent_received_records", (int64_t)snapshot.agent_received_records);
+	BSON_APPEND_INT64(&doc, "pending_lost_records", (int64_t)snapshot.pending_lost_records);
+	BSON_APPEND_INT64(&doc, "send_enqueue_lost_records", (int64_t)snapshot.send_enqueue_lost_records);
+	BSON_APPEND_INT64(&doc, "collector_rejected_records", (int64_t)snapshot.collector_rejected_records);
+	BSON_APPEND_INT64(&doc, "collector_queue_full_records", (int64_t)snapshot.collector_queue_full_records);
+	BSON_APPEND_INT64(&doc, "upload_retry_exhausted_records", (int64_t)snapshot.upload_retry_exhausted_records);
+	BSON_APPEND_INT64(&doc, "agent_lost_records", (int64_t)snapshot.agent_lost_records);
+	BSON_APPEND_INT64(&doc, "delivered_records", (int64_t)snapshot.delivered_records);
+	BSON_APPEND_INT64(&doc, "acknowledged_records", (int64_t)snapshot.acknowledged_records);
+	BSON_APPEND_INT64(&doc, "inflight_records", (int64_t)snapshot.inflight_records);
+	bson_error_t bson_error;
+	bool ok = mongoc_collection_insert_one(collection, &doc, nullptr, nullptr, &bson_error);
+	if (!ok && error)
+		*error = bson_error.message;
+	bson_destroy(&doc);
+	mongoc_collection_destroy(collection);
+	mongoc_client_pool_push(impl_->pool, client);
+	return ok;
+#endif
+}
+
+bool MongoSink::insert_collector_metrics(const audit_collector_accounting_snapshot &snapshot, std::string *error)
+{
+#if !HAVE_MONGOC
+	if (error)
+		*error = "libmongoc headers are not available; install libmongoc-dev libbson-dev";
+	return false;
+#else
+	if (!impl_->started || !impl_->pool) {
+		if (error)
+			*error = "MongoDB sink is not started";
+		return false;
+	}
+	mongoc_client_t *client = mongoc_client_pool_pop(impl_->pool);
+	if (!client) {
+		if (error)
+			*error = "failed to pop MongoDB client";
+		return false;
+	}
+	mongoc_collection_t *collection = mongoc_client_get_collection(client, impl_->config.database.c_str(), impl_->config.metrics_collection.c_str());
+	if (!collection) {
+		mongoc_client_pool_push(impl_->pool, client);
+		if (error)
+			*error = "failed to get MongoDB metrics collection";
+		return false;
+	}
+	bson_t doc;
+	bson_init(&doc);
+	BSON_APPEND_DATE_TIME(&doc, "ts", snapshot.report_unix_ms ? (int64_t)snapshot.report_unix_ms : unix_ms_now());
+	BSON_APPEND_UTF8(&doc, "source_type", "collector");
+	BSON_APPEND_UTF8(&doc, "source_id", snapshot.source_id.c_str());
+	BSON_APPEND_UTF8(&doc, "listen_addr", snapshot.listen_addr.c_str());
+	BSON_APPEND_INT64(&doc, "process_start_unix_ms", (int64_t)snapshot.process_start_unix_ms);
+	BSON_APPEND_INT64(&doc, "sequence", (int64_t)snapshot.sequence);
+	BSON_APPEND_INT64(&doc, "accepted_records", (int64_t)snapshot.accepted_records);
+	BSON_APPEND_INT64(&doc, "rejected_records", (int64_t)snapshot.rejected_records);
+	BSON_APPEND_INT64(&doc, "persisted_records", (int64_t)snapshot.persisted_records);
+	BSON_APPEND_INT64(&doc, "db_failed_lost_records", (int64_t)snapshot.db_failed_lost_records);
+	BSON_APPEND_INT64(&doc, "inflight_records", (int64_t)snapshot.inflight_records);
+	bson_error_t bson_error;
+	bool ok = mongoc_collection_insert_one(collection, &doc, nullptr, nullptr, &bson_error);
+	if (!ok && error)
+		*error = bson_error.message;
+	bson_destroy(&doc);
+	mongoc_collection_destroy(collection);
+	mongoc_client_pool_push(impl_->pool, client);
+	return ok;
 #endif
 }

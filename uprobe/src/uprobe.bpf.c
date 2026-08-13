@@ -27,6 +27,15 @@ struct {
 	__type(value, struct audit_bpf_loss_stats);
 } loss_stats SEC(".maps");
 
+static __always_inline void count_ob_audit_seen(void)
+{
+	u32 key = 0;
+	struct audit_bpf_loss_stats *stats = bpf_map_lookup_elem(&loss_stats, &key);
+
+	if (stats)
+		__sync_fetch_and_add(&stats->ob_audit_seen_records, 1);
+}
+
 static __always_inline void count_ringbuf_full_drop(void)
 {
 	u32 key = 0;
@@ -188,10 +197,8 @@ static __always_inline void emit_field_fragments(const char *src, long long sour
 		}
 
 		s = bpf_ringbuf_reserve(&rb, AUDIT_FRAGMENT_BUCKET, 0);
-		if (!s) {
-			count_ringbuf_full_drop();
+		if (!s)
 			break;
-		}
 		out_size = AUDIT_FRAGMENT_HEADER_SIZE + copied;
 		s->total_size = out_size;
 		s->record_type = AUDIT_RECORD_FRAGMENT;
@@ -290,6 +297,7 @@ int handle_uprobe(struct pt_regs *ctx)
 	main_out_size = event_payload_offset() + planned_payload_len;
 	if (main_out_size > sizeof(*e) || main_out_size > AUDIT_RINGBUF_MAX_BUCKET)
 		return 0;
+	count_ob_audit_seen();
 	e = reserve_audit_record(main_out_size);
 	if (!e) {
 		count_ringbuf_full_drop();

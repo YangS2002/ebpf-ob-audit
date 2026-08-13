@@ -47,15 +47,15 @@ agent:
         pending_ringbuf_bytes: 16777216
       grpc:
         # 单批 Upload 最大字节数。
-        batch_bytes: 262144
+        batch_bytes: 1048576
         # 批次聚合等待时间，毫秒。
         flush_interval_ms: 1000
         # 单次 Upload RPC 超时，毫秒。
         timeout_ms: 2000
-        # agent 用户态发送批次内存池大小；内存池耗尽时丢新记录，不阻塞 BPF 消费线程。
-        pool_bytes: 67108864
+        # agent 用户态发送批次内存池大小；内存池耗尽时丢新记录，不阻塞 BPF 消费线程。268435456 = 256MB
+        pool_bytes: 16777216
         # 并发上传 worker 数，上界由 agent 限制。
-        upload_concurrency: 2
+        upload_concurrency: 4
         # 单批失败后最多重试次数；总尝试次数 = 1 + max_retries。
         max_retries: 3
         # 失败恢复退避配置。

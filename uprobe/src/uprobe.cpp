@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <string>
+#include <unordered_set>
 
 // libbpf 和 skeleton 是 C 接口，C++ 编译时需要保持 C linkage。
 extern "C" {
@@ -20,6 +21,7 @@ extern "C" {
 
 #include "uprobe.h"
 #include "agent_logger.h"
+#include "audit_accounting.h"
 #include "audit_grpc_sender.h"
 #include "audit_loss_metrics.h"
 #include "ring_buffer/ring_buffer.h"
@@ -37,6 +39,11 @@ static constexpr unsigned int DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
 static constexpr unsigned int DEFAULT_GRPC_RETRY_MAX_MS = 500;
 
 static volatile bool exiting = false;
+
+static unsigned long long wall_time_ms()
+{
+	return (unsigned long long)time(nullptr) * 1000ULL;
+}
 
 #if AUDIT_PERF_FIELDS_ENABLED
 static unsigned long long monotonic_ns()
@@ -75,14 +82,18 @@ struct app_config {
 struct writer_state {
 	explicit writer_state(size_t pending_ringbuf_bytes) : pending(pending_ringbuf_bytes) {}
 
-	VarlenRingBuffer<unsigned long long> pending;
-	unsigned long long agent_received_records = 0;
-	unsigned long long pending_overflow_dropped_records = 0;
-	unsigned long long pending_expired_dropped_records = 0;
-	unsigned long long send_buffer_dropped_records = 0;
-	unsigned long long last_event_seq = 0;
-	char server_ip[MAX_IP_LEN] = {};
-	AuditGrpcSender grpc;
+		VarlenRingBuffer<unsigned long long> pending;
+		unsigned long long agent_received_records = 0;
+		unsigned long long pending_lost_records = 0;
+		unsigned long long send_buffer_dropped_records = 0;
+		unsigned long long last_event_seq = 0;
+		std::unordered_set<unsigned long long> lost_pending_events;
+		char server_ip[MAX_IP_LEN] = {};
+		std::string agent_id;
+		std::string server_ip_text;
+		AuditGrpcSender grpc;
+		unsigned long long process_start_unix_ms = wall_time_ms();
+		unsigned long long metrics_sequence = 0;
 };
 
 static void handle_signal(int)
@@ -246,19 +257,50 @@ static void print_grpc_timing_stats(const writer_state &state)
 }
 #endif
 
-static void print_agent_loss_metrics(const writer_state &state, const audit_bpf_loss_stats &bpf_stats)
+static audit_agent_accounting_snapshot make_agent_accounting_snapshot(writer_state &state,
+							 const audit_bpf_loss_stats &bpf_stats,
+							 bool advance_sequence)
 {
 	audit_grpc_stats grpc_stats = state.grpc.stats();
-	agent_log_info("event=agent_loss_metrics kernel_ringbuf_full_dropped_records=%llu agent_received_records=%llu agent_pending_dropped_records_overflow=%llu agent_pending_dropped_records_expired=%llu agent_send_buffer_dropped_records=%llu agent_upload_retry_exhausted_records=%llu agent_sent_records=%llu agent_acknowledged_records=%llu event_seq_last=%llu",
-	       bpf_stats.ringbuf_full_dropped_records,
-	       state.agent_received_records,
-	       state.pending_overflow_dropped_records,
-	       state.pending_expired_dropped_records,
-	       state.send_buffer_dropped_records,
-	       (unsigned long long)grpc_stats.dropped_after_retries_records,
-	       (unsigned long long)grpc_stats.sent_records,
-	       (unsigned long long)grpc_stats.acknowledged_records,
-	       state.last_event_seq);
+	audit_agent_accounting_snapshot snapshot;
+	snapshot.source_id = state.agent_id.empty() ? "default-agent" : state.agent_id;
+	snapshot.server_ip = state.server_ip_text;
+	snapshot.process_start_unix_ms = state.process_start_unix_ms;
+	snapshot.sequence = advance_sequence ? ++state.metrics_sequence : state.metrics_sequence;
+	snapshot.report_unix_ms = wall_time_ms();
+	snapshot.ob_audit_seen_records = bpf_stats.ob_audit_seen_records;
+	snapshot.ringbuf_lost_records = bpf_stats.ringbuf_full_dropped_records;
+	snapshot.agent_received_records = state.agent_received_records;
+	snapshot.pending_lost_records = state.pending_lost_records;
+	snapshot.send_enqueue_lost_records = state.send_buffer_dropped_records;
+	snapshot.collector_rejected_records = grpc_stats.collector_rejected_records;
+	snapshot.collector_queue_full_records = grpc_stats.collector_queue_full_records;
+	snapshot.upload_retry_exhausted_records = grpc_stats.dropped_after_retries_records;
+	snapshot.agent_lost_records = snapshot.ringbuf_lost_records + snapshot.pending_lost_records +
+		snapshot.send_enqueue_lost_records + snapshot.upload_retry_exhausted_records;
+	snapshot.delivered_records = grpc_stats.sent_records;
+	snapshot.acknowledged_records = grpc_stats.acknowledged_records;
+	snapshot.inflight_records = grpc_stats.queued_records;
+	return snapshot;
+}
+
+static void print_agent_loss_metrics(writer_state &state, const audit_bpf_loss_stats &bpf_stats)
+{
+	audit_agent_accounting_snapshot snapshot = make_agent_accounting_snapshot(state, bpf_stats, false);
+	agent_log_info("event=agent_audit_accounting ob_audit_seen_records=%llu ringbuf_lost_records=%llu agent_received_records=%llu pending_lost_records=%llu send_enqueue_lost_records=%llu collector_rejected_records=%llu collector_queue_full_records=%llu upload_retry_exhausted_records=%llu agent_lost_records=%llu delivered_records=%llu acknowledged_records=%llu inflight_records=%llu event_seq_last=%llu",
+       (unsigned long long)snapshot.ob_audit_seen_records,
+       (unsigned long long)snapshot.ringbuf_lost_records,
+       (unsigned long long)snapshot.agent_received_records,
+       (unsigned long long)snapshot.pending_lost_records,
+       (unsigned long long)snapshot.send_enqueue_lost_records,
+       (unsigned long long)snapshot.collector_rejected_records,
+       (unsigned long long)snapshot.collector_queue_full_records,
+       (unsigned long long)snapshot.upload_retry_exhausted_records,
+       (unsigned long long)snapshot.agent_lost_records,
+       (unsigned long long)snapshot.delivered_records,
+       (unsigned long long)snapshot.acknowledged_records,
+       (unsigned long long)snapshot.inflight_records,
+       state.last_event_seq);
 }
 
 static unsigned int clamp_capture(unsigned int len, unsigned int max_len)
@@ -284,6 +326,14 @@ static int emit_record(writer_state *state, char *data, size_t size)
 		return 0;
 	}
 	return 0;
+}
+
+static void mark_pending_lost(writer_state *state, unsigned long long event_seq)
+{
+	if (event_seq == 0)
+		return;
+	if (state->lost_pending_events.insert(event_seq).second)
+		state->pending_lost_records++;
 }
 
 // 未分片小事件：只拷 total_size 到栈上桶大小缓冲，填 server_ip 再发。
@@ -334,7 +384,7 @@ static int handle_main_event(writer_state *state, const event *e, unsigned long 
 	char *seg = static_cast<char *>(state->pending.allocate(e->event_seq, total));
 		if (!seg) {
 			// 空间不足：整条记录从首片起丢弃，后续分片找不到父 seq 也会被丢。
-			state->pending_overflow_dropped_records++;
+			mark_pending_lost(state, e->event_seq);
 			return 0;
 		}
 
@@ -365,8 +415,10 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 
 	// 找不到父 seq：首片(main)已被丢弃，整条记录从首片起就没进缓冲区，丢弃该分片。
 	char *seg = static_cast<char *>(state->pending.find(fragment->parent_event_seq));
-	if (!seg)
+	if (!seg) {
+		mark_pending_lost(state, fragment->parent_event_seq);
 		return 0;
+	}
 
 	event *hdr = reinterpret_cast<event *>(seg);
 	unsigned int payoff = event_payload_offset();
@@ -388,7 +440,7 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	if (!state->pending.fill(fragment->parent_event_seq, base + fragment->fragment_offset,
 				 fragment->payload, fragment->payload_len)) {
 		state->pending.erase(fragment->parent_event_seq);
-		state->pending_expired_dropped_records++;
+		mark_pending_lost(state, fragment->parent_event_seq);
 		return 0;
 	}
 
@@ -405,6 +457,7 @@ static int handle_fragment_record(writer_state *state, const audit_fragment_reco
 	size_t total = (size_t)payoff + names_len + full_sql + full_params;
 	hdr->total_size = (unsigned int)total;
 	int ret = append_merged(state, seg, total);
+	state->lost_pending_events.erase(fragment->parent_event_seq);
 	state->pending.erase(fragment->parent_event_seq);
 	return ret;
 }
@@ -484,6 +537,8 @@ int main(int argc, char **argv)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state->server_ip, config.server_ip_text.c_str());
+	state->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	state->server_ip_text = config.server_ip_text;
 	if (!init_grpc_sender(&state->grpc, config)) {
 		agent_log_error("event=grpc_sender_start_failed");
 		err = 1;
@@ -520,18 +575,29 @@ int main(int argc, char **argv)
 
 	agent_log_info("event=attach_success target=%s offset=0x%llx", target, offset);
 
-	while (!exiting) {
-		// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
-		err = ring_buffer__poll(rb, 100);
-		if (err == -EINTR) {
-			err = 0;
-			break;
+		while (!exiting) {
+			// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
+			err = ring_buffer__poll(rb, 100);
+			if (err == -EINTR) {
+				err = 0;
+				break;
+			}
+			if (err < 0) {
+				agent_log_error("event=ring_buffer_poll_failed err=%d", err);
+				break;
+			}
+			static unsigned long long last_metrics_report_ms = 0;
+			unsigned long long now_ms = wall_time_ms();
+			if (last_metrics_report_ms == 0 || now_ms - last_metrics_report_ms >= 10000) {
+				last_metrics_report_ms = now_ms;
+				audit_bpf_loss_stats bpf_stats = {};
+				unsigned int key = 0;
+				bpf_map__lookup_elem(skel->maps.loss_stats, &key, sizeof(key), &bpf_stats, sizeof(bpf_stats), 0);
+				audit_agent_accounting_snapshot snapshot = make_agent_accounting_snapshot(*state, bpf_stats, true);
+				if (!state->grpc.report_metrics(snapshot))
+					agent_log_error("event=agent_metrics_report_failed sequence=%llu", (unsigned long long)snapshot.sequence);
+			}
 		}
-		if (err < 0) {
-			agent_log_error("event=ring_buffer_poll_failed err=%d", err);
-			break;
-		}
-	}
 
 	cleanup:
 		if (state) {

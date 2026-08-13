@@ -295,4 +295,218 @@ mysql -h7.27.43.136 -P2881 -uroot@sys -A --batch --raw \
   -p > uprobe/test/full_connectivity_test/out/manual/official_ob_sql_audit.tsv
 ```
 
-全联通脚本会自动执行官方导出并和 MongoDB collector 数据对比，通常不需要手工导出。
+## 10. 丢失可观测指标汇聚与 MongoDB 对账
+
+本项目agent 通过已有 gRPC collector 通道周期性上报可观测指标，collector 将 agent 指标和自身指标统一写入 MongoDB。
+
+### 10.1 MongoDB 集合与 TTL
+
+collector 部署配置位于：
+
+```text
+uprobe/deploy/collector-deploy.example.yaml
+```
+
+相关配置：
+
+```yaml
+mongodb:
+  collection: audit_events
+  metrics_collection: audit_pipeline_metrics
+  event_ttl_days: 3
+  metrics_ttl_days: 1
+```
+
+含义：
+
+- `audit_events`：审计事件集合，TTL 暂定 3 天。
+- `audit_pipeline_metrics`：agent/collector 丢失与对账指标集合，TTL 暂定 1 天。
+- collector 启动时会自动创建 TTL index：
+  - `audit_events.ingest_time`，`expireAfterSeconds=259200`
+  - `audit_pipeline_metrics.ts`，`expireAfterSeconds=86400`
+
+### 10.2 指标写入模型
+
+指标统一写入：
+
+```text
+ob_audit.audit_pipeline_metrics
+```
+
+agent 文档示例：
+
+```json
+{
+  "ts": ISODate("2026-08-13T08:00:00Z"),
+  "source_type": "agent",
+  "source_id": "agent-node1-7.27.43.145",
+  "server_ip": "7.27.43.145",
+  "process_start_unix_ms": 1786530000000,
+  "sequence": 12,
+  "ob_audit_seen_records": 100000,
+  "ringbuf_lost_records": 10,
+  "agent_received_records": 99990,
+  "pending_lost_records": 3,
+  "send_enqueue_lost_records": 2,
+  "collector_rejected_records": 20,
+  "collector_queue_full_records": 20,
+  "upload_retry_exhausted_records": 5,
+  "agent_lost_records": 20,
+  "delivered_records": 99980,
+  "acknowledged_records": 99980,
+  "inflight_records": 128
+}
+```
+
+collector 文档示例：
+
+```json
+{
+  "ts": ISODate("2026-08-13T08:00:00Z"),
+  "source_type": "collector",
+  "source_id": "collector-50051",
+  "listen_addr": "0.0.0.0:50051",
+  "process_start_unix_ms": 1786530000000,
+  "sequence": 12,
+  "accepted_records": 99980,
+  "rejected_records": 20,
+  "persisted_records": 99800,
+  "db_failed_lost_records": 0,
+  "inflight_records": 180
+}
+```
+
+这些值是**进程启动后的累计 counter 快照**，不是单周期 delta。查询时间窗口时按 `source_id + process_start_unix_ms` 分组，用窗口内 `max(counter) - min(counter)` 计算增量。
+
+### 10.3 查看最近指标
+
+```bash
+docker exec -it mongodb8 mongosh 'mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit'
+```
+
+查看最近 agent 指标：
+
+```javascript
+db.audit_pipeline_metrics.find(
+  { source_type: "agent" },
+  { _id: 0, ts: 1, source_id: 1, ob_audit_seen_records: 1, agent_lost_records: 1, delivered_records: 1, inflight_records: 1 }
+).sort({ ts: -1 }).limit(5)
+```
+
+查看最近 collector 指标：
+
+```javascript
+db.audit_pipeline_metrics.find(
+  { source_type: "collector" },
+  { _id: 0, ts: 1, source_id: 1, accepted_records: 1, persisted_records: 1, db_failed_lost_records: 1, inflight_records: 1 }
+).sort({ ts: -1 }).limit(5)
+```
+
+查看 TTL index：
+
+```javascript
+db.audit_events.getIndexes()
+db.audit_pipeline_metrics.getIndexes()
+```
+
+### 10.4 窗口对账查询
+
+以下示例对最近 1 小时做 counter delta 汇总。
+
+agent 侧：
+
+```javascript
+var since = new Date(Date.now() - 3600 * 1000);
+db.audit_pipeline_metrics.aggregate([
+  { $match: { source_type: "agent", ts: { $gte: since } } },
+  { $sort: { source_id: 1, process_start_unix_ms: 1, ts: 1 } },
+  { $group: {
+      _id: { source_id: "$source_id", process_start_unix_ms: "$process_start_unix_ms" },
+      first_seen: { $first: "$ob_audit_seen_records" },
+      last_seen: { $last: "$ob_audit_seen_records" },
+      first_lost: { $first: "$agent_lost_records" },
+      last_lost: { $last: "$agent_lost_records" },
+      first_delivered: { $first: "$delivered_records" },
+      last_delivered: { $last: "$delivered_records" },
+      last_inflight: { $last: "$inflight_records" }
+  }},
+  { $project: {
+      seen_delta: { $subtract: ["$last_seen", "$first_seen"] },
+      lost_delta: { $subtract: ["$last_lost", "$first_lost"] },
+      delivered_delta: { $subtract: ["$last_delivered", "$first_delivered"] },
+      last_inflight: 1
+  }},
+  { $group: {
+      _id: null,
+      ob_audit_seen: { $sum: "$seen_delta" },
+      agent_lost: { $sum: "$lost_delta" },
+      agent_delivered: { $sum: "$delivered_delta" },
+      agent_inflight: { $sum: "$last_inflight" }
+  }}
+])
+```
+
+collector 侧：
+
+```javascript
+var since = new Date(Date.now() - 3600 * 1000);
+db.audit_pipeline_metrics.aggregate([
+  { $match: { source_type: "collector", ts: { $gte: since } } },
+  { $sort: { source_id: 1, process_start_unix_ms: 1, ts: 1 } },
+  { $group: {
+      _id: { source_id: "$source_id", process_start_unix_ms: "$process_start_unix_ms" },
+      first_accepted: { $first: "$accepted_records" },
+      last_accepted: { $last: "$accepted_records" },
+      first_persisted: { $first: "$persisted_records" },
+      last_persisted: { $last: "$persisted_records" },
+      first_db_lost: { $first: "$db_failed_lost_records" },
+      last_db_lost: { $last: "$db_failed_lost_records" },
+      last_inflight: { $last: "$inflight_records" }
+  }},
+  { $project: {
+      accepted_delta: { $subtract: ["$last_accepted", "$first_accepted"] },
+      persisted_delta: { $subtract: ["$last_persisted", "$first_persisted"] },
+      db_lost_delta: { $subtract: ["$last_db_lost", "$first_db_lost"] },
+      last_inflight: 1
+  }},
+  { $group: {
+      _id: null,
+      collector_accepted: { $sum: "$accepted_delta" },
+      collector_persisted: { $sum: "$persisted_delta" },
+      collector_db_failed_lost: { $sum: "$db_lost_delta" },
+      collector_inflight: { $sum: "$last_inflight" }
+  }}
+])
+```
+
+### 10.5 对账公式
+
+agent 层稳定态：
+
+```text
+ob_audit_seen ≈ agent_lost + agent_delivered + agent_inflight
+```
+
+collector 层稳定态：
+
+```text
+collector_accepted ≈ collector_persisted + collector_db_failed_lost + collector_inflight
+```
+
+全局口径：
+
+```text
+workload_total
+≈ ob_sql_audit_ignored_records
+ + agent_lost
+ + collector_db_failed_lost
+ + collector_persisted
+ + agent_inflight
+ + collector_inflight
+```
+
+说明：
+
+- `ob_sql_audit_ignored_records` 不是本项目采集值，需要由压测/业务工作负载侧提供，例如 `USE database` 这类 OB SQL Audit 不记录语句。
+- 实时窗口中必须带上 `inflight`，否则正在发送或正在 Mongo 入库的记录会造成短时不平。
+- 如果只看已经稳定停止后的窗口，`inflight` 应接近 0。

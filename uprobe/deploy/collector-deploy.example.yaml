@@ -28,6 +28,12 @@ collector:
         uri: mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit
         database: ob_audit
         collection: audit_events
+        # 丢失/对账可观测指标集合，agent 通过 gRPC 上报，collector 自身周期写入。
+        metrics_collection: audit_pipeline_metrics
+        # 审计事件保留 3 天。
+        event_ttl_days: 3
+        # 丢失/对账指标暂保留 1 天。
+        metrics_ttl_days: 1
         # 存放 schema 版本字典的集合（_id=version），下游按记录 sv 拉取解码。
         schema_collection: audit_schemas
         # 字段编码 schema 文件（JSON：{version, fields:{数字键: 全名}}）。

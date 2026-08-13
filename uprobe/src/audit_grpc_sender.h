@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 
+#include "audit_accounting.h"
 #include "collector_resolver.h"
 
 #ifndef AUDIT_GRPC_TIMING_ENABLED
@@ -56,6 +57,8 @@ struct audit_grpc_stats {
 	uint32_t ready_batches = 0;
 	uint32_t max_ready_batches = 0;
 	uint64_t failed_uploads = 0;
+	uint64_t collector_rejected_records = 0;
+	uint64_t collector_queue_full_records = 0;
 	uint64_t failed_records = 0;
 	uint64_t failed_bytes = 0;
 #if AUDIT_GRPC_TIMING_ENABLED
@@ -83,6 +86,7 @@ public:
 	bool start(const audit_grpc_config &config, std::unique_ptr<CollectorResolver> resolver);
 	void stop();
 	bool submit(char *data, size_t size);
+	bool report_metrics(const audit_agent_accounting_snapshot &snapshot);
 	bool enabled() const;
 	std::string current_collector() const;
 	bool wait_ready(uint32_t timeout_ms) const;

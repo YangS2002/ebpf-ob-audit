@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -11,6 +14,7 @@
 #include <grpcpp/grpcpp.h>
 #include "audit_upload.grpc.pb.h"
 #include "audit_event_parser.h"
+#include "collector_loss_metrics.h"
 #include "collector_registry.h"
 #include "collector_timing.h"
 #include "mongodb_sink.h"
@@ -57,11 +61,12 @@ public:
 				    audit::UploadReply *reply) override
 	{
 		[[maybe_unused]] const unsigned long long upload_start_ns = COLLECTOR_TIMING_NOW();
-		if (request->file_version() != AUDIT_FILE_VERSION || request->event_size() != sizeof(event)) {
-			reply->set_ok(false);
-			reply->set_message("version or event_size mismatch");
-			return grpc::Status::OK;
-		}
+			if (request->file_version() != AUDIT_FILE_VERSION) {
+				reply->set_ok(false);
+				reply->set_status(audit::UPLOAD_STATUS_VERSION_MISMATCH);
+				reply->set_message("version mismatch");
+				return grpc::Status::OK;
+			}
 #if AUDIT_PERF_FIELDS_ENABLED
 		std::string records = request->records();
 #else
@@ -74,11 +79,13 @@ public:
 		[[maybe_unused]] const unsigned long long parse_ns = COLLECTOR_TIMING_NOW() - parse_start_ns;
 		if (!parse_ok) {
 			reply->set_ok(false);
+			reply->set_status(audit::UPLOAD_STATUS_DECODE_ERROR);
 			reply->set_message("invalid audit records: " + parse_error);
 			return grpc::Status::OK;
 		}
 		if (request->record_count() != events.size()) {
 			reply->set_ok(false);
+			reply->set_status(audit::UPLOAD_STATUS_DECODE_ERROR);
 			reply->set_message("record_count mismatch");
 			return grpc::Status::OK;
 		}
@@ -87,35 +94,35 @@ public:
 		for (const auto &parsed : events)
 			const_cast<event *>(parsed.record)->perf_collector_receive_ns = collector_receive_ns;
 #endif
-		if (mongo_sink_ && mongo_sink_->enabled()) {
+		if (mongo_workers_) {
 			std::string task_records(records.data(), records.size());
 			auto task = std::make_shared<MongoInsertTask>(request->agent_id(), request->server_ip(),
-								     std::move(task_records), events);
+								     std::move(task_records), events, parse_ns);
+			unsigned long long accepted_records = events.size();
+			const unsigned long long upload_total_ns = COLLECTOR_TIMING_NOW() - upload_start_ns;
+			task->set_upload_total_ns(upload_total_ns);
 			if (!mongo_workers_ || !mongo_workers_->submit(task)) {
+				collector_loss_metrics_rejected(accepted_records);
+				collector_loss_metrics_flush();
 				reply->set_ok(false);
-				reply->set_message("mongodb insert queue is closed");
-				return grpc::Status::OK;
-			}
-			mongo_insert_result result = task->wait();
-			if (!result.ok) {
-				reply->set_ok(false);
-				reply->set_message("mongodb insert failed: " + result.error);
+				reply->set_status(audit::UPLOAD_STATUS_QUEUE_FULL);
+				reply->set_message("queue_full");
+				reply->set_accepted_records(0);
+				reply->set_accepted_bytes(0);
 				return grpc::Status::OK;
 			}
 			reply->set_ok(true);
+			reply->set_status(audit::UPLOAD_STATUS_OK);
 			reply->set_message("ok");
-			reply->set_accepted_records(result.accepted_records);
-			reply->set_accepted_bytes(result.accepted_bytes);
+			reply->set_accepted_records(accepted_records);
+			reply->set_accepted_bytes(records.size());
+			collector_loss_metrics_accepted(accepted_records);
+			collector_loss_metrics_flush();
 			{
 				std::lock_guard<std::mutex> lock(counters_mutex_);
-				accepted_records_ += result.accepted_records;
-				accepted_bytes_ += result.accepted_bytes;
+				accepted_records_ += accepted_records;
+				accepted_bytes_ += records.size();
 			}
-#if AUDIT_GRPC_TIMING_ENABLED
-			const unsigned long long upload_total_ns = collector_timing_now_ns() - upload_start_ns;
-			record_collector_timing(collector_id_, listen_addr_, result.accepted_records, result.accepted_bytes,
-						parse_ns, result.stats, upload_total_ns);
-#endif
 			return grpc::Status::OK;
 		}
 		if (!records.empty()) {
@@ -123,11 +130,13 @@ public:
 			fflush(file_);
 			if (written != records.size()) {
 				reply->set_ok(false);
+				reply->set_status(audit::UPLOAD_STATUS_INTERNAL_ERROR);
 				reply->set_message(strerror(errno));
 				return grpc::Status::OK;
 			}
 		}
 		reply->set_ok(true);
+		reply->set_status(audit::UPLOAD_STATUS_OK);
 		reply->set_message("ok");
 		reply->set_accepted_records(request->record_count());
 		reply->set_accepted_bytes(records.size());
@@ -136,6 +145,46 @@ public:
 			accepted_records_ += request->record_count();
 			accepted_bytes_ += records.size();
 		}
+		return grpc::Status::OK;
+	}
+
+		grpc::Status ReportMetrics(grpc::ServerContext *, const audit::MetricsReport *request,
+					   audit::MetricsReply *reply) override
+	{
+		if (!mongo_sink_ || !mongo_sink_->enabled()) {
+			reply->set_ok(false);
+			reply->set_message("mongodb sink is not enabled");
+			return grpc::Status::OK;
+		}
+		audit_agent_accounting_snapshot snapshot;
+		snapshot.source_id = request->source_id();
+		snapshot.server_ip = request->server_ip();
+		snapshot.process_start_unix_ms = request->process_start_unix_ms();
+		snapshot.sequence = request->sequence();
+		snapshot.report_unix_ms = request->report_unix_ms();
+		if (request->has_agent()) {
+			const audit::AgentAccounting &agent = request->agent();
+			snapshot.ob_audit_seen_records = agent.ob_audit_seen_records();
+			snapshot.ringbuf_lost_records = agent.ringbuf_lost_records();
+			snapshot.agent_received_records = agent.agent_received_records();
+			snapshot.pending_lost_records = agent.pending_lost_records();
+			snapshot.send_enqueue_lost_records = agent.send_enqueue_lost_records();
+			snapshot.collector_rejected_records = agent.collector_rejected_records();
+			snapshot.collector_queue_full_records = agent.collector_queue_full_records();
+			snapshot.upload_retry_exhausted_records = agent.upload_retry_exhausted_records();
+			snapshot.agent_lost_records = agent.agent_lost_records();
+			snapshot.delivered_records = agent.delivered_records();
+			snapshot.acknowledged_records = agent.acknowledged_records();
+			snapshot.inflight_records = agent.inflight_records();
+		}
+		std::string error;
+		if (!mongo_sink_->insert_agent_metrics(snapshot, &error)) {
+			reply->set_ok(false);
+			reply->set_message(error);
+			return grpc::Status::OK;
+		}
+		reply->set_ok(true);
+		reply->set_message("ok");
 		return grpc::Status::OK;
 	}
 
@@ -180,6 +229,9 @@ static bool load_config_file(const char *path, collector_app_config *config)
 	config->mongodb.uri = yaml.get_string("mongodb.uri", config->mongodb.uri);
 	config->mongodb.database = yaml.get_string("mongodb.database", config->mongodb.database);
 	config->mongodb.collection = yaml.get_string("mongodb.collection", config->mongodb.collection);
+	config->mongodb.metrics_collection = yaml.get_string("mongodb.metrics_collection", config->mongodb.metrics_collection);
+	config->mongodb.event_ttl_days = yaml.get_u32("mongodb.event_ttl_days", config->mongodb.event_ttl_days);
+	config->mongodb.metrics_ttl_days = yaml.get_u32("mongodb.metrics_ttl_days", config->mongodb.metrics_ttl_days);
 	config->mongodb.schema_collection = yaml.get_string("mongodb.schema_collection", config->mongodb.schema_collection);
 	config->mongodb.schema_file_path = yaml.get_string("mongodb.schema_file_path", config->mongodb.schema_file_path);
 	config->mongodb.app_name = yaml.get_string("mongodb.app_name", config->mongodb.app_name);
@@ -208,6 +260,21 @@ static const char *config_path_from_args(int argc, char **argv)
 	return "collector.yaml";
 }
 
+static void on_mongo_insert_complete(const MongoInsertTask &task, const mongo_insert_result &result,
+					     const std::string &collector_id, const std::string &listen_addr)
+{
+	unsigned long long records = task.events().size();
+	if (result.ok)
+		collector_loss_metrics_persisted(records);
+	else
+		collector_loss_metrics_db_retry_exhausted(records);
+	collector_loss_metrics_flush();
+#if AUDIT_GRPC_TIMING_ENABLED
+	record_collector_timing(collector_id, listen_addr, records, task.records_size(), task.parse_ns(), result.stats,
+				      task.upload_total_ns());
+#endif
+}
+
 int main(int argc, char **argv)
 {
 	collector_app_config config;
@@ -226,7 +293,12 @@ int main(int argc, char **argv)
 		unsigned int worker_count = config.mongodb.worker_count ? config.mongodb.worker_count : config.mongodb.insert_concurrency;
 		if (worker_count == 0)
 			worker_count = 1;
-		mongo_workers.reset(new MongoInsertWorkerPool(&mongo_sink, worker_count, config.mongodb.queue_capacity));
+		mongo_workers.reset(new MongoInsertWorkerPool(
+			&mongo_sink, worker_count, config.mongodb.queue_capacity,
+			[collector_id = config.registry.collector_id, listen_addr = config.listen_addr](
+				const MongoInsertTask &task, const mongo_insert_result &result) {
+				on_mongo_insert_complete(task, result, collector_id, listen_addr);
+			}));
 		if (!mongo_workers->start()) {
 			fprintf(stderr, "collector MongoDB worker startup failed\n");
 			return 1;
@@ -251,10 +323,28 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	printf("collector listen=%s storage=%s output=%s config=%s\n", config.listen_addr.c_str(), config.storage.c_str(), output_path, config_path);
+	collector_loss_metrics_init(config.registry.collector_id, config.listen_addr);
+	std::atomic<bool> metrics_stopping{false};
+	std::thread metrics_thread;
+	if (config.storage == "mongodb") {
+		metrics_thread = std::thread([&] {
+			while (!metrics_stopping.load()) {
+				std::this_thread::sleep_for(std::chrono::seconds(10));
+				if (metrics_stopping.load())
+					break;
+				std::string error;
+				if (!mongo_sink.insert_collector_metrics(collector_loss_metrics_snapshot(), &error))
+					fprintf(stderr, "collector metrics insert failed: %s\n", error.c_str());
+			}
+		});
+	}
 #if AUDIT_GRPC_TIMING_ENABLED
 	collector_timing_log_enabled(config.registry.collector_id, config.listen_addr, config.storage, config_path);
 #endif
 	server->Wait();
+	metrics_stopping.store(true);
+	if (metrics_thread.joinable())
+		metrics_thread.join();
 	registry.stop();
 	return 0;
 }

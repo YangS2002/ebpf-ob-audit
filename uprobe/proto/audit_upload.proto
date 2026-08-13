@@ -4,6 +4,7 @@ package audit;
 
 service AuditCollector {
   rpc Upload(AuditBatch) returns (UploadReply);
+  rpc ReportMetrics(MetricsReport) returns (MetricsReply);
 }
 
 message AuditBatch {
@@ -15,9 +16,58 @@ message AuditBatch {
   bytes records = 6;
 }
 
+message MetricsReport {
+  string source_type = 1;
+  string source_id = 2;
+  string server_ip = 3;
+  string listen_addr = 4;
+  uint64 process_start_unix_ms = 5;
+  uint64 sequence = 6;
+  uint64 report_unix_ms = 7;
+  AgentAccounting agent = 10;
+  CollectorAccounting collector = 11;
+}
+
+message AgentAccounting {
+  uint64 ob_audit_seen_records = 1;
+  uint64 ringbuf_lost_records = 2;
+  uint64 agent_received_records = 3;
+  uint64 pending_lost_records = 4;
+  uint64 send_enqueue_lost_records = 5;
+  uint64 collector_rejected_records = 6;
+  uint64 collector_queue_full_records = 7;
+  uint64 upload_retry_exhausted_records = 8;
+  uint64 agent_lost_records = 9;
+  uint64 delivered_records = 10;
+  uint64 acknowledged_records = 11;
+  uint64 inflight_records = 12;
+}
+
+message CollectorAccounting {
+  uint64 accepted_records = 1;
+  uint64 rejected_records = 2;
+  uint64 persisted_records = 3;
+  uint64 db_failed_lost_records = 4;
+  uint64 inflight_records = 5;
+}
+
+message MetricsReply {
+  bool ok = 1;
+  string message = 2;
+}
+
+enum UploadStatus {
+  UPLOAD_STATUS_OK = 0;
+  UPLOAD_STATUS_QUEUE_FULL = 1;
+  UPLOAD_STATUS_DECODE_ERROR = 2;
+  UPLOAD_STATUS_VERSION_MISMATCH = 3;
+  UPLOAD_STATUS_INTERNAL_ERROR = 4;
+}
+
 message UploadReply {
   bool ok = 1;
   string message = 2;
   uint64 accepted_records = 3;
   uint64 accepted_bytes = 4;
+  UploadStatus status = 5;
 }
