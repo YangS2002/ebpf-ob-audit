@@ -34,7 +34,14 @@ agent:
           enabled: true
           etcd_endpoints: http://7.27.43.145:2379
           service_name: audit-collector
+          # 已废弃：discovery 路径统一使用 gRPC round_robin，此键仅为向后兼容保留，不再用于选路。
           selection_policy: hash_agent
+          # 是否启用 etcd Watch 增量发现；关闭时仅按 refresh_interval_ms 周期 Range。
+          watch_enabled: true
+          # 周期性 Range 兜底刷新间隔，毫秒。
+          refresh_interval_ms: 30000
+          # Watch 事件突发合并窗口，毫秒；一次突发只触发一次 channel 重建。
+          rebuild_debounce_ms: 300
       buffer:
         # agent 用户态分片 SQL/params 重组缓冲池，不包含 eBPF ringbuf。
         pending_ringbuf_bytes: 16777216
@@ -54,6 +61,12 @@ agent:
         # 失败恢复退避配置。
         retry_initial_ms: 100
         retry_max_ms: 500
+        # 上传 channel keepalive 探活时间，毫秒；用于在不等 etcd 租约 TTL 的情况下发现静默死亡的 collector。
+        keepalive_time_ms: 15000
+        # keepalive ping 超时，毫秒。
+        keepalive_timeout_ms: 5000
+        # 无在途 RPC 时是否仍发送 keepalive ping。
+        keepalive_permit_without_calls: true
       uprobe:
         # observer_path 为空时，部署脚本可由 oceanbase-ce.global.home_path 推导。
         observer_path: /home/yangshuo17/ob3node/bin/observer

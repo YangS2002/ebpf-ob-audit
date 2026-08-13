@@ -236,6 +236,9 @@ def default_agent_runtime() -> Dict[str, Any]:
                 "etcd_endpoints": "",
                 "service_name": "",
                 "selection_policy": "hash_agent",
+                "watch_enabled": True,
+                "refresh_interval_ms": 30000,
+                "rebuild_debounce_ms": 300,
             },
         },
         "buffer": {
@@ -250,6 +253,9 @@ def default_agent_runtime() -> Dict[str, Any]:
             "max_retries": 3,
             "retry_initial_ms": 100,
             "retry_max_ms": 500,
+            "keepalive_time_ms": 15000,
+            "keepalive_timeout_ms": 5000,
+            "keepalive_permit_without_calls": True,
         },
         "uprobe": {
             "observer_path": "",

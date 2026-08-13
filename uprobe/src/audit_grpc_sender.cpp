@@ -34,6 +34,7 @@
 #endif
 
 #include <grpcpp/grpcpp.h>
+#include <grpc/grpc.h>
 #include "audit_upload.grpc.pb.h"
 
 static constexpr uint32_t DEFAULT_GRPC_BATCH_BYTES = 262144;
@@ -45,6 +46,9 @@ static constexpr uint32_t DEFAULT_GRPC_MAX_RETRIES = 3;
 static constexpr uint32_t DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
 static constexpr uint32_t DEFAULT_GRPC_RETRY_MAX_MS = 500;
 static constexpr uint32_t MAX_GRPC_UPLOAD_CONCURRENCY = 8;
+static constexpr uint32_t DEFAULT_GRPC_KEEPALIVE_TIME_MS = 15000;
+static constexpr uint32_t DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS = 5000;
+static constexpr uint32_t DISCOVERY_POLL_INTERVAL_MS = 200;
 
 struct AuditGrpcSender::Impl {
 	struct Batch {
@@ -148,10 +152,13 @@ struct AuditGrpcSender::Impl {
 #endif
 		std::unique_ptr<CollectorResolver> resolver;
 		std::string current_addr;
+		std::string current_target;
+		uint64_t set_version = 0;
 		std::shared_ptr<grpc::Channel> channel;
 		uint64_t channel_version = 0;
 		bool switching = false;
 		std::vector<std::thread> workers;
+		std::thread discovery_thread;
 		mutable std::mutex mutex;
 		std::condition_variable cond;
 		BatchPool pool;
@@ -277,27 +284,89 @@ struct WorkerUploadState {
 	std::unique_ptr<audit::AuditCollector::Stub> stub;
 };
 
-static bool connect_current_collector(AuditGrpcSender::Impl *impl)
+static std::string join_addrs(const std::vector<std::string> &addrs)
 {
-	std::string addr;
-	{
-		std::lock_guard<std::mutex> lock(impl->mutex);
-		if (!impl->resolver)
-			return false;
-		addr = impl->resolver->current();
+	std::string joined;
+	for (size_t i = 0; i < addrs.size(); i++) {
+		if (i)
+			joined.push_back(',');
+		joined += addrs[i];
 	}
-	if (addr.empty())
-		return false;
+	return joined;
+}
 
-	auto channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
+// Builds one multi-address gRPC channel using the built-in round_robin LB
+// policy plus keepalive. addrs are "ip:port"; returns nullptr if empty.
+static std::shared_ptr<grpc::Channel> build_lb_channel(const std::vector<std::string> &addrs,
+						       const audit_grpc_config &cfg)
+{
+	if (addrs.empty())
+		return nullptr;
+	std::string target = "ipv4:" + join_addrs(addrs);
+	grpc::ChannelArguments args;
+	args.SetServiceConfigJSON(R"({"loadBalancingConfig":[{"round_robin":{}}]})");
+	if (cfg.keepalive_time_ms > 0) {
+		args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, (int)cfg.keepalive_time_ms);
+		args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, cfg.keepalive_permit_without_calls ? 1 : 0);
+		args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+	}
+	if (cfg.keepalive_timeout_ms > 0)
+		args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, (int)cfg.keepalive_timeout_ms);
+	return grpc::CreateCustomChannel(target, grpc::InsecureChannelCredentials(), args);
+}
+
+// Reads the resolver's address set under impl->mutex (so the resolver cannot be
+// destroyed concurrently) and, when the set changed (or force), rebuilds the
+// round_robin channel outside the lock and atomically swaps it in using the
+// switching guard.
+static void rebuild_channel_from_resolver(AuditGrpcSender::Impl *impl, bool force)
+{
+	// Read the resolver's address set while holding impl->mutex so the resolver
+	// object (owned by impl->resolver) cannot be reset/destroyed concurrently.
+	// addresses() only takes the resolver's own lock and returns a copy, so it
+	// is cheap and never re-enters impl->mutex. The expensive channel build
+	// below stays outside the lock.
+	uint64_t set_version = 0;
+	std::vector<std::string> addrs;
 	{
 		std::lock_guard<std::mutex> lock(impl->mutex);
-		impl->current_addr = addr;
+		if (impl->stopping || !impl->enabled || !impl->resolver)
+			return;
+		addrs = impl->resolver->addresses(&set_version);
+		if (!force && set_version == impl->set_version)
+			return;
+	}
+
+	std::shared_ptr<grpc::Channel> channel = build_lb_channel(addrs, impl->config);
+	std::string joined = join_addrs(addrs);
+
+	{
+		std::unique_lock<std::mutex> lock(impl->mutex);
+		while (impl->switching && !impl->stopping)
+			impl->cond.wait(lock);
+		if (impl->stopping || !impl->enabled)
+			return;
+		impl->set_version = set_version;
+		if (!channel) {
+			// No addresses yet; keep any existing channel and wait for discovery.
+			impl->cond.notify_all();
+			return;
+		}
+		impl->switching = true;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(impl->mutex);
 		impl->channel = std::move(channel);
+		impl->current_addr = joined;
+		impl->current_target = joined;
 		impl->channel_version++;
+		impl->stats.channel_switches++;
+		impl->switching = false;
 	}
 	impl->cond.notify_all();
-	return true;
+	fprintf(stderr, "grpc rebuild collector channel: targets=%s set_version=%llu\n",
+		joined.c_str(), (unsigned long long)set_version);
 }
 
 static bool get_send_target(AuditGrpcSender::Impl *impl, SendTarget *target)
@@ -313,48 +382,19 @@ static bool get_send_target(AuditGrpcSender::Impl *impl, SendTarget *target)
 	return true;
 }
 
-static bool switch_collector(AuditGrpcSender::Impl *impl, uint64_t send_version)
+static void discovery_loop(AuditGrpcSender::Impl *impl)
 {
-	std::string failed_addr;
-	{
-		std::unique_lock<std::mutex> lock(impl->mutex);
-		while (impl->switching && !impl->stopping)
-			impl->cond.wait(lock);
-		if (impl->stopping || !impl->enabled)
-			return false;
-		if (send_version != impl->channel_version)
-			return true;
-		impl->switching = true;
-		failed_addr = impl->current_addr;
+	std::unique_lock<std::mutex> lock(impl->mutex);
+	while (!impl->stopping) {
+		lock.unlock();
+		rebuild_channel_from_resolver(impl, false);
+		lock.lock();
+		if (impl->stopping)
+			break;
+		impl->cond.wait_for(lock, std::chrono::milliseconds(DISCOVERY_POLL_INTERVAL_MS));
 	}
-
-	if (!failed_addr.empty() && impl->resolver)
-		impl->resolver->report_failure(failed_addr);
-
-	std::string addr;
-	if (impl->resolver)
-		addr = impl->resolver->next();
-	auto channel = addr.empty() ? std::shared_ptr<grpc::Channel>() :
-		grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
-
-	bool switched = false;
-	{
-		std::lock_guard<std::mutex> lock(impl->mutex);
-		if (!addr.empty() && channel && !impl->stopping && impl->enabled &&
-		    send_version == impl->channel_version) {
-			impl->current_addr = addr;
-			impl->channel = std::move(channel);
-			impl->channel_version++;
-			impl->stats.channel_switches++;
-			switched = true;
-		}
-		impl->switching = false;
-	}
-	impl->cond.notify_all();
-	if (switched)
-		fprintf(stderr, "grpc switch collector: %s\n", addr.c_str());
-	return switched;
 }
+
 
 #if AUDIT_PERF_FIELDS_ENABLED
 static std::string db_name_from_records(const char *records, size_t size)
@@ -423,7 +463,8 @@ static bool upload_once(AuditGrpcSender::Impl *impl, AuditGrpcSender::Impl::Batc
 			std::lock_guard<std::mutex> lock(impl->mutex);
 			impl->stats.failed_uploads++;
 		}
-		switch_collector(impl, target.version);
+		// Transient failures are handled by gRPC subchannel health/backoff on
+		// the round_robin channel; batch retry re-reads the current channel.
 		return false;
 	}
 
@@ -559,6 +600,8 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 	normalized.max_retries = default_or(normalized.max_retries, DEFAULT_GRPC_MAX_RETRIES);
 	normalized.retry_initial_ms = default_or(normalized.retry_initial_ms, DEFAULT_GRPC_RETRY_INITIAL_MS);
 	normalized.retry_max_ms = default_or(normalized.retry_max_ms, DEFAULT_GRPC_RETRY_MAX_MS);
+	normalized.keepalive_time_ms = default_or(normalized.keepalive_time_ms, DEFAULT_GRPC_KEEPALIVE_TIME_MS);
+	normalized.keepalive_timeout_ms = default_or(normalized.keepalive_timeout_ms, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS);
 
 	uint32_t min_batches = normalized.upload_concurrency + 2;
 	{
@@ -577,18 +620,20 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 		impl_->started = true;
 		impl_->stats = audit_grpc_stats();
 		impl_->channel_version = 0;
+		impl_->set_version = 0;
 		impl_->switching = false;
 #if AUDIT_GRPC_TIMING_ENABLED
 		reset_grpc_roundtrip_timing_locked(impl_.get());
 #endif
 		reset_queue_counters_locked(impl_.get());
 	}
-	if (!connect_current_collector(impl_.get())) {
-		stop();
-		return false;
-	}
+	// Build the initial channel from the resolver's current set. For the static
+	// path this yields a one-address round_robin channel. For etcd discovery
+	// that is still empty, proceed anyway; the discovery thread builds it later.
+	rebuild_channel_from_resolver(impl_.get(), true);
 	for (uint32_t i = 0; i < normalized.upload_concurrency; i++)
 		impl_->workers.emplace_back(sender_worker, impl_.get());
+	impl_->discovery_thread = std::thread(discovery_loop, impl_.get());
 	return true;
 }
 
@@ -607,6 +652,8 @@ void AuditGrpcSender::stop()
 		if (worker.joinable())
 			worker.join();
 	}
+	if (impl_->discovery_thread.joinable())
+		impl_->discovery_thread.join();
 	std::unique_ptr<CollectorResolver> resolver;
 	{
 		std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -615,6 +662,7 @@ void AuditGrpcSender::stop()
 		impl_->enabled = false;
 		resolver = std::move(impl_->resolver);
 		impl_->current_addr.clear();
+		impl_->current_target.clear();
 		impl_->channel.reset();
 		impl_->channel_version++;
 		impl_->switching = false;
@@ -706,7 +754,7 @@ bool AuditGrpcSender::enabled() const
 std::string AuditGrpcSender::current_collector() const
 {
 	std::lock_guard<std::mutex> lock(impl_->mutex);
-	return impl_->current_addr;
+	return impl_->current_target;
 }
 
 bool AuditGrpcSender::wait_ready(uint32_t timeout_ms) const

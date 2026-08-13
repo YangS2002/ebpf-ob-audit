@@ -27,6 +27,9 @@ struct audit_grpc_config {
 	uint32_t max_retries = 0;
 	uint32_t retry_initial_ms = 0;
 	uint32_t retry_max_ms = 0;
+	uint32_t keepalive_time_ms = 0;
+	uint32_t keepalive_timeout_ms = 0;
+	bool keepalive_permit_without_calls = true;
 };
 
 struct audit_grpc_stats {

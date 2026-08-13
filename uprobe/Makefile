@@ -23,7 +23,7 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 					 | sed 's/riscv64/riscv/')
 VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 INCLUDES := -I$(OUTPUT) -I$(SRC_DIR) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
-CXXFLAGS := -g -O2 -Wall -std=c++17
+CXXFLAGS := -O2 -Wall -std=c++17
 PROTOC ?= protoc
 GRPC_CPP_PLUGIN ?= $(shell command -v grpc_cpp_plugin 2>/dev/null || printf grpc_cpp_plugin)
 GRPC_CXXFLAGS ?= $(shell pkg-config --cflags grpc++ protobuf 2>/dev/null)

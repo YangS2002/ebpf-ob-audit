@@ -55,6 +55,9 @@ struct app_config {
 	std::string collector_discovery_service_name;
 	std::string collector_discovery_selection_policy;
 	bool collector_discovery = false;
+	bool collector_discovery_watch_enabled = true;
+	uint32_t collector_discovery_refresh_interval_ms = 30000;
+	uint32_t collector_discovery_rebuild_debounce_ms = 300;
 	size_t pending_ringbuf_bytes = DEFAULT_PENDING_RINGBUF_BYTES;
 	unsigned int grpc_batch_bytes = DEFAULT_GRPC_BATCH_BYTES;
 	unsigned int grpc_flush_interval_ms = DEFAULT_GRPC_FLUSH_INTERVAL_MS;
@@ -64,6 +67,9 @@ struct app_config {
 	unsigned int grpc_max_retries = DEFAULT_GRPC_MAX_RETRIES;
 	unsigned int grpc_retry_initial_ms = DEFAULT_GRPC_RETRY_INITIAL_MS;
 	unsigned int grpc_retry_max_ms = DEFAULT_GRPC_RETRY_MAX_MS;
+	unsigned int grpc_keepalive_time_ms = 15000;
+	unsigned int grpc_keepalive_timeout_ms = 5000;
+	bool grpc_keepalive_permit_without_calls = true;
 };
 
 struct writer_state {
@@ -122,7 +128,12 @@ static bool load_config(const char *path, app_config *config)
 	config->collector_discovery = yaml.get_bool("collector.discovery.enabled", config->collector_discovery);
 	config->collector_discovery_etcd_endpoints = yaml.get_string("collector.discovery.etcd_endpoints", config->collector_discovery_etcd_endpoints);
 	config->collector_discovery_service_name = yaml.get_string("collector.discovery.service_name", config->collector_discovery_service_name);
+	// selection_policy is deprecated on the discovery path (gRPC round_robin is used);
+	// still parsed for backward compatibility but ignored for collector selection.
 	config->collector_discovery_selection_policy = yaml.get_string("collector.discovery.selection_policy", config->collector_discovery_selection_policy);
+	config->collector_discovery_watch_enabled = yaml.get_bool("collector.discovery.watch_enabled", config->collector_discovery_watch_enabled);
+	config->collector_discovery_refresh_interval_ms = yaml.get_u32("collector.discovery.refresh_interval_ms", config->collector_discovery_refresh_interval_ms);
+	config->collector_discovery_rebuild_debounce_ms = yaml.get_u32("collector.discovery.rebuild_debounce_ms", config->collector_discovery_rebuild_debounce_ms);
 	config->pending_ringbuf_bytes = static_cast<size_t>(yaml.get_u64("buffer.pending_ringbuf_bytes", config->pending_ringbuf_bytes));
 	config->grpc_batch_bytes = yaml.get_u32("grpc.batch_bytes", config->grpc_batch_bytes);
 	config->grpc_flush_interval_ms = yaml.get_u32("grpc.flush_interval_ms", config->grpc_flush_interval_ms);
@@ -132,6 +143,9 @@ static bool load_config(const char *path, app_config *config)
 	config->grpc_max_retries = yaml.get_u32("grpc.max_retries", config->grpc_max_retries);
 	config->grpc_retry_initial_ms = yaml.get_u32("grpc.retry_initial_ms", config->grpc_retry_initial_ms);
 	config->grpc_retry_max_ms = yaml.get_u32("grpc.retry_max_ms", config->grpc_retry_max_ms);
+	config->grpc_keepalive_time_ms = yaml.get_u32("grpc.keepalive_time_ms", config->grpc_keepalive_time_ms);
+	config->grpc_keepalive_timeout_ms = yaml.get_u32("grpc.keepalive_timeout_ms", config->grpc_keepalive_timeout_ms);
+	config->grpc_keepalive_permit_without_calls = yaml.get_bool("grpc.keepalive_permit_without_calls", config->grpc_keepalive_permit_without_calls);
 	return true;
 }
 
@@ -151,12 +165,18 @@ static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 	grpc_config.max_retries = config.grpc_max_retries;
 	grpc_config.retry_initial_ms = config.grpc_retry_initial_ms;
 	grpc_config.retry_max_ms = config.grpc_retry_max_ms;
+	grpc_config.keepalive_time_ms = config.grpc_keepalive_time_ms;
+	grpc_config.keepalive_timeout_ms = config.grpc_keepalive_timeout_ms;
+	grpc_config.keepalive_permit_without_calls = config.grpc_keepalive_permit_without_calls;
 	if (config.collector_discovery && !config.collector_discovery_etcd_endpoints.empty()) {
 		std::unique_ptr<CollectorResolver> resolver(new EtcdCollectorResolver(
 			config.collector_discovery_etcd_endpoints,
 			config.collector_discovery_service_name.empty() ? "audit-collector" : config.collector_discovery_service_name,
 			grpc_config.agent_id,
-			config.collector_discovery_selection_policy.empty() ? "first" : config.collector_discovery_selection_policy));
+			config.collector_discovery_selection_policy.empty() ? "first" : config.collector_discovery_selection_policy,
+			config.collector_discovery_watch_enabled,
+			config.collector_discovery_refresh_interval_ms,
+			config.collector_discovery_rebuild_debounce_ms));
 		return sender->start(grpc_config, std::move(resolver));
 	}
 	return sender->start(grpc_config);
