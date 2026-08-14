@@ -36,6 +36,7 @@ struct audit_grpc_config {
 struct audit_grpc_stats {
 	uint64_t queued_records = 0;
 	uint64_t queued_bytes = 0;
+	uint64_t accepted_records = 0;
 	uint64_t sent_batches = 0;
 	uint64_t sent_records = 0;
 	uint64_t acknowledged_records = 0;
@@ -85,6 +86,7 @@ public:
 	bool start(const audit_grpc_config &config);
 	bool start(const audit_grpc_config &config, std::unique_ptr<CollectorResolver> resolver);
 	void stop();
+	bool flush();
 	bool submit(char *data, size_t size);
 	bool report_metrics(const audit_agent_accounting_snapshot &snapshot);
 	bool enabled() const;

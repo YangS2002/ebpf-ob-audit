@@ -325,7 +325,65 @@ mongodb:
   - `audit_events.ingest_time`，`expireAfterSeconds=259200`
   - `audit_pipeline_metrics.ts`，`expireAfterSeconds=86400`
 
-### 10.2 指标写入模型
+### 10.2 一条记录在管道里的流向
+
+先看一条审计记录从 OB 到 MongoDB 会经过哪些环节，每个环节可能丢在哪里。字段全部是**进程启动后的累计计数**。
+
+```text
+[agent 层]
+  ob_audit_seen          OB 侧看到的总记录（入口）
+      | 丢: ringbuf_lost
+      v
+  agent_received         进入用户态
+      | 丢: pending_lost
+      v
+  (合并分片后进发送队列)
+      | 丢: send_enqueue_lost
+      v
+  upload -> collector    发送；被拒=rejected（重试，不算丢）
+      | 丢: upload_retry_exhausted（重试耗尽才算丢）
+      v
+[collector 层]
+  accepted               collector 接收
+      v
+  persisted              写入 MongoDB
+      | 丢: db_failed_lost（入库重试耗尽）
+```
+
+一句话规则：
+
+- collector 队列满只回 `false`（`rejected`），**不算 collector 丢失**，记录退回 agent 重试。
+- agent 重试到上限仍失败才真正丢（`upload_retry_exhausted`）。
+- collector 只把“入库重试耗尽”算作自己的丢失（`db_failed_lost`）。
+
+### 10.2.1 agent 字段字典
+
+| 字段 | 含义 | 是否丢失 |
+|---|---|---|
+| `ob_audit_seen_records` | BPF 探针在 OB 侧看到的审计记录总数（管道入口，对账分母） | 否 |
+| `ringbuf_lost_records` | ringbuffer 满，记录没进用户态就丢 | 是 |
+| `agent_received_records` | 用户态从 ringbuffer 成功收到的记录数 | 否 |
+| `pending_lost_records` | 分片合并缓冲区入队失败丢的记录（按事件去重） | 是 |
+| `send_enqueue_lost_records` | 进发送队列失败丢的记录 | 是 |
+| `collector_rejected_records` | collector 回 `false` 拒收的记录数（会重试，不一定丢） | 否 |
+| `collector_queue_full_records` | 其中因 collector 队列满被拒的记录数（是 `rejected` 的子集） | 否 |
+| `upload_retry_exhausted_records` | 重试到上限仍失败、最终丢的记录 | 是 |
+| `agent_lost_records` | agent 侧总丢失 = ringbuf + pending + send_enqueue + upload_retry_exhausted | 是（汇总） |
+| `delivered_records` | 成功发出并被 collector 接收的记录 | 否 |
+| `acknowledged_records` | collector 明确回 `ok` 的记录 | 否 |
+| `inflight_records` | 正在发送 / 等确认、尚未定论的记录 | 否 |
+
+### 10.2.2 collector 字段字典
+
+| 字段 | 含义 | 是否丢失 |
+|---|---|---|
+| `accepted_records` | collector 接收并成功入库队列的记录 | 否 |
+| `rejected_records` | 因队列满等原因回 `false` 拒收的记录（对应 agent 重试，不是丢失） | 否 |
+| `persisted_records` | 成功写入 MongoDB 的记录 | 否 |
+| `db_failed_lost_records` | 入库重试耗尽、最终丢的记录 | 是 |
+| `inflight_records` | 已接收、还在队列 / 入库中尚未定论的记录 | 否 |
+
+### 10.2.3 指标写入模型
 
 指标统一写入：
 
@@ -352,9 +410,12 @@ agent 文档示例：
   "collector_queue_full_records": 20,
   "upload_retry_exhausted_records": 5,
   "agent_lost_records": 20,
+  "sender_accepted_records": 99988,
   "delivered_records": 99980,
   "acknowledged_records": 99980,
-  "inflight_records": 128
+  "pending_inflight_records": 3,
+  "sender_inflight_records": 3,
+  "inflight_records": 6
 }
 ```
 
@@ -377,6 +438,20 @@ collector 文档示例：
 ```
 
 这些值是**进程启动后的累计 counter 快照**，不是单周期 delta。查询时间窗口时按 `source_id + process_start_unix_ms` 分组，用窗口内 `max(counter) - min(counter)` 计算增量。
+
+### 10.2.1 Agent 在途记录口径
+
+`inflight_records` 不再使用 sender ready queue 长度。它包含两部分：
+
+```text
+pending_inflight = pending 分片重组缓冲区中尚未合并完成的逻辑事件数
+sender_inflight  = sender_accepted_records - acknowledged_records - upload_retry_exhausted_records
+inflight_records = pending_inflight + sender_inflight
+```
+
+`s​​ender_accepted_records` 是记录成功进入 agent sender 后的内部累计值。该公式覆盖 current batch、ready queue、worker 正在 Upload 的 batch 和 retry backoff 中的 batch；`queued_records` 仅用于观察队列积压，不参与丢失对账。
+
+Agent 正常退出时会先消费 ringbuf 残留；仍在 `pending` 的未完整分片统一计入 `pending_lost_records`；随后等待 sender flush 完全部 batch 和重试，再上报最终 metrics。因此退出后的最终快照应满足 `inflight_records=0`。
 
 ### 10.3 查看最近指标
 
@@ -510,3 +585,45 @@ workload_total
 - `ob_sql_audit_ignored_records` 不是本项目采集值，需要由压测/业务工作负载侧提供，例如 `USE database` 这类 OB SQL Audit 不记录语句。
 - 实时窗口中必须带上 `inflight`，否则正在发送或正在 Mongo 入库的记录会造成短时不平。
 - 如果只看已经稳定停止后的窗口，`inflight` 应接近 0。
+
+## 11. event_seq 持久化与退出补发
+
+### 11.1 event_seq 持久化（预留块法）
+
+`event_seq` 是 BPF 里的全局自增序号，只作入库唯一索引。默认每次启动从 0 开始，重启后会与 MongoDB 里已入库记录的索引冲突。持久化方案：
+
+- checkpoint 文件只存一个 u64，表示“已预留的序号上界”。
+- 启动：读回上界 `X` 作为 BPF seq 起点，并立即把 `X + reserve_step` 写回文件（启动即预留一整块）。
+- 运行：序号逼近上界（剩余不足半块）时，上界再加一块并落盘。
+- 正常退出：把当前真实序号落盘，下次启动只需再跳一块，避免每次重启浪费整块。
+
+任何已发出的序号都严格小于已落盘的上界，所以进程崩溃后下次启动直接跳到上界，**不会重号**（崩溃时会跳号，但序号只用作唯一索引，跳号无碍）。
+
+50k QPS 下 `reserve_step=1000000（100w）` 约等于每 20s 才写一次盘，开销极低。
+
+配置（`agent-deploy.example.yaml` 的 `buffer` 段）：
+
+```yaml
+buffer:
+  # 留空则由 deploy_agent.py 自动填成 <deploy_home>/run/event_seq.ckpt。
+  event_seq_checkpoint_path: ""
+  # 每块预留的序号数量。
+  event_seq_reserve_step: 1000000
+```
+
+留空 `event_seq_checkpoint_path` 表示不持久化（重启序号从 0 重来）。
+
+### 11.2 各 agent 总收集记录数是否需要持久化
+
+不需要。`ob_audit_seen_records` 等都是**进程启动后的累计 counter**，重启进入新的 `process_start_unix_ms` 生命周期从 0 计起。但 MongoDB 保留全部历史快照，对账按 `(source_id, process_start_unix_ms)` 分组算窗口 delta 再跨生命周期求和，历史总数不会丢。唯一缺口是“上次上报到退出之间”的增量（≤ 上报周期 10s），由退出补发进一步消掉。
+
+### 11.3 退出补发
+
+agent 收到 SIGINT/SIGTERM 后，在退出清理阶段依次：
+
+1. `ring_buffer__consume` 抽干内核 ringbuf 里残留事件，进用户态发送队列。
+2. 补发一次最终指标（同步 RPC），减少对账缺口。
+3. 落盘当前 event_seq。
+4. `grpc.stop()` —— 该调用本身是 flush 语义，会封口当前批次并把发送队列里剩余批次全部发完再退出。
+
+因此正常退出不会因为“内存里还有没发完的数据”而丢记录。

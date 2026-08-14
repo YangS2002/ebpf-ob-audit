@@ -37,6 +37,7 @@ static constexpr unsigned int DEFAULT_GRPC_UPLOAD_CONCURRENCY = 2;
 static constexpr unsigned int DEFAULT_GRPC_MAX_RETRIES = 3;
 static constexpr unsigned int DEFAULT_GRPC_RETRY_INITIAL_MS = 100;
 static constexpr unsigned int DEFAULT_GRPC_RETRY_MAX_MS = 500;
+static constexpr unsigned long long DEFAULT_EVENT_SEQ_RESERVE_STEP = 1000000ULL;
 
 static volatile bool exiting = false;
 
@@ -77,6 +78,8 @@ struct app_config {
 	unsigned int grpc_keepalive_time_ms = 15000;
 	unsigned int grpc_keepalive_timeout_ms = 5000;
 	bool grpc_keepalive_permit_without_calls = true;
+	std::string event_seq_checkpoint_path;
+	unsigned long long event_seq_reserve_step = DEFAULT_EVENT_SEQ_RESERVE_STEP;
 };
 
 struct writer_state {
@@ -157,7 +160,62 @@ static bool load_config(const char *path, app_config *config)
 	config->grpc_keepalive_time_ms = yaml.get_u32("grpc.keepalive_time_ms", config->grpc_keepalive_time_ms);
 	config->grpc_keepalive_timeout_ms = yaml.get_u32("grpc.keepalive_timeout_ms", config->grpc_keepalive_timeout_ms);
 	config->grpc_keepalive_permit_without_calls = yaml.get_bool("grpc.keepalive_permit_without_calls", config->grpc_keepalive_permit_without_calls);
+	config->event_seq_checkpoint_path = yaml.get_string("buffer.event_seq_checkpoint_path", config->event_seq_checkpoint_path);
+	config->event_seq_reserve_step = yaml.get_u64("buffer.event_seq_reserve_step", config->event_seq_reserve_step);
 	return true;
+}
+
+// event_seq 本地持久化：checkpoint 文件只存一个 u64（已预留的序号上界）。
+// 启动时读回上界 X 作为 BPF seq 起点，并立即把 X+STEP 写回，等于预留一整块序号；
+// 运行中序号逼近上界时再预留下一块。任何已发出的序号都严格小于已落盘的上界，
+// 因此进程崩溃后下次启动直接跳到上界不会重号（崩溃时跳号，但序号只用作唯一索引，跳号无碍）。
+static unsigned long long read_seq_checkpoint(const std::string &path)
+{
+	if (path.empty())
+		return 0;
+	FILE *fp = fopen(path.c_str(), "r");
+	if (!fp)
+		return 0;
+	unsigned long long value = 0;
+	if (fscanf(fp, "%llu", &value) != 1)
+		value = 0;
+	fclose(fp);
+	return value;
+}
+
+static bool write_seq_checkpoint(const std::string &path, unsigned long long value)
+{
+	if (path.empty())
+		return false;
+	std::string tmp = path + ".tmp";
+	FILE *fp = fopen(tmp.c_str(), "w");
+	if (!fp)
+		return false;
+	bool ok = fprintf(fp, "%llu\n", value) > 0;
+	if (fflush(fp) != 0)
+		ok = false;
+	fclose(fp);
+	if (!ok) {
+		remove(tmp.c_str());
+		return false;
+	}
+	return rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+static bool bpf_seq_get(uprobe_bpf *skel, unsigned long long *out)
+{
+	unsigned int key = 0;
+	unsigned long long value = 0;
+	if (bpf_map__lookup_elem(skel->maps.seq, &key, sizeof(key), &value, sizeof(value), 0) != 0)
+		return false;
+	*out = value;
+	return true;
+}
+
+static bool bpf_seq_set(uprobe_bpf *skel, unsigned long long value)
+{
+	unsigned int key = 0;
+	return bpf_map__update_elem(skel->maps.seq, &key, sizeof(key), &value, sizeof(value), 0) == 0;
 }
 
 static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
@@ -278,9 +336,13 @@ static audit_agent_accounting_snapshot make_agent_accounting_snapshot(writer_sta
 	snapshot.upload_retry_exhausted_records = grpc_stats.dropped_after_retries_records;
 	snapshot.agent_lost_records = snapshot.ringbuf_lost_records + snapshot.pending_lost_records +
 		snapshot.send_enqueue_lost_records + snapshot.upload_retry_exhausted_records;
+	snapshot.sender_accepted_records = grpc_stats.accepted_records;
 	snapshot.delivered_records = grpc_stats.sent_records;
 	snapshot.acknowledged_records = grpc_stats.acknowledged_records;
-	snapshot.inflight_records = grpc_stats.queued_records;
+	snapshot.pending_inflight_records = state.pending.size();
+	snapshot.sender_inflight_records = grpc_stats.accepted_records - grpc_stats.acknowledged_records -
+		grpc_stats.dropped_after_retries_records;
+	snapshot.inflight_records = snapshot.pending_inflight_records + snapshot.sender_inflight_records;
 	return snapshot;
 }
 
@@ -525,6 +587,7 @@ int main(int argc, char **argv)
 	ring_buffer *rb = nullptr;
 	app_config config;
 	int err = 0;
+	unsigned long long seq_reserved_upper = 0;
 	load_config(config_file, &config);
 
 	std::unique_ptr<writer_state> state(new (std::nothrow) writer_state(config.pending_ringbuf_bytes));
@@ -555,6 +618,18 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	agent_log_info("event=bpf_load_success");
+	// event_seq 起点恢复：读回已持久化上界，跳过一整块预留区间，保证跨重启序号不重复。
+	if (!config.event_seq_checkpoint_path.empty()) {
+		unsigned long long step = config.event_seq_reserve_step ? config.event_seq_reserve_step : DEFAULT_EVENT_SEQ_RESERVE_STEP;
+		unsigned long long seq_start = read_seq_checkpoint(config.event_seq_checkpoint_path);
+		seq_reserved_upper = seq_start + step;
+		if (!write_seq_checkpoint(config.event_seq_checkpoint_path, seq_reserved_upper))
+			agent_log_error("event=event_seq_checkpoint_write_failed path=%s", config.event_seq_checkpoint_path.c_str());
+		if (!bpf_seq_set(skel, seq_start))
+			agent_log_error("event=event_seq_map_init_failed start=%llu", seq_start);
+		else
+			agent_log_info("event=event_seq_restored start=%llu reserved_upper=%llu step=%llu", seq_start, seq_reserved_upper, step);
+	}
 	// pid = -1 表示对所有进程生效；target + offset 指定被 hook 的用户态函数入口。
 	agent_log_info("event=attach_begin target=%s offset=0x%llx", target, offset);
 	link = bpf_program__attach_uprobe(skel->progs.handle_uprobe, false, -1, target, offset);
@@ -596,20 +671,51 @@ int main(int argc, char **argv)
 				audit_agent_accounting_snapshot snapshot = make_agent_accounting_snapshot(*state, bpf_stats, true);
 				if (!state->grpc.report_metrics(snapshot))
 					agent_log_error("event=agent_metrics_report_failed sequence=%llu", (unsigned long long)snapshot.sequence);
+				// 序号逼近预留上界时再预留一块并落盘（约每 STEP 条写一次，开销极低）。
+				if (!config.event_seq_checkpoint_path.empty()) {
+					unsigned long long step = config.event_seq_reserve_step ? config.event_seq_reserve_step : DEFAULT_EVENT_SEQ_RESERVE_STEP;
+					unsigned long long cur = 0;
+					if (bpf_seq_get(skel, &cur) && cur + step / 2 >= seq_reserved_upper) {
+						seq_reserved_upper = cur + step;
+						if (!write_seq_checkpoint(config.event_seq_checkpoint_path, seq_reserved_upper))
+							agent_log_error("event=event_seq_checkpoint_write_failed path=%s", config.event_seq_checkpoint_path.c_str());
+					}
+				}
 			}
 		}
 
 	cleanup:
 		if (state) {
+			// 退出补发：先把内核 ringbuf 里残留事件抽干进发送队列，避免退出丢内存数据。
+			if (rb)
+				ring_buffer__consume(rb);
+			// consume 后仍留在 pending 的都是缺少尾部分片的未完成记录，不能发送不完整数据。
+			// 退出时统一转入 pending_lost，使最终对账闭合。
+			state->pending_lost_records += state->pending.clear();
+			// 封口并等待 sender 队列、上传 RPC 和重试全部完成，再取最终快照。
+			if (state->grpc.enabled() && !state->grpc.flush())
+				agent_log_error("event=agent_sender_flush_failed");
 			audit_bpf_loss_stats bpf_stats = {};
 			if (skel) {
 				unsigned int key = 0;
 				bpf_map__lookup_elem(skel->maps.loss_stats, &key, sizeof(key), &bpf_stats, sizeof(bpf_stats), 0);
 			}
+			// 退出前补发一次最终指标，减少"上次上报到退出"之间的对账缺口。
+			if (state->grpc.enabled()) {
+				audit_agent_accounting_snapshot final_snapshot = make_agent_accounting_snapshot(*state, bpf_stats, true);
+				if (!state->grpc.report_metrics(final_snapshot))
+					agent_log_error("event=agent_final_metrics_report_failed sequence=%llu", (unsigned long long)final_snapshot.sequence);
+			}
 			print_agent_loss_metrics(*state, bpf_stats);
 	#if AUDIT_GRPC_TIMING_ENABLED
 			print_grpc_timing_stats(*state);
 	#endif
+			// 落盘当前实际序号，下次启动只需再跳一块，避免每次重启浪费整块预留。
+			if (skel && !config.event_seq_checkpoint_path.empty()) {
+				unsigned long long cur = 0;
+				if (bpf_seq_get(skel, &cur))
+					write_seq_checkpoint(config.event_seq_checkpoint_path, cur);
+			}
 			state->grpc.stop();
 		}
 	ring_buffer__free(rb);

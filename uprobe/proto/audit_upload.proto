@@ -41,6 +41,9 @@ message AgentAccounting {
   uint64 delivered_records = 10;
   uint64 acknowledged_records = 11;
   uint64 inflight_records = 12;
+  uint64 sender_accepted_records = 13;
+  uint64 pending_inflight_records = 14;
+  uint64 sender_inflight_records = 15;
 }
 
 message CollectorAccounting {

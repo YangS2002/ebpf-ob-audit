@@ -166,6 +166,7 @@ struct AuditGrpcSender::Impl {
 		std::deque<Batch *> ready_batches;
 		uint64_t queued_records = 0;
 		uint64_t queued_bytes = 0;
+		uint64_t active_records = 0;
 	};
 
 static uint32_t default_or(uint32_t value, uint32_t default_value)
@@ -208,6 +209,13 @@ static void sub_queued_locked(AuditGrpcSender::Impl *impl, const AuditGrpcSender
 {
 	impl->queued_records -= batch->record_count;
 	impl->queued_bytes -= batch->payload->size();
+	impl->active_records += batch->record_count;
+	update_pool_stats_locked(impl);
+}
+
+static void complete_active_locked(AuditGrpcSender::Impl *impl, const AuditGrpcSender::Impl::Batch *batch)
+{
+	impl->active_records -= batch->record_count;
 	update_pool_stats_locked(impl);
 }
 
@@ -575,6 +583,7 @@ static void sender_worker(AuditGrpcSender::Impl *impl)
 		{
 			std::lock_guard<std::mutex> lock(impl->mutex);
 			impl->stats.active_workers--;
+			complete_active_locked(impl, batch);
 			impl->pool.release(batch);
 			update_pool_stats_locked(impl);
 		}
@@ -639,6 +648,19 @@ bool AuditGrpcSender::start(const audit_grpc_config &config, std::unique_ptr<Col
 	for (uint32_t i = 0; i < normalized.upload_concurrency; i++)
 		impl_->workers.emplace_back(sender_worker, impl_.get());
 	impl_->discovery_thread = std::thread(discovery_loop, impl_.get());
+	return true;
+}
+
+bool AuditGrpcSender::flush()
+{
+	std::unique_lock<std::mutex> lock(impl_->mutex);
+	if (!impl_->started || impl_->stopping)
+		return false;
+	seal_current_batch_locked(impl_.get());
+	impl_->cond.notify_all();
+	impl_->cond.wait(lock, [this] {
+		return impl_->queued_records == 0 && impl_->active_records == 0;
+	});
 	return true;
 }
 
@@ -728,6 +750,7 @@ bool AuditGrpcSender::submit(char *data, size_t size)
 	bool first_record = impl_->current_batch->record_count == 0;
 	if (first_record)
 		impl_->current_batch->first_record_time = now;
+	impl_->stats.accepted_records++;
 	impl_->current_batch->payload->append(data, size);
 	impl_->current_batch->record_count++;
 	impl_->queued_records++;
@@ -776,6 +799,9 @@ bool AuditGrpcSender::report_metrics(const audit_agent_accounting_snapshot &snap
 	agent->set_delivered_records(snapshot.delivered_records);
 	agent->set_acknowledged_records(snapshot.acknowledged_records);
 	agent->set_inflight_records(snapshot.inflight_records);
+	agent->set_sender_accepted_records(snapshot.sender_accepted_records);
+	agent->set_pending_inflight_records(snapshot.pending_inflight_records);
+	agent->set_sender_inflight_records(snapshot.sender_inflight_records);
 	audit::MetricsReply reply;
 	grpc::ClientContext context;
 	if (impl_->config.timeout_ms > 0)

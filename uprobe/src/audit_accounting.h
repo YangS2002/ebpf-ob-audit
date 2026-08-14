@@ -20,8 +20,11 @@ struct audit_agent_accounting_snapshot {
 	uint64_t collector_queue_full_records = 0;
 	uint64_t upload_retry_exhausted_records = 0;
 	uint64_t agent_lost_records = 0;
+	uint64_t sender_accepted_records = 0;
 	uint64_t delivered_records = 0;
 	uint64_t acknowledged_records = 0;
+	uint64_t pending_inflight_records = 0;
+	uint64_t sender_inflight_records = 0;
 	uint64_t inflight_records = 0;
 };
 

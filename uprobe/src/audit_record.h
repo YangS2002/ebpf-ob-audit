@@ -5,7 +5,7 @@
 /* ringbuf 总容量。所有 main event 与 fragment 共用这一个 ringbuf。
  * 64KB SQL/params 分片后可能单条事件约 128KB+，256KB 并发余量太小。
  * 先固定 4MB，后续按丢包率和 grpc 批量策略调整。 */
-#define AUDIT_RINGBUF_SIZE (4 * 1024 * 1024)
+#define AUDIT_RINGBUF_SIZE (32 * 1024)
 
 /* main event 定长 bucket。struct event 头固定 345B，加最大 name 段 316B，
  * 再加 sql 首片 1023B + params 首片 255B = 1939B <= 2048。

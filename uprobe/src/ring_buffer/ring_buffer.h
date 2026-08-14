@@ -96,6 +96,15 @@ public:
 	size_t used_bytes() const { return used_bytes_; }
 	size_t size() const { return index_.size(); }
 
+	/* 退出时丢弃所有未完成的重组段，返回丢弃的逻辑事件数。 */
+	size_t clear()
+	{
+		size_t count = index_.size();
+		index_.clear();
+		used_bytes_ = 0;
+		return count;
+	}
+
 private:
 	struct Segment {
 		size_t offset;

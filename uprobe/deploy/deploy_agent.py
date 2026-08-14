@@ -243,6 +243,9 @@ def default_agent_runtime() -> Dict[str, Any]:
         },
         "buffer": {
             "pending_ringbuf_bytes": 16 * 1024 * 1024,
+            # 留空则由部署脚本按 <deploy_home>/run/event_seq.ckpt 自动填充。
+            "event_seq_checkpoint_path": "",
+            "event_seq_reserve_step": 1000000,
         },
         "grpc": {
             "batch_bytes": 262144,
@@ -309,10 +312,14 @@ def parse_config(path: Path) -> DeployConfig:
             node_cfg = get_path(data, f"agent.{name}", {}) or {}
             node_runtime = deep_merge(runtime_global, node_cfg.get("runtime", {}) if isinstance(node_cfg.get("runtime", {}), dict) else {})
             node_runtime = deep_merge(node_runtime, node_cfg.get("override", {}) if isinstance(node_cfg.get("override", {}), dict) else {})
+            node_deploy_home = str(node_cfg.get("deploy_home", deploy_home))
+            # event_seq checkpoint 路径留空时，按节点 deploy_home 自动填成绝对路径（agent.yaml 不支持变量展开）。
+            if not str(get_path(node_runtime, "buffer.event_seq_checkpoint_path", "")):
+                node_runtime = deep_merge(node_runtime, {"buffer": {"event_seq_checkpoint_path": f"{node_deploy_home}/run/event_seq.ckpt"}})
             nodes.append(Node(
                 name=name,
                 ip=ip,
-                deploy_home=str(node_cfg.get("deploy_home", deploy_home)),
+                deploy_home=node_deploy_home,
                 observer_path=str(get_path(node_runtime, "uprobe.observer_path", "")),
                 offset=str(get_path(node_runtime, "uprobe.offset", "")),
                 output_file=str(get_path(node_runtime, "uprobe.output_file", "out.adt")),
@@ -467,6 +474,7 @@ set -euo pipefail
 DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
 mkdir -p "$DEPLOY_HOME/logs"
+mkdir -p "$DEPLOY_HOME/run"
 rm -f "$DEPLOY_HOME"/logs/*
 export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
 : > "$UPROBE_LOG_FILE"

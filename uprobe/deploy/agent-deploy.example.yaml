@@ -45,6 +45,11 @@ agent:
       buffer:
         # agent 用户态分片 SQL/params 重组缓冲池，不包含 eBPF ringbuf。
         pending_ringbuf_bytes: 16777216
+        # event_seq 持久化 checkpoint 文件路径；留空则不持久化，重启后序号从 0 重来。
+        # 部署脚本会自动填成 <deploy_home>/run/event_seq.ckpt。
+        event_seq_checkpoint_path: ""
+        # 每次启动/逼近上界时预留的序号块大小。50k QPS 下 100w ≈ 20s，保证跨重启不重号且写盘极少。
+        event_seq_reserve_step: 1000000
       grpc:
         # 单批 Upload 最大字节数。
         batch_bytes: 1048576

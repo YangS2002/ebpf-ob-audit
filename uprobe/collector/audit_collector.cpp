@@ -172,10 +172,13 @@ public:
 			snapshot.collector_rejected_records = agent.collector_rejected_records();
 			snapshot.collector_queue_full_records = agent.collector_queue_full_records();
 			snapshot.upload_retry_exhausted_records = agent.upload_retry_exhausted_records();
-			snapshot.agent_lost_records = agent.agent_lost_records();
-			snapshot.delivered_records = agent.delivered_records();
-			snapshot.acknowledged_records = agent.acknowledged_records();
-			snapshot.inflight_records = agent.inflight_records();
+				snapshot.agent_lost_records = agent.agent_lost_records();
+				snapshot.sender_accepted_records = agent.sender_accepted_records();
+				snapshot.delivered_records = agent.delivered_records();
+				snapshot.acknowledged_records = agent.acknowledged_records();
+				snapshot.pending_inflight_records = agent.pending_inflight_records();
+				snapshot.sender_inflight_records = agent.sender_inflight_records();
+				snapshot.inflight_records = agent.inflight_records();
 		}
 		std::string error;
 		if (!mongo_sink_->insert_agent_metrics(snapshot, &error)) {

@@ -753,8 +753,11 @@ bool MongoSink::insert_agent_metrics(const audit_agent_accounting_snapshot &snap
 	BSON_APPEND_INT64(&doc, "collector_queue_full_records", (int64_t)snapshot.collector_queue_full_records);
 	BSON_APPEND_INT64(&doc, "upload_retry_exhausted_records", (int64_t)snapshot.upload_retry_exhausted_records);
 	BSON_APPEND_INT64(&doc, "agent_lost_records", (int64_t)snapshot.agent_lost_records);
+	BSON_APPEND_INT64(&doc, "sender_accepted_records", (int64_t)snapshot.sender_accepted_records);
 	BSON_APPEND_INT64(&doc, "delivered_records", (int64_t)snapshot.delivered_records);
 	BSON_APPEND_INT64(&doc, "acknowledged_records", (int64_t)snapshot.acknowledged_records);
+	BSON_APPEND_INT64(&doc, "pending_inflight_records", (int64_t)snapshot.pending_inflight_records);
+	BSON_APPEND_INT64(&doc, "sender_inflight_records", (int64_t)snapshot.sender_inflight_records);
 	BSON_APPEND_INT64(&doc, "inflight_records", (int64_t)snapshot.inflight_records);
 	bson_error_t bson_error;
 	bool ok = mongoc_collection_insert_one(collection, &doc, nullptr, nullptr, &bson_error);
