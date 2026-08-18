@@ -268,6 +268,14 @@ python3 uprobe/test/full_connectivity_test/run_all_mongo.py \
   --mongo-query '{"db_name":"ebpf_audit_dist_test"}'
 ```
 
+### sysbench 测试
+  租户创建
+```
+  CREATE RESOURCE UNIT u_perf MAX_CPU=6, MIN_CPU=6, MEMORY_SIZE='9G', LOG_DISK_SIZE='40G', MAX_IOPS=100000, MIN_IOPS=100000;
+  CREATE RESOURCE POOL p_perf UNIT='u_perf', UNIT_NUM=1, ZONE_LIST=('zone1','zone2','zone3');
+  CREATE TENANT perf RESOURCE_POOL_LIST=('p_perf'), PRIMARY_ZONE='RANDOM' SET ob_tcp_invited_nodes='%';
+```
+
 当前批量只有一个 case：`full_connectivity`。
 
 ## 8. 只导出 MongoDB
@@ -452,6 +460,24 @@ inflight_records = pending_inflight + sender_inflight
 `s​​ender_accepted_records` 是记录成功进入 agent sender 后的内部累计值。该公式覆盖 current batch、ready queue、worker 正在 Upload 的 batch 和 retry backoff 中的 batch；`queued_records` 仅用于观察队列积压，不参与丢失对账。
 
 Agent 正常退出时会先消费 ringbuf 残留；仍在 `pending` 的未完整分片统一计入 `pending_lost_records`；随后等待 sender flush 完全部 batch 和重试，再上报最终 metrics。因此退出后的最终快照应满足 `inflight_records=0`。
+
+### 10.2.2 Collector 优雅退出对账
+
+Collector 在正常运行期仍只按 10 秒周期上报 metrics，不在 Upload RPC 或 Mongo worker 热路径增加锁、同步等待或额外 I/O。收到 `SIGTERM` / `SIGINT` 时，退出路径按以下顺序执行：
+
+```text
+server.Shutdown() → 停止接收新 Upload
+→ mongo_workers.stop() → 关闭队列并 drain 已接收任务、完成 Mongo 重试
+→ 写入一次最终 collector metrics
+→ registry.stop() → 退出
+```
+
+最终快照保证：
+
+```text
+collector_inflight_records = 0
+collector_accepted_records = persisted_records + db_failed_lost_records
+```
 
 ### 10.3 查看最近指标
 

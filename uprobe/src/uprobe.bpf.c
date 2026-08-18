@@ -388,26 +388,31 @@ int handle_uprobe(struct pt_regs *ctx)
 	payload = e->payload;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->user_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF,
 					  OB_AUDIT_PROXY_USER_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->proxy_user_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF,
 					  OB_AUDIT_TENANT_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->tenant_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF, MAX_DB_NAME_LEN - 1, payload);
 	e->db_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_payload(sql, sql_len, AUDIT_MAIN_SQL_PAYLOAD_MAX, payload);
 	e->query_sql_payload_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_payload(params_value, params_value_len, AUDIT_MAIN_PARAMS_PAYLOAD_MAX, payload);
 	e->params_value_payload_len = copied;
 	payload_len += copied;

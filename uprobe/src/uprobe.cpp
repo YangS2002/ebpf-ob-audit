@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
+#include <chrono>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -588,6 +590,7 @@ int main(int argc, char **argv)
 	app_config config;
 	int err = 0;
 	unsigned long long seq_reserved_upper = 0;
+	std::thread *metrics_thread = nullptr;
 	load_config(config_file, &config);
 
 	std::unique_ptr<writer_state> state(new (std::nothrow) writer_state(config.pending_ringbuf_bytes));
@@ -650,21 +653,18 @@ int main(int argc, char **argv)
 
 	agent_log_info("event=attach_success target=%s offset=0x%llx", target, offset);
 
-		while (!exiting) {
-			// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
-			err = ring_buffer__poll(rb, 100);
-			if (err == -EINTR) {
-				err = 0;
-				break;
-			}
-			if (err < 0) {
-				agent_log_error("event=ring_buffer_poll_failed err=%d", err);
-				break;
-			}
-			static unsigned long long last_metrics_report_ms = 0;
-			unsigned long long now_ms = wall_time_ms();
-			if (last_metrics_report_ms == 0 || now_ms - last_metrics_report_ms >= 10000) {
-				last_metrics_report_ms = now_ms;
+		// 指标上报 + seq checkpoint 放到独立线程：report_metrics 是阻塞 grpc 调用，
+		// collector 慢/不可达时会卡住调用线程。若与 ring poll 同线程，会停住 ringbuf
+		// 消费导致内核 ringbuf 打满丢包(4/5 节点实测 ringbuf_lost 与上报失败同时出现)。
+		// 独立线程后，上报无论成败都不阻塞 ring 消费。
+		metrics_thread = new (std::nothrow) std::thread([&]() {
+			unsigned long long last_report_ms = 0;
+			while (!exiting) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				unsigned long long now_ms = wall_time_ms();
+				if (last_report_ms != 0 && now_ms - last_report_ms < 10000)
+					continue;
+				last_report_ms = now_ms;
 				audit_bpf_loss_stats bpf_stats = {};
 				unsigned int key = 0;
 				bpf_map__lookup_elem(skel->maps.loss_stats, &key, sizeof(key), &bpf_stats, sizeof(bpf_stats), 0);
@@ -682,9 +682,31 @@ int main(int argc, char **argv)
 					}
 				}
 			}
+		});
+		if (!metrics_thread)
+			agent_log_error("event=metrics_thread_create_failed");
+
+		while (!exiting) {
+			// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
+			err = ring_buffer__poll(rb, 100);
+			if (err == -EINTR) {
+				err = 0;
+				break;
+			}
+			if (err < 0) {
+				agent_log_error("event=ring_buffer_poll_failed err=%d", err);
+				break;
+			}
 		}
 
 	cleanup:
+		// 先停指标线程并 join，保证后续最终上报不与其并发调用 report_metrics。
+		exiting = true;
+		if (metrics_thread) {
+			metrics_thread->join();
+			delete metrics_thread;
+			metrics_thread = nullptr;
+		}
 		if (state) {
 			// 退出补发：先把内核 ringbuf 里残留事件抽干进发送队列，避免退出丢内存数据。
 			if (rb)

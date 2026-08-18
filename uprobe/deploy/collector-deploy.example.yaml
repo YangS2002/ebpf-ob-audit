@@ -45,7 +45,9 @@ collector:
         write_concern_wtimeout_ms: 2000
         connect_timeout_ms: 2000
         server_selection_timeout_ms: 3000
-        socket_timeout_ms: 5000
+        # 启动时对非空集合建唯一索引需扫全表, 压测期负载高时 >5s 会超时报
+        # "createIndexes ... Failed to read 4 bytes", 故放宽到 30s。
+        socket_timeout_ms: 30000
         pool_min_size: 1
         pool_max_size: 4
         insert_concurrency: 4

@@ -14,11 +14,11 @@ oceanbase-ce:
     home_path: /home/yangshuo17/ob3node
   servers:
     - name: ob1
-      ip: 7.27.43.136
+      ip: 7.27.222.3
     - name: ob2
-      ip: 7.27.43.137
+      ip: 7.27.222.4
     - name: ob3
-      ip: 7.27.43.138
+      ip: 7.27.222.5
 
 agent:
   global:
@@ -43,8 +43,8 @@ agent:
           # Watch 事件突发合并窗口，毫秒；一次突发只触发一次 channel 重建。
           rebuild_debounce_ms: 300
       buffer:
-        # agent 用户态分片 SQL/params 重组缓冲池，不包含 eBPF ringbuf。
-        pending_ringbuf_bytes: 16777216
+        # agent 用户态分片 SQL/params 重组缓冲池，不包含 eBPF ringbuf。67108864 = 64MB
+        pending_ringbuf_bytes: 67108864 
         # event_seq 持久化 checkpoint 文件路径；留空则不持久化，重启后序号从 0 重来。
         # 部署脚本会自动填成 <deploy_home>/run/event_seq.ckpt。
         event_seq_checkpoint_path: ""
@@ -58,7 +58,7 @@ agent:
         # 单次 Upload RPC 超时，毫秒。
         timeout_ms: 2000
         # agent 用户态发送批次内存池大小；内存池耗尽时丢新记录，不阻塞 BPF 消费线程。268435456 = 256MB
-        pool_bytes: 16777216
+        pool_bytes: 268435456
         # 并发上传 worker 数，上界由 agent 限制。
         upload_concurrency: 4
         # 单批失败后最多重试次数；总尝试次数 = 1 + max_retries。
@@ -82,15 +82,15 @@ agent:
   ob1:
     override:
       agent:
-        id: agent-ob1-7.27.43.136
+        id: agent-ob1-7.27.222.3
   ob2:
     override:
       agent:
-        id: agent-ob2-7.27.43.137
+        id: agent-ob2-7.27.222.4
   ob3:
     override:
       agent:
-        id: agent-ob3-7.27.43.138
+        id: agent-ob3-7.27.222.5
       # 示例：只给 ob3 调大发送内存池。
       # grpc:
       #   pool_bytes: 134217728

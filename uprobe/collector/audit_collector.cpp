@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,13 @@ static unsigned long long monotonic_ns()
 	return COLLECTOR_TIMING_NOW();
 }
 #endif
+
+static volatile sig_atomic_t exiting = 0;
+
+static void handle_signal(int)
+{
+	exiting = 1;
+}
 
 class AuditCollectorService final : public audit::AuditCollector::Service {
 public:
@@ -327,6 +335,8 @@ int main(int argc, char **argv)
 	}
 	printf("collector listen=%s storage=%s output=%s config=%s\n", config.listen_addr.c_str(), config.storage.c_str(), output_path, config_path);
 	collector_loss_metrics_init(config.registry.collector_id, config.listen_addr);
+	signal(SIGINT, handle_signal);
+	signal(SIGTERM, handle_signal);
 	std::atomic<bool> metrics_stopping{false};
 	std::thread metrics_thread;
 	if (config.storage == "mongodb") {
@@ -344,10 +354,24 @@ int main(int argc, char **argv)
 #if AUDIT_GRPC_TIMING_ENABLED
 	collector_timing_log_enabled(config.registry.collector_id, config.listen_addr, config.storage, config_path);
 #endif
+	std::thread shutdown_thread([&] {
+		while (!exiting)
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		server->Shutdown();
+	});
 	server->Wait();
 	metrics_stopping.store(true);
 	if (metrics_thread.joinable())
 		metrics_thread.join();
+	if (mongo_workers)
+		mongo_workers->stop();
+	if (config.storage == "mongodb") {
+		std::string error;
+		if (!mongo_sink.insert_collector_metrics(collector_loss_metrics_snapshot(), &error))
+			fprintf(stderr, "collector final metrics insert failed: %s\n", error.c_str());
+	}
 	registry.stop();
+	if (shutdown_thread.joinable())
+		shutdown_thread.join();
 	return 0;
 }
