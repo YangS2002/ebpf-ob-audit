@@ -31,6 +31,7 @@ class Node:
     observer_path: str = ""
     offset: str = ""
     output_file: str = "out.adt"
+    runtime: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -50,6 +51,10 @@ class DeployConfig:
     grpc_batch_bytes: int
     grpc_flush_interval_ms: int
     grpc_timeout_ms: int
+    grpc_pool_bytes: int
+    grpc_retry_initial_ms: int
+    grpc_retry_max_ms: int
+    pending_ringbuf_bytes: int
     observer_path: str
     offset: str
     output_file: str
@@ -189,6 +194,80 @@ def parse_yaml_subset(path: Path) -> Dict[str, Any]:
     return root
 
 
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def to_yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text == "" or any(ch in text for ch in [":", "#", " ", "\t"]):
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def dump_yaml(data: Dict[str, Any], indent: int = 0) -> List[str]:
+    lines: List[str] = []
+    prefix = " " * indent
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.extend(dump_yaml(value, indent + 2))
+        else:
+            lines.append(f"{prefix}{key}: {to_yaml_scalar(value)}")
+    return lines
+
+
+def default_agent_runtime() -> Dict[str, Any]:
+    return {
+        "collector": {
+            "addr": "",
+            "discovery": {
+                "enabled": True,
+                "etcd_endpoints": "",
+                "service_name": "",
+                "selection_policy": "hash_agent",
+                "watch_enabled": True,
+                "refresh_interval_ms": 30000,
+                "rebuild_debounce_ms": 300,
+            },
+        },
+        "buffer": {
+            "pending_ringbuf_bytes": 16 * 1024 * 1024,
+            # 留空则由部署脚本按 <deploy_home>/run/event_seq.ckpt 自动填充。
+            "event_seq_checkpoint_path": "",
+            "event_seq_reserve_step": 1000000,
+        },
+        "grpc": {
+            "batch_bytes": 262144,
+            "flush_interval_ms": 1000,
+            "timeout_ms": 2000,
+            "pool_bytes": 64 * 1024 * 1024,
+            "upload_concurrency": 2,
+            "max_retries": 3,
+            "retry_initial_ms": 100,
+            "retry_max_ms": 500,
+            "keepalive_time_ms": 15000,
+            "keepalive_timeout_ms": 5000,
+            "keepalive_permit_without_calls": True,
+        },
+        "uprobe": {
+            "observer_path": "",
+            "offset": "",
+            "output_file": "out.adt",
+        },
+    }
+
+
 def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
     current: Any = data
     for part in dotted.split("."):
@@ -196,6 +275,12 @@ def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
             return default
         current = current[part]
     return current
+
+
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes")
 
 
 def parse_config(path: Path) -> DeployConfig:
@@ -210,24 +295,12 @@ def parse_config(path: Path) -> DeployConfig:
     password = str(user.get("password", ""))
     sudo_password = str(user.get("sudo_password", user.get("user_password", "")))
     deploy_home = str(agent_global.get("deploy_home", "~/ebpf-ob-audit-agent"))
-    collector_addr = str(agent_global.get("collector_addr", ""))
-    collector_discovery_enabled = bool(agent_global.get("collector_discovery_enabled", True))
-    collector_discovery_etcd_endpoints = str(agent_global.get("collector_discovery_etcd_endpoints", "http://7.27.43.139:2379"))
-    collector_discovery_service_name = str(agent_global.get("collector_discovery_service_name", "audit-collector"))
-    collector_discovery_watch = bool(agent_global.get("collector_discovery_watch", True))
-    collector_discovery_retry_interval_ms = int(agent_global.get("collector_discovery_retry_interval_ms", 3000))
-    collector_discovery_selection_policy = str(agent_global.get("collector_discovery_selection_policy", "hash_agent"))
-    grpc_batch_bytes = int(agent_global.get("grpc_batch_bytes", 262144))
-    grpc_flush_interval_ms = int(agent_global.get("grpc_flush_interval_ms", 1000))
-    grpc_timeout_ms = int(agent_global.get("grpc_timeout_ms", 2000))
-    observer_path = str(agent_global.get("observer_path", ""))
-    offset = str(agent_global.get("offset", ""))
-    output_file = str(agent_global.get("output_file", "out.adt"))
+    runtime_global = deep_merge(default_agent_runtime(), agent_global.get("runtime", {}) if isinstance(agent_global.get("runtime", {}), dict) else {})
 
-    if not observer_path:
+    if not get_path(runtime_global, "uprobe.observer_path", ""):
         home_path = str(ob_global.get("home_path", ""))
         if home_path:
-            observer_path = f"{home_path}/bin/observer"
+            runtime_global = deep_merge(runtime_global, {"uprobe": {"observer_path": f"{home_path}/bin/observer"}})
 
     nodes: List[Node] = []
     if isinstance(servers, list):
@@ -237,20 +310,47 @@ def parse_config(path: Path) -> DeployConfig:
             name = str(server.get("name", f"node{idx + 1}"))
             ip = str(server.get("ip", ""))
             node_cfg = get_path(data, f"agent.{name}", {}) or {}
+            node_runtime = deep_merge(runtime_global, node_cfg.get("runtime", {}) if isinstance(node_cfg.get("runtime", {}), dict) else {})
+            node_runtime = deep_merge(node_runtime, node_cfg.get("override", {}) if isinstance(node_cfg.get("override", {}), dict) else {})
+            node_deploy_home = str(node_cfg.get("deploy_home", deploy_home))
+            # event_seq checkpoint 路径留空时，按节点 deploy_home 自动填成绝对路径（agent.yaml 不支持变量展开）。
+            if not str(get_path(node_runtime, "buffer.event_seq_checkpoint_path", "")):
+                node_runtime = deep_merge(node_runtime, {"buffer": {"event_seq_checkpoint_path": f"{node_deploy_home}/run/event_seq.ckpt"}})
             nodes.append(Node(
                 name=name,
                 ip=ip,
-                deploy_home=str(node_cfg.get("deploy_home", deploy_home)),
-                observer_path=str(node_cfg.get("observer_path", observer_path)),
-                offset=str(node_cfg.get("offset", offset)),
-                output_file=str(node_cfg.get("output_file", output_file)),
+                deploy_home=node_deploy_home,
+                observer_path=str(get_path(node_runtime, "uprobe.observer_path", "")),
+                offset=str(get_path(node_runtime, "uprobe.offset", "")),
+                output_file=str(get_path(node_runtime, "uprobe.output_file", "out.adt")),
+                runtime=deep_merge(node_runtime, {"agent": {"id": f"agent-{name}-{ip}", "server_ip": ip}}),
             ))
 
-    config = DeployConfig(username, port, password, sudo_password, deploy_home, collector_addr,
-                          collector_discovery_enabled, collector_discovery_etcd_endpoints,
-                          collector_discovery_service_name, collector_discovery_watch,
-                          collector_discovery_retry_interval_ms, collector_discovery_selection_policy,
-                          grpc_batch_bytes, grpc_flush_interval_ms, grpc_timeout_ms, observer_path, offset, output_file, nodes)
+    config = DeployConfig(
+        username=username,
+        port=port,
+        password=password,
+        sudo_password=sudo_password,
+        deploy_home=deploy_home,
+        collector_addr=str(get_path(runtime_global, "collector.addr", "")),
+        collector_discovery_enabled=bool_value(get_path(runtime_global, "collector.discovery.enabled", True)),
+        collector_discovery_etcd_endpoints=str(get_path(runtime_global, "collector.discovery.etcd_endpoints", "")),
+        collector_discovery_service_name=str(get_path(runtime_global, "collector.discovery.service_name", "")),
+        collector_discovery_watch=True,
+        collector_discovery_retry_interval_ms=3000,
+        collector_discovery_selection_policy=str(get_path(runtime_global, "collector.discovery.selection_policy", "hash_agent")),
+        grpc_batch_bytes=int(get_path(runtime_global, "grpc.batch_bytes", 262144)),
+        grpc_flush_interval_ms=int(get_path(runtime_global, "grpc.flush_interval_ms", 1000)),
+        grpc_timeout_ms=int(get_path(runtime_global, "grpc.timeout_ms", 2000)),
+        grpc_pool_bytes=int(get_path(runtime_global, "grpc.pool_bytes", 64 * 1024 * 1024)),
+        grpc_retry_initial_ms=int(get_path(runtime_global, "grpc.retry_initial_ms", 100)),
+        grpc_retry_max_ms=int(get_path(runtime_global, "grpc.retry_max_ms", 500)),
+        pending_ringbuf_bytes=int(get_path(runtime_global, "buffer.pending_ringbuf_bytes", 16 * 1024 * 1024)),
+        observer_path=str(get_path(runtime_global, "uprobe.observer_path", "")),
+        offset=str(get_path(runtime_global, "uprobe.offset", "")),
+        output_file=str(get_path(runtime_global, "uprobe.output_file", "out.adt")),
+        nodes=nodes,
+    )
     validate_config(config)
     return config
 
@@ -266,6 +366,39 @@ def validate_config(config: DeployConfig) -> None:
             missing.append(f"oceanbase-ce.servers[{node.name}].ip")
     if missing:
         raise DeployError("missing required config fields: " + ", ".join(missing))
+
+
+def is_empty_required(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) == 0
+    return False
+
+
+def add_required_error(errors: List[str], kind: str, node: Node, field: str) -> None:
+    value = get_path(node.runtime, field)
+    if is_empty_required(value):
+        errors.append(f"CONFIG ERROR {kind} {node.name} {node.ip}: missing runtime.{field}")
+
+
+def validate_agent_runtime(config: DeployConfig) -> None:
+    errors: List[str] = []
+    for node in config.nodes:
+        add_required_error(errors, "agent", node, "agent.id")
+        add_required_error(errors, "agent", node, "agent.server_ip")
+        discovery_enabled = bool_value(get_path(node.runtime, "collector.discovery.enabled", True))
+        if discovery_enabled:
+            add_required_error(errors, "agent", node, "collector.discovery.etcd_endpoints")
+            add_required_error(errors, "agent", node, "collector.discovery.service_name")
+        else:
+            add_required_error(errors, "agent", node, "collector.addr")
+        add_required_error(errors, "agent", node, "uprobe.observer_path")
+        add_required_error(errors, "agent", node, "uprobe.offset")
+    if errors:
+        raise DeployError("\n".join(errors))
 
 
 def build_agent(skip_build: bool) -> None:
@@ -322,26 +455,11 @@ def write_text(path: Path, content: str, mode: Optional[int] = None) -> None:
         path.chmod(mode)
 
 
-def render_uprobe_conf(config: DeployConfig, node: Node) -> str:
+def render_agent_yaml(node: Node) -> str:
     return "\n".join([
-        "# generated by uprobe/deploy/deploy_agent.py",
-        f"server_ip={node.ip}",
-        f"agent_id=agent-{node.name}-{node.ip}",
-        "",
-        f"collector_addr={config.collector_addr}",
-        f"collector_discovery_enabled={str(config.collector_discovery_enabled).lower()}",
-        f"collector_discovery_etcd_endpoints={config.collector_discovery_etcd_endpoints}",
-        f"collector_discovery_service_name={config.collector_discovery_service_name}",
-        f"collector_discovery_watch={str(config.collector_discovery_watch).lower()}",
-        f"collector_discovery_retry_interval_ms={config.collector_discovery_retry_interval_ms}",
-        f"collector_discovery_selection_policy={config.collector_discovery_selection_policy}",
-        "",
-        f"grpc_batch_bytes={config.grpc_batch_bytes}",
-        f"grpc_flush_interval_ms={config.grpc_flush_interval_ms}",
-        f"grpc_timeout_ms={config.grpc_timeout_ms}",
-        "grpc_queue_bytes=262144",
-        "grpc_retry_initial_ms=100",
-        "grpc_retry_max_ms=500",
+        "# agent 运行时配置，由 deploy_agent.py 根据 agent-deploy YAML 生成。",
+        "# 请不要手工修改远端该文件；需要变更时修改部署 YAML 的 global、节点字段或 override。",
+        *dump_yaml(node.runtime),
         "",
     ])
 
@@ -356,9 +474,11 @@ set -euo pipefail
 DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
 mkdir -p "$DEPLOY_HOME/logs"
-	export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
-	: > "$UPROBE_LOG_FILE"
-	{incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/uprobe.conf"
+mkdir -p "$DEPLOY_HOME/run"
+rm -f "$DEPLOY_HOME"/logs/*
+export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
+: > "$UPROBE_LOG_FILE"
+{incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/agent.yaml"
 """
 
 
@@ -404,9 +524,9 @@ def remote(config: DeployConfig, node: Node, command: str, dry_run: bool = False
 
 def deploy_node(config: DeployConfig, node: Node, archive: Path, dry_run: bool) -> NodeResult:
     remote_tmp = f"/tmp/{archive.name}"
-    conf_path = archive.parent / f"uprobe-{node.name}-{node.ip}.conf"
-    write_text(conf_path, render_uprobe_conf(config, node))
-    remote_conf = f"{node.deploy_home}/conf/uprobe.conf"
+    conf_path = archive.parent / f"agent-{node.name}-{node.ip}.yaml"
+    write_text(conf_path, render_agent_yaml(node))
+    remote_conf = f"{node.deploy_home}/conf/agent.yaml"
     require_cmd(ssh_base(config, node.ip) + [f"mkdir -p {quote_arg(node.deploy_home)} {quote_arg(node.deploy_home + '/conf')}"], dry_run=dry_run)
     require_cmd(scp_base(config, archive, node.ip, remote_tmp), dry_run=dry_run)
     unpack_cmd = f"tar -xzf {quote_arg(remote_tmp)} -C {quote_arg(node.deploy_home)} && rm -f {quote_arg(remote_tmp)}"
@@ -481,8 +601,12 @@ def stop_node(config: DeployConfig, node: Node, dry_run: bool) -> NodeResult:
     cmd = (
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -z \"$pids\" ]; then echo state=not_running; exit 0; fi; "
-        f"{sudo_kill} kill $pids; sleep 1; "
+        f"{sudo_kill} kill $pids; "
+        f"for i in $(seq 1 15); do "
+        f"sleep 1; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
+        f"if [ -z \"$left\" ]; then break; fi; "
+        f"done; "
         f"if [ -n \"$left\" ]; then {sudo_kill} kill -9 $left; fi; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -n \"$left\" ]; then echo state=failed; exit 1; else echo state=stopped; fi"
@@ -557,7 +681,7 @@ def print_start_command(node: Node) -> None:
         if not node.offset:
             missing.append("offset")
         print(f"START {node.name} {node.ip}: incomplete, missing {', '.join(missing)}")
-        print(f"       edit {node.deploy_home}/conf/uprobe.conf if needed, then run {node.deploy_home}/run/start_agent.sh")
+        print(f"       edit deploy YAML runtime fields, then re-run deploy/start")
 
 
 def print_summary(results: List[NodeResult]) -> None:
@@ -618,6 +742,8 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action in ("start", "deploy-start"):
+            validate_agent_runtime(config)
         if config.password:
             print("INFO using user.password for SSH via sshpass. If sshpass is missing, install requirements/system dependency or configure passwordless SSH.")
         if config.sudo_password:

@@ -1,40 +1,96 @@
 user:
+  # SSH 登录用户。部署脚本通过该用户把 agent 包复制到 OB 节点。
   username: yangshuo17
+  # SSH 端口。
   port: 32200
-  # SSH login password / second-factor password used by sshpass on deploy machine.
-  password: Yangs090031@
-  # Remote sudo password for user yangshuo17. Used to start/stop privileged uprobe.
+  # SSH 密码；如果已配置免密登录，可以留空。
+  password: ""
+  # 远端 sudo 密码，用于以 root 权限启动 uprobe。
   sudo_password: "1"
 
 oceanbase-ce:
-  servers:
-    - name: ob1
-      ip: 7.27.43.145
-    - name: ob2
-      ip: 7.27.43.136
-    - name: ob3
-      ip: 7.27.43.137
+  # OB 集群基础信息。agent 节点默认来自这里，agent 自身配置不包含 collector/Mongo 设置。
   global:
     home_path: /home/yangshuo17/ob3node
+  servers:
+    - name: ob1
+      ip: 7.27.222.3
+    - name: ob2
+      ip: 7.27.222.4
+    - name: ob3
+      ip: 7.27.222.5
 
 agent:
   global:
+    # agent 部署目录。
     deploy_home: /home/yangshuo17/ebpf-ob-audit-agent
-    collector_addr: 7.27.43.138:50051
-    collector_discovery_enabled: true
-    collector_discovery_etcd_endpoints: http://7.27.43.139:2379
-    collector_discovery_service_name: audit-collector
-    collector_discovery_watch: true
-    collector_discovery_retry_interval_ms: 3000
-    collector_discovery_selection_policy: hash_agent
-    grpc_batch_bytes: 262144
-    grpc_flush_interval_ms: 1000
-    grpc_timeout_ms: 2000
-    # If observer_path is empty, deployer defaults to oceanbase-ce.global.home_path/bin/observer.
-    observer_path: /home/yangshuo17/ob3node/bin/observer
-    offset: "0x000000000bf18950"
-    output_file: out.adt
-  # Optional per-node override example:
-  # ob2:
-  #   observer_path: /home/yangshuo17/ob3node/bin/observer
-  #   offset: "0x000000000bf18950"
+
+    # agent 运行时配置。部署脚本会把本段和节点 override 合并成远端 conf/agent.yaml。
+    runtime:
+      collector:
+        # collector 静态地址；关闭 discovery 或 discovery 暂无结果时可直接使用。
+        addr: 7.27.43.139:50051
+        discovery:
+          enabled: true
+          etcd_endpoints: http://7.27.43.145:2379
+          service_name: audit-collector
+          # 已废弃：discovery 路径统一使用 gRPC round_robin，此键仅为向后兼容保留，不再用于选路。
+          selection_policy: hash_agent
+          # 是否启用 etcd Watch 增量发现；关闭时仅按 refresh_interval_ms 周期 Range。
+          watch_enabled: true
+          # 周期性 Range 兜底刷新间隔，毫秒。
+          refresh_interval_ms: 30000
+          # Watch 事件突发合并窗口，毫秒；一次突发只触发一次 channel 重建。
+          rebuild_debounce_ms: 300
+      buffer:
+        # agent 用户态分片 SQL/params 重组缓冲池，不包含 eBPF ringbuf。67108864 = 64MB
+        pending_ringbuf_bytes: 67108864 
+        # event_seq 持久化 checkpoint 文件路径；留空则不持久化，重启后序号从 0 重来。
+        # 部署脚本会自动填成 <deploy_home>/run/event_seq.ckpt。
+        event_seq_checkpoint_path: ""
+        # 每次启动/逼近上界时预留的序号块大小。50k QPS 下 100w ≈ 20s，保证跨重启不重号且写盘极少。
+        event_seq_reserve_step: 1000000
+      grpc:
+        # 单批 Upload 最大字节数。
+        batch_bytes: 1048576
+        # 批次聚合等待时间，毫秒。
+        flush_interval_ms: 1000
+        # 单次 Upload RPC 超时，毫秒。
+        timeout_ms: 2000
+        # agent 用户态发送批次内存池大小；内存池耗尽时丢新记录，不阻塞 BPF 消费线程。268435456 = 256MB
+        pool_bytes: 268435456
+        # 并发上传 worker 数，上界由 agent 限制。
+        upload_concurrency: 4
+        # 单批失败后最多重试次数；总尝试次数 = 1 + max_retries。
+        max_retries: 3
+        # 失败恢复退避配置。
+        retry_initial_ms: 100
+        retry_max_ms: 500
+        # 上传 channel keepalive 探活时间，毫秒；用于在不等 etcd 租约 TTL 的情况下发现静默死亡的 collector。
+        keepalive_time_ms: 15000
+        # keepalive ping 超时，毫秒。
+        keepalive_timeout_ms: 5000
+        # 无在途 RPC 时是否仍发送 keepalive ping。
+        keepalive_permit_without_calls: true
+      uprobe:
+        # observer_path 为空时，部署脚本可由 oceanbase-ce.global.home_path 推导。
+        observer_path: /home/yangshuo17/ob3node/bin/observer
+        offset: "0x000000000bf18950"
+        output_file: out.adt
+
+  # 节点级配置只覆盖 agent 自己的运行参数；不要放 collector 监听、注册、Mongo 配置。
+  ob1:
+    override:
+      agent:
+        id: agent-ob1-7.27.222.3
+  ob2:
+    override:
+      agent:
+        id: agent-ob2-7.27.222.4
+  ob3:
+    override:
+      agent:
+        id: agent-ob3-7.27.222.5
+      # 示例：只给 ob3 调大发送内存池。
+      # grpc:
+      #   pool_bytes: 134217728

@@ -3,6 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "uprobe.h"
+#include "audit_loss_metrics.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -19,36 +20,49 @@ struct {
 	__type(value, u64);
 } seq SEC(".maps");
 
-/* per-cpu 临时缓冲。
- * bpf_ringbuf_reserve() 要求 size 为编译期常量，变长记录无法使用。
- * 改用 per-cpu scratch 填好记录后 bpf_ringbuf_output() 输出。
- * struct event / fragment 过大，不能放 BPF 512B 栈，必须用 map。 */
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct event);
-} event_scratch SEC(".maps");
+	__type(value, struct audit_bpf_loss_stats);
+} loss_stats SEC(".maps");
 
-struct audit_fragment_scratch {
-	unsigned int total_size;
-	unsigned short record_type;
-	unsigned short record_flags;
-	unsigned long long event_seq;
-	unsigned long long parent_event_seq;
-	unsigned long long next_fragment_seq;
-	unsigned int field;
-	unsigned int fragment_offset;
-	unsigned int payload_len;
-	char payload[AUDIT_FRAGMENT_PAYLOAD_MAX]; // offset 44 B
-};
+static __always_inline void count_ob_audit_seen(void)
+{
+	u32 key = 0;
+	struct audit_bpf_loss_stats *stats = bpf_map_lookup_elem(&loss_stats, &key);
 
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, struct audit_fragment_scratch);
-} fragment_scratch SEC(".maps");
+	if (stats)
+		__sync_fetch_and_add(&stats->ob_audit_seen_records, 1);
+}
+
+static __always_inline void count_ringbuf_full_drop(void)
+{
+	u32 key = 0;
+	struct audit_bpf_loss_stats *stats = bpf_map_lookup_elem(&loss_stats, &key);
+
+	if (stats)
+		__sync_fetch_and_add(&stats->ringbuf_full_dropped_records, 1);
+}
+
+#define AUDIT_STATIC_ASSERT(cond, name) typedef char audit_static_assert_##name[(cond) ? 1 : -1]
+AUDIT_STATIC_ASSERT(AUDIT_FRAGMENT_HEADER_SIZE + AUDIT_FRAGMENT_PAYLOAD_MAX < AUDIT_FRAGMENT_BUCKET, fragment_fits_bucket);
+#define AUDIT_FRAGMENT_SAFE_PAYLOAD_4096 4095
+#define AUDIT_FORCE_AND(value, mask) asm volatile("%0 &= " #mask : "+r"(value))
+
+static __always_inline void *reserve_audit_record(unsigned int total_size)
+{
+	if (total_size <= AUDIT_RINGBUF_BUCKET_MAIN)
+		return bpf_ringbuf_reserve(&rb, AUDIT_RINGBUF_BUCKET_MAIN, 0);
+	return 0;
+}
+
+static __always_inline unsigned int fragment_payload_size(unsigned int remaining)
+{
+	if (remaining > AUDIT_FRAGMENT_SAFE_PAYLOAD_4096)
+		return AUDIT_FRAGMENT_SAFE_PAYLOAD_4096;
+	return remaining;
+}
 
 static __always_inline int read_i64(const void *base, unsigned long off, long long *dst)
 {
@@ -139,53 +153,41 @@ static __always_inline u64 next_event_seq(void)
 	return 0;
 }
 
-/* 用 per-cpu scratch 填好 fragment 后 bpf_ringbuf_output 输出。
- * 顺序输出：fragment i 输出后才推进到 i+1。
+/* 顺序输出 fragment：fragment i 输出后才推进到 i+1。
  * next_fragment_seq 预先按剩余字节数计算：
  *   - 当前片是最后一片逻辑片 → next = final_next_fragment_seq（跨字段链或 0）
  *   - 还有后续片 → next = next_event_seq()
- * output 失败则停止，已输出片链由用户态按 next_fragment_seq==0 判定尾片。 */
+ * reserve 失败则停止，已输出片链由用户态按 next_fragment_seq==0 判定尾片。 */
 static __always_inline void emit_field_fragments(const char *src, long long source_len, unsigned int field,
-						 unsigned int first_offset, u64 parent_event_seq,
-						 u64 first_fragment_seq, u64 final_next_fragment_seq)
+							 unsigned int first_offset, u64 parent_event_seq,
+							 u64 first_fragment_seq, u64 final_next_fragment_seq)
 {
-	struct audit_fragment_scratch *s;
 	unsigned int capture_len;
 	unsigned int offset = first_offset;
 	u64 fragment_seq = first_fragment_seq;
-	bool physical_complete;
-	u32 key = 0;
 	int i;
 
 	if (!src)
 		return;
 	capture_len = clamp_len(source_len, field == FRAG_FIELD_QUERY_SQL ? AUDIT_SQL_CAPTURE_MAX : AUDIT_PARAMS_CAPTURE_MAX);
-	physical_complete = source_len <= (field == FRAG_FIELD_QUERY_SQL ? AUDIT_SQL_CAPTURE_MAX : AUDIT_PARAMS_CAPTURE_MAX);
 
 #pragma unroll
 	for (i = 0; i < AUDIT_MAX_FRAGMENTS_PER_FIELD; i++) {
+		struct audit_fragment_record *s;
 		unsigned int remaining;
 		unsigned int copied;
+		unsigned int out_size;
 		u64 next_seq;
 		bool is_last;
 
 		if (offset >= capture_len || fragment_seq == 0)
 			break;
-		/* 每次迭代重新 lookup，避免循环展开后 s 被 spill 到栈，
-		 * verifier 丢失 PTR_TO_MAP_VALUE 类型。 */
-		s = bpf_map_lookup_elem(&fragment_scratch, &key);
-		if (!s)
-			return;
 		remaining = capture_len - offset;
-		copied = remaining;
-		if (copied > AUDIT_FRAGMENT_PAYLOAD_MAX)
-			copied = AUDIT_FRAGMENT_PAYLOAD_MAX;
-		/* 强制生成 BPF AND 指令。纯 C 的 copied &= 4095 会被 clang 当冗余优化掉，
-		 * verifier 仍看到 signed min 可能为负。 */
-		asm volatile("%0 &= 4095" : "+r"(copied));
+		copied = fragment_payload_size(remaining);
+		AUDIT_FORCE_AND(copied, 4095);
 		if (copied == 0)
 			break;
-		is_last = (remaining <= AUDIT_FRAGMENT_PAYLOAD_MAX);
+		is_last = (remaining <= copied);
 		if (is_last) {
 			next_seq = final_next_fragment_seq;
 		} else {
@@ -194,30 +196,23 @@ static __always_inline void emit_field_fragments(const char *src, long long sour
 				next_seq = final_next_fragment_seq;
 		}
 
+		s = bpf_ringbuf_reserve(&rb, AUDIT_FRAGMENT_BUCKET, 0);
+		if (!s)
+			break;
+		out_size = AUDIT_FRAGMENT_HEADER_SIZE + copied;
+		s->total_size = out_size;
 		s->record_type = AUDIT_RECORD_FRAGMENT;
 		s->record_flags = AUDIT_RECORD_FLAG_FRAGMENT;
-		if (next_seq == 0) {
+		if (next_seq == 0)
 			s->record_flags |= AUDIT_RECORD_FLAG_LAST_FRAGMENT | AUDIT_RECORD_FLAG_LOGICAL_COMPLETE;
-			if (physical_complete)
-				s->record_flags |= AUDIT_RECORD_FLAG_PHYSICAL_COMPLETE;
-		}
 		s->event_seq = fragment_seq;
 		s->parent_event_seq = parent_event_seq;
 		s->next_fragment_seq = next_seq;
 		s->field = field;
 		s->fragment_offset = offset;
 		s->payload_len = copied;
-		if (copied > 0)
-			bpf_probe_read_user(s->payload, copied, src + offset);
-
-		{
-			unsigned int out_size = audit_fragment_payload_offset() + copied;
-			if (out_size > sizeof(*s))
-				out_size = sizeof(*s);
-			s->total_size = out_size;
-			if (bpf_ringbuf_output(&rb, s, out_size, 0))
-				break;
-		}
+		bpf_probe_read_user(s->payload, copied, src + offset);
+		bpf_ringbuf_submit(s, 0);
 
 		if (is_last)
 			break;
@@ -263,8 +258,13 @@ int handle_uprobe(struct pt_regs *ctx)
 	unsigned int proxy_user_name_len = 0;
 	unsigned int tenant_name_len = 0;
 	unsigned int db_name_len = 0;
+	unsigned int planned_payload_len = 0;
+	unsigned int main_out_size = 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+		u64 perf_bpf_entry_ns = bpf_ktime_get_ns();
+#endif
 
-	// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
+		// RSI传参，第二参数是目标参数，c++第一个参数隐式this指针
 	audit_record = (const void *)PT_REGS_PARM2(ctx);
 	if (!audit_record)
 		return 0;
@@ -293,13 +293,16 @@ int handle_uprobe(struct pt_regs *ctx)
 	sql_first_len = clamp_len(sql_len, AUDIT_MAIN_SQL_PAYLOAD_MAX);
 	params_first_len = clamp_len(params_value_len, AUDIT_MAIN_PARAMS_PAYLOAD_MAX);
 
-	// per-cpu scratch 填好 main event，再 bpf_ringbuf_output 变长输出。
-	{
-		u32 scratch_key = 0;
-		e = bpf_map_lookup_elem(&event_scratch, &scratch_key);
-	}
-	if (!e)
+	planned_payload_len = user_name_len + proxy_user_name_len + tenant_name_len + db_name_len + sql_first_len + params_first_len;
+	main_out_size = event_payload_offset() + planned_payload_len;
+	if (main_out_size > sizeof(*e) || main_out_size > AUDIT_RINGBUF_MAX_BUCKET)
 		return 0;
+	count_ob_audit_seen();
+	e = reserve_audit_record(main_out_size);
+	if (!e) {
+		count_ringbuf_full_drop();
+		return 0;
+	}
 
 	main_event_seq = next_event_seq();
 	id = bpf_get_current_pid_tgid();
@@ -313,6 +316,15 @@ int handle_uprobe(struct pt_regs *ctx)
 
 	e->query_sql_len = sql_len;
 	e->params_value_len = 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+		e->perf_bpf_entry_ns = perf_bpf_entry_ns;
+		e->perf_bpf_before_output_ns = 0;
+		e->perf_agent_receive_ns = 0;
+		e->perf_agent_before_submit_ns = 0;
+		e->perf_agent_after_submit_ns = 0;
+		e->perf_collector_receive_ns = 0;
+		e->perf_mongo_before_insert_ns = 0;
+#endif
 	e->fragment_flags = 0;
 	e->next_fragment_field = FRAG_FIELD_NONE;
 	if (sql_len > AUDIT_MAIN_SQL_PAYLOAD_MAX) {
@@ -376,26 +388,31 @@ int handle_uprobe(struct pt_regs *ctx)
 	payload = e->payload;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_USER_NAME_PTR_OFF, OB_AUDIT_USER_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->user_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_PROXY_USER_NAME_PTR_OFF,
 					  OB_AUDIT_PROXY_USER_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->proxy_user_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_TENANT_NAME_PTR_OFF,
 					  OB_AUDIT_TENANT_NAME_LEN_OFF, MAX_NAME_LEN - 1, payload);
 	e->tenant_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_string_payload(audit_record, OB_AUDIT_DB_NAME_PTR_OFF, OB_AUDIT_DB_NAME_LEN_OFF, MAX_DB_NAME_LEN - 1, payload);
 	e->db_name_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_payload(sql, sql_len, AUDIT_MAIN_SQL_PAYLOAD_MAX, payload);
 	e->query_sql_payload_len = copied;
-	payload += copied;
 	payload_len += copied;
+	AUDIT_FORCE_AND(payload_len, 2047);
+	payload = e->payload + payload_len;
 	copied = read_user_payload(params_value, params_value_len, AUDIT_MAIN_PARAMS_PAYLOAD_MAX, payload);
 	e->params_value_payload_len = copied;
 	payload_len += copied;
@@ -417,13 +434,14 @@ int handle_uprobe(struct pt_regs *ctx)
 	}
 	e->next_fragment_seq = first_fragment_seq;
 	{
-		/* output 的 size 必须是 verifier 能证明有界的局部变量，
-		 * 不能用从 map 字段读回的 e->total_size。 */
 		unsigned int out_size = event_payload_offset() + payload_len;
-		if (out_size > sizeof(*e))
-			out_size = sizeof(*e);
+		if (out_size > main_out_size)
+			out_size = main_out_size;
 		e->total_size = out_size;
-		bpf_ringbuf_output(&rb, e, out_size, 0);
+#if AUDIT_PERF_FIELDS_ENABLED
+		e->perf_bpf_before_output_ns = bpf_ktime_get_ns();
+#endif
+		bpf_ringbuf_submit(e, 0);
 	}
 	if (main_fragment_flags & FRAG_QUERY_SQL_FRAGMENTED)
 		emit_field_fragments(sql, sql_len, FRAG_FIELD_QUERY_SQL, sql_first_len, main_event_seq,

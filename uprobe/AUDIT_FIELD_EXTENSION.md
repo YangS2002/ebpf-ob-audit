@@ -92,6 +92,59 @@ static void write_request_type_name(FILE *out, const event &e)
 
 这不会改变 `.adt` 二进制结构。
 
+## 让新字段上送到 MongoDB（collector 链路）
+
+上面的步骤只让字段进入 `.adt` 和 `adt_to_csv`。当前主链路是 `agent -> gRPC -> collector -> MongoDB`，collector 侧是 **schema 驱动**的，还需要额外两处修改。
+
+数据流：`struct event` 二进制原样上送 collector，collector 按 `audit_schema.json` 决定写哪些字段、用什么数字键落库。
+
+- `uprobe/audit_schema.json`：数字键 → 字段全名 的映射，带 `version`。每条记录落库时带 `sv=version` 标记，下游按 sv 解码。
+- `uprobe/src/mongodb_sink.cpp` 的 `kFieldAppenders[]`：字段全名 → "如何从 `struct event` 取值写进 BSON" 的 writer 注册表。
+
+**硬约束**：collector 启动时遍历 `audit_schema.json` 的每个字段全名去 `kFieldAppenders` 找 writer；只要 schema 里出现某字段、而注册表里没有对应 writer，collector 会启动失败并报 `schema field has no writer support: <字段名>`。所以这两处必须成对新增。
+
+前置：先完成上面《新增一个采集字段》的步骤（`uprobe.h` 偏移 + `struct event` 追加 + `uprobe.bpf.c` 读取），保证 `struct event` 里已有该字段。
+
+### 1. 在 `mongodb_sink.cpp` 的 `kFieldAppenders` 增加 writer
+
+按字段类型选 BSON 追加方式（appender 是无捕获 lambda，`c.e` 是 `const event *`）：
+
+```cpp
+// 整型
+{"request_type", +[](bson_t *d, const char *k, const append_ctx &c) { BSON_APPEND_INT32(d, k, c.e->request_type); }},
+// 字符串（带长度的采集字段用 append_text）
+{"some_name", +[](bson_t *d, const char *k, const append_ctx &c) { append_text(d, k, event_some_name(c.e), c.e->some_name_len); }},
+```
+
+非 `event` 派生的字段（如 `agent_id` / `server_ip` / `ingest_time`）从 `append_ctx` 取，参考现有同名项。
+
+### 2. 在 `audit_schema.json` 增加映射并递增 `version`
+
+```json
+{
+  "version": 3,
+  "fields": {
+    "...": "...",
+    "47": "request_type"
+  }
+}
+```
+
+用未占用的数字键；`version` 必须递增（记录会带新 `sv`，schema 字典集合按版本写入，下游按 sv 解码）。
+
+**只能增量，绝不复用/重编号/删除已有数字键。** MongoDB 里字段以数字键存储（如 `{"37": "root"}`），键的含义完全由 schema 版本决定。若改动某个已有键的映射，历史记录里那个键会被按新含义解码，值直接张冠李戴。新增字段永远只往后追加新键。
+
+### 3. 派生 / 格式化字段（可选）
+
+若要落库枚举名或格式化值（如 `plan_type_value` + `plan_type`、`trans_status_value` + `trans_status`），在 `kFieldAppenders` 里加一项调用格式化函数写字符串，并在 `audit_schema.json` 里给它单独的数字键，参考现有 `plan_type` / `trans_status` 两项写法。
+
+### 4. 对比校验（可选）
+
+若要把新字段纳入与官方 `GV$OB_SQL_AUDIT` 的正确性对比：
+
+- `uprobe/tools/mongo_to_csv.py`：确认新字段能导出（按数字键或全名）。
+- `uprobe/test/distributed_sql_test/compare_official_collector.py`：在 `COMPARE_FIELDS` 增加该字段。
+
 ## 版本和兼容
 
 `audit_file_header` 里记录：
@@ -126,6 +179,14 @@ header.event_size == sizeof(event)
 - [ ] 如需格式化，`uprobe/tools/audit_format.h` 增加转换函数
 - [ ] 判断是否需要递增 `AUDIT_FILE_VERSION`
 - [ ] 重新编译生产端和消费端
+
+要让新字段上送到 MongoDB，额外检查（否则 collector 启动会因缺 writer 失败）：
+
+- [ ] `uprobe/src/mongodb_sink.cpp` 在 `kFieldAppenders` 增加 writer
+- [ ] `uprobe/audit_schema.json` 增加数字键映射
+- [ ] `uprobe/audit_schema.json` 递增 `version`
+- [ ] 重新编译并重新部署 collector
+- [ ] 如需对比校验：`mongo_to_csv.py` 导出 + `compare_official_collector.py` 的 `COMPARE_FIELDS`
 
 只新增 CSV 派生字段时检查：
 

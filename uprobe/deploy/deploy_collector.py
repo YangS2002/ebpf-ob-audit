@@ -32,6 +32,7 @@ class CollectorNode:
     listen_addr: str = ""
     advertise_addr: str = ""
     instance_id: str = ""
+    runtime: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -49,6 +50,9 @@ class DeployConfig:
     mongodb_uri: str
     mongodb_database: str
     mongodb_collection: str
+    mongodb_metrics_collection: str
+    mongodb_event_ttl_days: int
+    mongodb_metrics_ttl_days: int
     mongodb_app_name: str
     mongodb_write_concern: str
     mongodb_connect_timeout_ms: int
@@ -204,6 +208,76 @@ def get_path(data: Dict[str, Any], dotted: str, default: Any = None) -> Any:
     return current
 
 
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def to_yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text == "" or any(ch in text for ch in [":", "#", " ", "\t"]):
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def dump_yaml(data: Dict[str, Any], indent: int = 0) -> List[str]:
+    lines: List[str] = []
+    prefix = " " * indent
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.extend(dump_yaml(value, indent + 2))
+        else:
+            lines.append(f"{prefix}{key}: {to_yaml_scalar(value)}")
+    return lines
+
+
+def default_collector_runtime() -> Dict[str, Any]:
+    return {
+        "collector": {
+            "listen_addr": "",
+            "registry": {
+                "enabled": True,
+                "etcd_endpoints": "",
+                "service_name": "",
+                "instance_id": "",
+                "advertise_addr": "",
+                "lease_ttl_sec": 10,
+                "keepalive_interval_sec": 3,
+            },
+        },
+        "storage": {"type": "mongodb"},
+        "mongodb": {
+            "uri": "",
+            "database": "",
+            "collection": "",
+            "metrics_collection": "audit_pipeline_metrics",
+            "event_ttl_days": 3,
+            "metrics_ttl_days": 1,
+            "app_name": "ebpf-ob-audit-collector",
+            "write_concern": "w1",
+            "connect_timeout_ms": 2000,
+            "server_selection_timeout_ms": 3000,
+            "socket_timeout_ms": 5000,
+            "pool_min_size": 1,
+            "pool_max_size": 4,
+            "insert_concurrency": 2,
+            "bulk_max_records": 1000,
+            "bulk_max_bytes": 4194304,
+            "ordered_insert": False,
+        },
+    }
+
+
 def bool_value(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -227,32 +301,36 @@ def parse_config(path: Path) -> DeployConfig:
     port = int(user.get("port", 22))
     password = str(user.get("password", ""))
     deploy_home = str(global_cfg.get("deploy_home", "/home/yangshuo17/ebpf-ob-audit-collector"))
+    runtime_global = deep_merge(default_collector_runtime(), global_cfg.get("runtime", {}) if isinstance(global_cfg.get("runtime", {}), dict) else {})
 
     config = DeployConfig(
         username=username,
         port=port,
         password=password,
         deploy_home=deploy_home,
-        storage=str(global_cfg.get("storage", "mongodb")),
-        registry_enabled=bool_value(global_cfg.get("registry_enabled", True)),
-        registry_etcd_endpoints=str(global_cfg.get("registry_etcd_endpoints", "http://7.27.43.139:2379")),
-        registry_service_name=str(global_cfg.get("registry_service_name", "audit-collector")),
-        registry_lease_ttl_sec=int(global_cfg.get("registry_lease_ttl_sec", 10)),
-        registry_keepalive_interval_sec=int(global_cfg.get("registry_keepalive_interval_sec", 3)),
-        mongodb_uri=str(global_cfg.get("mongodb_uri", "mongodb://7.27.43.139:27017")),
-        mongodb_database=str(global_cfg.get("mongodb_database", "ob_audit")),
-        mongodb_collection=str(global_cfg.get("mongodb_collection", "audit_events")),
-        mongodb_app_name=str(global_cfg.get("mongodb_app_name", "ebpf-ob-audit-collector")),
-        mongodb_write_concern=str(global_cfg.get("mongodb_write_concern", "w1")),
-        mongodb_connect_timeout_ms=int(global_cfg.get("mongodb_connect_timeout_ms", 2000)),
-        mongodb_server_selection_timeout_ms=int(global_cfg.get("mongodb_server_selection_timeout_ms", 3000)),
-        mongodb_socket_timeout_ms=int(global_cfg.get("mongodb_socket_timeout_ms", 5000)),
-        mongodb_pool_min_size=int(global_cfg.get("mongodb_pool_min_size", 1)),
-        mongodb_pool_max_size=int(global_cfg.get("mongodb_pool_max_size", 4)),
-        mongodb_insert_concurrency=int(global_cfg.get("mongodb_insert_concurrency", 2)),
-        mongodb_bulk_max_records=int(global_cfg.get("mongodb_bulk_max_records", 1000)),
-        mongodb_bulk_max_bytes=int(global_cfg.get("mongodb_bulk_max_bytes", 4194304)),
-        mongodb_ordered_insert=bool_value(global_cfg.get("mongodb_ordered_insert", False)),
+        storage=str(get_path(runtime_global, "storage.type", "mongodb")),
+        registry_enabled=bool_value(get_path(runtime_global, "collector.registry.enabled", True)),
+        registry_etcd_endpoints=str(get_path(runtime_global, "collector.registry.etcd_endpoints", "")),
+        registry_service_name=str(get_path(runtime_global, "collector.registry.service_name", "")),
+        registry_lease_ttl_sec=int(get_path(runtime_global, "collector.registry.lease_ttl_sec", 10)),
+        registry_keepalive_interval_sec=int(get_path(runtime_global, "collector.registry.keepalive_interval_sec", 3)),
+        mongodb_uri=str(get_path(runtime_global, "mongodb.uri", "")),
+        mongodb_database=str(get_path(runtime_global, "mongodb.database", "")),
+        mongodb_collection=str(get_path(runtime_global, "mongodb.collection", "")),
+        mongodb_metrics_collection=str(get_path(runtime_global, "mongodb.metrics_collection", "audit_pipeline_metrics")),
+        mongodb_event_ttl_days=int(get_path(runtime_global, "mongodb.event_ttl_days", 3)),
+        mongodb_metrics_ttl_days=int(get_path(runtime_global, "mongodb.metrics_ttl_days", 1)),
+        mongodb_app_name=str(get_path(runtime_global, "mongodb.app_name", "ebpf-ob-audit-collector")),
+        mongodb_write_concern=str(get_path(runtime_global, "mongodb.write_concern", "w1")),
+        mongodb_connect_timeout_ms=int(get_path(runtime_global, "mongodb.connect_timeout_ms", 2000)),
+        mongodb_server_selection_timeout_ms=int(get_path(runtime_global, "mongodb.server_selection_timeout_ms", 3000)),
+        mongodb_socket_timeout_ms=int(get_path(runtime_global, "mongodb.socket_timeout_ms", 5000)),
+        mongodb_pool_min_size=int(get_path(runtime_global, "mongodb.pool_min_size", 1)),
+        mongodb_pool_max_size=int(get_path(runtime_global, "mongodb.pool_max_size", 4)),
+        mongodb_insert_concurrency=int(get_path(runtime_global, "mongodb.insert_concurrency", 2)),
+        mongodb_bulk_max_records=int(get_path(runtime_global, "mongodb.bulk_max_records", 1000)),
+        mongodb_bulk_max_bytes=int(get_path(runtime_global, "mongodb.bulk_max_bytes", 4194304)),
+        mongodb_ordered_insert=bool_value(get_path(runtime_global, "mongodb.ordered_insert", False)),
         collectors=[],
     )
 
@@ -273,7 +351,13 @@ def parse_config(path: Path) -> DeployConfig:
                 advertise_addr = f"{ip}:{listen_port}"
             instance_id = str(server.get("instance_id", name))
             node_home = str(server.get("deploy_home", deploy_home))
-            config.collectors.append(CollectorNode(name, ip, listen_port, node_home, listen_addr, advertise_addr, instance_id))
+            node_runtime = deep_merge(runtime_global, server.get("runtime", {}) if isinstance(server.get("runtime", {}), dict) else {})
+            node_runtime = deep_merge(node_runtime, {"collector": {"listen_addr": listen_addr, "registry": {
+                "instance_id": instance_id,
+                "advertise_addr": advertise_addr,
+            }}})
+            node_runtime = deep_merge(node_runtime, server.get("override", {}) if isinstance(server.get("override", {}), dict) else {})
+            config.collectors.append(CollectorNode(name, ip, listen_port, node_home, listen_addr, advertise_addr, instance_id, node_runtime))
 
     validate_config(config)
     return config
@@ -294,6 +378,35 @@ def validate_config(config: DeployConfig) -> None:
             missing.append(f"collector.servers[{node.name}].advertise_addr")
     if missing:
         raise DeployError("missing required config fields: " + ", ".join(missing))
+
+
+def is_empty_required(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) == 0
+    return False
+
+
+def add_required_error(errors: List[str], kind: str, node: CollectorNode, field: str) -> None:
+    value = get_path(node.runtime, field)
+    if is_empty_required(value):
+        errors.append(f"CONFIG ERROR {kind} {node.name} {node.ip}: missing runtime.{field}")
+
+
+def validate_collector_runtime(config: DeployConfig) -> None:
+    errors: List[str] = []
+    for node in config.collectors:
+        add_required_error(errors, "collector", node, "collector.listen_addr")
+        add_required_error(errors, "collector", node, "storage.type")
+        if get_path(node.runtime, "storage.type", "") == "mongodb":
+            add_required_error(errors, "collector", node, "mongodb.uri")
+            add_required_error(errors, "collector", node, "mongodb.database")
+            add_required_error(errors, "collector", node, "mongodb.collection")
+    if errors:
+        raise DeployError("\n".join(errors))
 
 
 def build_collector(skip_build: bool) -> None:
@@ -353,34 +466,11 @@ def write_text(path: Path, content: str, mode: Optional[int] = None) -> None:
         path.chmod(mode)
 
 
-def render_collector_conf(config: DeployConfig, node: CollectorNode) -> str:
+def render_collector_yaml(node: CollectorNode) -> str:
     return "\n".join([
-        "# generated by uprobe/deploy/deploy_collector.py",
-        f"collector_listen_addr={node.listen_addr}",
-        f"collector_storage={config.storage}",
-        "",
-        f"collector_registry_enabled={str(config.registry_enabled).lower()}",
-        f"collector_registry_etcd_endpoints={config.registry_etcd_endpoints}",
-        f"collector_registry_service_name={config.registry_service_name}",
-        f"collector_registry_instance_id={node.instance_id}",
-        f"collector_registry_advertise_addr={node.advertise_addr}",
-        f"collector_registry_lease_ttl_sec={config.registry_lease_ttl_sec}",
-        f"collector_registry_keepalive_interval_sec={config.registry_keepalive_interval_sec}",
-        "",
-        f"mongodb_uri={config.mongodb_uri}",
-        f"mongodb_database={config.mongodb_database}",
-        f"mongodb_collection={config.mongodb_collection}",
-        f"mongodb_app_name={config.mongodb_app_name}",
-        f"mongodb_write_concern={config.mongodb_write_concern}",
-        f"mongodb_connect_timeout_ms={config.mongodb_connect_timeout_ms}",
-        f"mongodb_server_selection_timeout_ms={config.mongodb_server_selection_timeout_ms}",
-        f"mongodb_socket_timeout_ms={config.mongodb_socket_timeout_ms}",
-        f"mongodb_pool_min_size={config.mongodb_pool_min_size}",
-        f"mongodb_pool_max_size={config.mongodb_pool_max_size}",
-        f"mongodb_insert_concurrency={config.mongodb_insert_concurrency}",
-        f"mongodb_bulk_max_records={config.mongodb_bulk_max_records}",
-        f"mongodb_bulk_max_bytes={config.mongodb_bulk_max_bytes}",
-        f"mongodb_ordered_insert={str(config.mongodb_ordered_insert).lower()}",
+        "# collector 运行时配置，由 deploy_collector.py 根据 collector-deploy YAML 生成。",
+        "# 请不要手工修改远端该文件；需要变更时修改部署 YAML 的 global、节点字段或 override。",
+        *dump_yaml(node.runtime),
         "",
     ])
 
@@ -389,14 +479,27 @@ def render_start_script() -> str:
     return """#!/usr/bin/env bash
 set -euo pipefail
 DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
-CONF=${1:-$DEPLOY_HOME/conf/collector.conf}
-COLLECTOR_ID=$(awk -F= '/^collector_registry_instance_id=/{print $2}' "$CONF")
-PORT=$(awk -F= '/^collector_listen_addr=/{print $2}' "$CONF" | awk -F: '{print $NF}')
+CONF=${1:-$DEPLOY_HOME/conf/collector.yaml}
+COLLECTOR_ID=$(python3 - "$CONF" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding='utf-8') as f:
+    data = yaml.safe_load(f)
+print(data['collector']['registry']['instance_id'])
+PY
+)
+PORT=$(python3 - "$CONF" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding='utf-8') as f:
+    data = yaml.safe_load(f)
+print(str(data['collector']['listen_addr']).rsplit(':', 1)[1])
+PY
+)
 if [ -z "${PORT:-}" ]; then
   echo "collector_listen_addr missing in $CONF" >&2
   exit 1
 fi
 export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${LD_LIBRARY_PATH:-}"
+cd "$DEPLOY_HOME"
 mkdir -p "$DEPLOY_HOME/logs" "$DEPLOY_HOME/run"
 LOG_FILE="$DEPLOY_HOME/logs/collector.log"
 PID_FILE="$DEPLOY_HOME/run/collector-${PORT}.pid"
@@ -412,6 +515,12 @@ def make_package(binary: Path, work_dir: Path) -> Path:
     for subdir in ("bin", "lib", "run", "logs", "conf"):
         (package_root / subdir).mkdir(parents=True)
     shutil.copy2(binary, package_root / "bin" / "audit_collector")
+    # Field-encoding schema file; collector reads it at startup (default cwd-relative
+    # path resolves to deploy_home, matching where start_collector.sh launches).
+    schema_file = UPROBE_DIR / "audit_schema.json"
+    if not schema_file.exists():
+        raise DeployError(f"schema file not found: {schema_file}")
+    shutil.copy2(schema_file, package_root / "audit_schema.json")
     write_text(package_root / "run" / "start_collector.sh", render_start_script(), 0o755)
     collect_libraries(binary, package_root / "lib")
     archive = work_dir / "uprobe-collector-common.tar.gz"
@@ -445,9 +554,9 @@ def remote(config: DeployConfig, node: CollectorNode, command: str, dry_run: boo
 
 def deploy_node(config: DeployConfig, node: CollectorNode, archive: Path, dry_run: bool) -> NodeResult:
     remote_tmp = f"/tmp/{archive.name}"
-    conf_path = archive.parent / f"collector-{node.name}-{node.listen_port}.conf"
-    write_text(conf_path, render_collector_conf(config, node))
-    remote_conf = f"{node.deploy_home}/conf/collector-{node.listen_port}.conf"
+    conf_path = archive.parent / f"collector-{node.name}-{node.listen_port}.yaml"
+    write_text(conf_path, render_collector_yaml(node))
+    remote_conf = f"{node.deploy_home}/conf/collector-{node.listen_port}.yaml"
     require_cmd(ssh_base(config, node.ip) + [f"mkdir -p {quote_arg(node.deploy_home)} {quote_arg(node.deploy_home + '/conf')}"] , dry_run=dry_run)
     require_cmd(scp_base(config, archive, node.ip, remote_tmp), dry_run=dry_run)
     unpack_cmd = f"tar -xzf {quote_arg(remote_tmp)} -C {quote_arg(node.deploy_home)} && rm -f {quote_arg(remote_tmp)}"
@@ -457,18 +566,22 @@ def deploy_node(config: DeployConfig, node: CollectorNode, archive: Path, dry_ru
 
 
 def start_node(config: DeployConfig, node: CollectorNode, dry_run: bool) -> NodeResult:
-    pattern = "[a]udit_collector --config conf/collector-" + str(node.listen_port) + ".conf"
+    pattern = "[a]udit_collector --config conf/collector-" + str(node.listen_port) + ".yaml"
     pid_file = f"run/collector-{node.listen_port}.pid"
     cmd = (
         f"cd {quote_arg(node.deploy_home)} && mkdir -p logs run && "
+        # 强制重启: 先杀掉该端口已存在的旧实例, 保证是全新进程(累计指标从零开始)。
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
-        f"if [ -n \"$pids\" ]; then state=already_running; "
-        f"else nohup ./run/start_collector.sh {quote_arg('conf/collector-' + str(node.listen_port) + '.conf')} > /dev/null 2>&1 < /dev/null & echo $! > {quote_arg(pid_file)}; state=started; fi; "
+        f"if [ -n \"$pids\" ]; then kill $pids; sleep 1; "
+        f"left=$(pgrep -f {quote_arg(pattern)} || true); if [ -n \"$left\" ]; then kill -9 $left; fi; fi; "
+        # 无条件清空共享 logs 目录(collector.log / collector_timing.log), 避免旧数据污染下一次统计。
+        f"rm -f logs/*; "
+        f"nohup ./run/start_collector.sh {quote_arg('conf/collector-' + str(node.listen_port) + '.yaml')} > /dev/null 2>&1 < /dev/null & echo $! > {quote_arg(pid_file)}; state=started; "
         f"sleep 3; "
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if ss -ltn sport = :{node.listen_port} 2>/dev/null | tail -n +2 | grep -q .; then listening=yes; else listening=no; fi; "
         f"if [ -n \"$pids\" ]; then running=yes; else running=no; fi; "
-        f"printf 'state=%s running=%s listening=%s port={node.listen_port} pids=%s config=conf/collector-{node.listen_port}.conf' \"$state\" \"$running\" \"$listening\" \"$pids\"; "
+        f"printf 'state=%s running=%s listening=%s port={node.listen_port} pids=%s config=conf/collector-{node.listen_port}.yaml' \"$state\" \"$running\" \"$listening\" \"$pids\"; "
         f"if [ \"$running\" != yes ] || [ \"$listening\" != yes ]; then exit 1; fi"
     )
     result = remote(config, node, cmd, dry_run=dry_run, capture=True)
@@ -481,11 +594,16 @@ def start_node(config: DeployConfig, node: CollectorNode, dry_run: bool) -> Node
 
 
 def stop_node(config: DeployConfig, node: CollectorNode, dry_run: bool) -> NodeResult:
-    pattern = "[a]udit_collector --config conf/collector-" + str(node.listen_port) + ".conf"
+    pattern = "[a]udit_collector --config conf/collector-" + str(node.listen_port) + ".yaml"
     cmd = (
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -z \"$pids\" ]; then echo state=not_running; exit 0; fi; "
-        f"kill $pids; sleep 1; "
+        f"kill $pids; "
+        f"for i in $(seq 1 15); do "
+        f"sleep 1; "
+        f"left=$(pgrep -f {quote_arg(pattern)} || true); "
+        f"if [ -z \"$left\" ]; then break; fi; "
+        f"done; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -n \"$left\" ]; then kill -9 $left; fi; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
@@ -605,6 +723,8 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action in ("start", "deploy-start"):
+            validate_collector_runtime(config)
         if config.password:
             print("INFO using user.password for SSH via sshpass.")
         build_dir.mkdir(parents=True, exist_ok=True)

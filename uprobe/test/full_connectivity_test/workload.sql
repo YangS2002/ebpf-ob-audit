@@ -34,50 +34,15 @@ CREATE TABLE dist_order (
   KEY idx_tenant_status (tenant_key, order_status)
 ) PARTITION BY HASH(order_id) PARTITIONS 16;
 
-CREATE TABLE dist_order_item (
-  item_id BIGINT NOT NULL,
-  order_id BIGINT NOT NULL,
-  sku VARCHAR(64) NOT NULL,
-  qty INT NOT NULL,
-  price DECIMAL(18,2) NOT NULL,
-  PRIMARY KEY (item_id),
-  KEY idx_order (order_id)
-) PARTITION BY HASH(item_id) PARTITIONS 16;
+CREATE TABLE dist_order_item (item_id BIGINT NOT NULL,order_id BIGINT NOT NULL,sku VARCHAR(64) NOT NULL,qty INT NOT NULL,price DECIMAL(18,2) NOT NULL,PRIMARY KEY (item_id),KEY idx_order (order_id)) PARTITION BY HASH(item_id) PARTITIONS 16;
 
-CREATE TABLE dist_range_case (
-  id BIGINT NOT NULL,
-  k BIGINT NOT NULL,
-  c VARCHAR(120) NOT NULL,
-  PRIMARY KEY (id),
-  KEY idx_k (k)
-) PARTITION BY RANGE(id) (
-  PARTITION p0 VALUES LESS THAN (1000),
-  PARTITION p1 VALUES LESS THAN (2000),
-  PARTITION p2 VALUES LESS THAN (3000),
-  PARTITION p3 VALUES LESS THAN MAXVALUE
-);
+CREATE TABLE dist_range_case (id BIGINT NOT NULL,k BIGINT NOT NULL,c VARCHAR(120) NOT NULL,PRIMARY KEY (id),KEY idx_k (k)) PARTITION BY RANGE(id) (  PARTITION p0 VALUES LESS THAN (1000),  PARTITION p1 VALUES LESS THAN (2000),  PARTITION p2 VALUES LESS THAN (3000),  PARTITION p3 VALUES LESS THAN MAXVALUE);
 
-CREATE TABLE dist_tx_case (
-  id BIGINT NOT NULL,
-  k BIGINT NOT NULL,
-  c VARCHAR(120) NOT NULL,
-  PRIMARY KEY (id)
-) PARTITION BY HASH(id) PARTITIONS 16;
+CREATE TABLE dist_tx_case (  id BIGINT NOT NULL,  k BIGINT NOT NULL,  c VARCHAR(120) NOT NULL,  PRIMARY KEY (id)) PARTITION BY HASH(id) PARTITIONS 16;
 
-CREATE TABLE dist_unique_case (
-  id BIGINT NOT NULL,
-  uk BIGINT NOT NULL,
-  c VARCHAR(120) NOT NULL,
-  PRIMARY KEY (id, uk),
-  UNIQUE KEY uk_dist_unique_case (uk)
-) PARTITION BY HASH(uk) PARTITIONS 16;
+CREATE TABLE dist_unique_case (  id BIGINT NOT NULL,  uk BIGINT NOT NULL,  c VARCHAR(120) NOT NULL,  PRIMARY KEY (id, uk),  UNIQUE KEY uk_dist_unique_case (uk)) PARTITION BY HASH(uk) PARTITIONS 16;
 
-INSERT INTO dist_customer (customer_id, tenant_key, name, city, status) VALUES
-  (1, 10, 'dist_customer_1', 'hangzhou', 1),
-  (2, 10, 'dist_customer_2', 'shanghai', 1),
-  (1001, 20, 'dist_customer_1001', 'beijing', 1),
-  (2001, 20, 'dist_customer_2001', 'shenzhen', 0),
-  (3001, 30, 'dist_customer_3001', 'guangzhou', 1);
+INSERT INTO dist_customer (customer_id, tenant_key, name, city, status) VALUES  (1, 10, 'dist_customer_1', 'hangzhou', 1),  (2, 10, 'dist_customer_2', 'shanghai', 1),  (1001, 20, 'dist_customer_1001', 'beijing', 1),  (2001, 20, 'dist_customer_2001', 'shenzhen', 0),  (3001, 30, 'dist_customer_3001', 'guangzhou', 1);
 
 INSERT INTO dist_order (order_id, customer_id, tenant_key, amount, order_status) VALUES
   (1, 1, 10, 11.00, 1),

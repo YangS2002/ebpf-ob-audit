@@ -23,7 +23,7 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
 					 | sed 's/riscv64/riscv/')
 VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
 INCLUDES := -I$(OUTPUT) -I$(SRC_DIR) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
-CXXFLAGS := -g -Wall -std=c++17
+CXXFLAGS := -O2 -Wall -std=c++17
 PROTOC ?= protoc
 GRPC_CPP_PLUGIN ?= $(shell command -v grpc_cpp_plugin 2>/dev/null || printf grpc_cpp_plugin)
 GRPC_CXXFLAGS ?= $(shell pkg-config --cflags grpc++ protobuf 2>/dev/null)
@@ -33,6 +33,11 @@ MONGO_LDLIBS ?= $(shell pkg-config --libs libmongoc-1.0 libbson-1.0 2>/dev/null)
 GTEST_CXXFLAGS ?= $(shell pkg-config --cflags gtest 2>/dev/null)
 GTEST_LDLIBS ?= $(shell pkg-config --libs gtest_main gtest 2>/dev/null || printf -- '-lgtest_main -lgtest -pthread')
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
+AUDIT_PERF_FIELDS_ENABLED ?= 0
+AUDIT_PERF_DEFINE := -DAUDIT_PERF_FIELDS_ENABLED=$(AUDIT_PERF_FIELDS_ENABLED)
+AUDIT_GRPC_TIMING_ENABLED ?= 0
+AUDIT_GRPC_TIMING_DEFINE := -DAUDIT_GRPC_TIMING_ENABLED=$(AUDIT_GRPC_TIMING_ENABLED)
+CXXFLAGS += $(AUDIT_PERF_DEFINE) $(AUDIT_GRPC_TIMING_DEFINE)
 
 CLANG_BPF_SYS_INCLUDES = $(shell $(CLANG) -v -E - </dev/null 2>&1 \
 	| sed -n '/<...> search starts here:/,/End of search list./{ s| \(/.*\)|-idirafter \1|p }')
@@ -89,7 +94,7 @@ $(BPFTOOL): | $(BPFTOOL_OUTPUT)
 
 $(OUTPUT)/%.bpf.o: $(SRC_DIR)/%.bpf.c $(LIBBPF_OBJ) $(wildcard $(SRC_DIR)/*.h) $(VMLINUX) | $(OUTPUT)
 	$(call msg,BPF,$@)
-	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
+	$(Q)$(CLANG) -g -O2 -fno-stack-protector -target bpf -D__TARGET_ARCH_$(ARCH) $(AUDIT_PERF_DEFINE) $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) -c $(filter %.c,$^) -o $@
 	$(Q)$(LLVM_STRIP) -g $@
 
 $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT) $(BPFTOOL)
@@ -139,11 +144,23 @@ $(OUTPUT)/collector_resolver.o: $(SRC_DIR)/collector_resolver.cpp $(SRC_DIR)/col
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) $(INCLUDES) -I$(OUTPUT) -c $< -o $@
 
-$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+$(OUTPUT)/collector_timing.o: collector/collector_timing.cpp collector/collector_timing.h $(SRC_DIR)/mongodb_sink.h | $(OUTPUT)
 	$(call msg,CXX,$@)
-	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) -c $< -o $@
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
 
-$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+$(OUTPUT)/collector_loss_metrics.o: collector/collector_loss_metrics.cpp collector/collector_loss_metrics.h | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) -Icollector -c $< -o $@
+
+$(OUTPUT)/audit_collector.o: collector/audit_collector.cpp collector/mongo_insert_worker.h collector/collector_timing.h collector/collector_loss_metrics.h $(OUTPUT)/audit_upload.grpc.pb.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
+
+$(OUTPUT)/mongo_insert_worker.o: collector/mongo_insert_worker.cpp collector/mongo_insert_worker.h $(SRC_DIR)/bounded_mpmc_queue.h $(wildcard $(SRC_DIR)/*.h) | $(OUTPUT)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) -c $< -o $@
+
+$(BINDIR)/audit_collector: $(OUTPUT)/audit_collector.o $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_loss_metrics.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) -o $@
 
@@ -153,6 +170,27 @@ collector-connection-test: $(BINDIR)/collector_connection_test
 $(BINDIR)/collector_connection_test: $(TEST_DIR)/collector_connection_test.cpp $(OUTPUT)/etcdserverpb/rpc.grpc.pb.h $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
 	$(call msg,CXX,$@)
 	$(Q)$(CXX) $(CXXFLAGS) $(GRPC_CXXFLAGS) -I$(OUTPUT) $< $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o $(ALL_LDFLAGS) $(GRPC_LDLIBS) -o $@
+
+.PHONY: collector-async-ack-e2e-test
+collector-async-ack-e2e-test: $(BINDIR)/collector_async_ack_e2e_test
+
+$(BINDIR)/collector_async_ack_e2e_test: $(TEST_DIR)/collector_async_ack_e2e_test.cpp $(OUTPUT)/mongo_insert_worker.o $(OUTPUT)/collector_timing.o $(OUTPUT)/collector_loss_metrics.o $(OUTPUT)/collector_registry.o $(OUTPUT)/audit_event_parser.o $(OUTPUT)/mongodb_sink.o $(OUTPUT)/audit_schema.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -Icollector -I$(OUTPUT) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(MONGO_LDLIBS) $(GTEST_LDLIBS) -o $@
+
+.PHONY: agent-sender-e2e-test
+agent-sender-e2e-test: $(BINDIR)/agent_sender_e2e_test
+
+.PHONY: bounded-mpmc-queue-test
+bounded-mpmc-queue-test: $(BINDIR)/bounded_mpmc_queue_test
+
+$(BINDIR)/bounded_mpmc_queue_test: $(TEST_DIR)/bounded_mpmc_queue_test.cpp $(SRC_DIR)/bounded_mpmc_queue.h | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) -I$(SRC_DIR) $< $(GTEST_LDLIBS) -pthread -o $@
+
+$(BINDIR)/agent_sender_e2e_test: $(TEST_DIR)/e2e_agent_sender/audit_grpc_sender_e2e_test.cpp $(OUTPUT)/audit_grpc_sender.o $(OUTPUT)/collector_resolver.o $(OUTPUT)/audit_upload.pb.o $(OUTPUT)/audit_upload.grpc.pb.o $(OUTPUT)/etcdserverpb/rpc.pb.o $(OUTPUT)/etcdserverpb/rpc.grpc.pb.o | $(BINDIR)
+	$(call msg,CXX,$@)
+	$(Q)$(CXX) $(CXXFLAGS) $(GTEST_CXXFLAGS) $(GRPC_CXXFLAGS) -I$(SRC_DIR) -I$(OUTPUT) $^ $(ALL_LDFLAGS) $(GRPC_LDLIBS) $(GTEST_LDLIBS) -o $@
 
 .PHONY: event-size
 event-size: $(BINDIR)/event_size

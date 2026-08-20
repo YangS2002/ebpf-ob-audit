@@ -4,6 +4,16 @@
 
 #include "audit_record.h"
 
+#ifndef AUDIT_PERF_FIELDS_ENABLED
+#define AUDIT_PERF_FIELDS_ENABLED 0
+#endif
+
+#if AUDIT_PERF_FIELDS_ENABLED
+#define AUDIT_FILE_VERSION_VALUE 6
+#else
+#define AUDIT_FILE_VERSION_VALUE 5
+#endif
+
 #define TASK_COMM_LEN 16
 #define MAX_NAME_LEN 64
 #define MAX_IP_LEN OB_ADDR_SIZE
@@ -92,7 +102,7 @@
 
 #define AUDIT_FILE_MAGIC "OBAUDT1"
 #define AUDIT_FILE_MAGIC_SIZE 8
-#define AUDIT_FILE_VERSION 5
+#define AUDIT_FILE_VERSION AUDIT_FILE_VERSION_VALUE
 #define AUDIT_FLUSH_THRESHOLD (64 * 1024)
 #ifndef AUDIT_EVENT_PAYLOAD_SIZE
 #define AUDIT_EVENT_PAYLOAD_SIZE (MAX_NAME_LEN + MAX_NAME_LEN + MAX_NAME_LEN + MAX_DB_NAME_LEN + MAX_SQL_LEN + MAX_PARAMS_VALUE_LEN)
@@ -179,6 +189,16 @@ struct event {
 	long long execute_time; // 
 	long long query_sql_len;
 	long long params_value_len;
+
+#if AUDIT_PERF_FIELDS_ENABLED
+	unsigned long long perf_bpf_entry_ns;
+	unsigned long long perf_bpf_before_output_ns;
+	unsigned long long perf_agent_receive_ns;
+	unsigned long long perf_agent_before_submit_ns;
+	unsigned long long perf_agent_after_submit_ns;
+	unsigned long long perf_collector_receive_ns;
+	unsigned long long perf_mongo_before_insert_ns;
+#endif
 
 	struct ob_trace_id_raw trace_id;//
 

@@ -66,6 +66,8 @@ def run_case(args, case):
         cmd.append("--mysql-force")
     if args.mongo_sort_desc:
         cmd.append("--mongo-sort-desc")
+    if args.mismatches_only:
+        cmd.append("--mismatches-only")
 
     if case["name"] != CASES[0]["name"]:
         cmd.append("--no-clear-mongo")
@@ -83,14 +85,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run all distributed SQL audit tests against MongoDB collector storage.")
     parser.add_argument("--deploy-config", default="", help="unused; kept for compatibility")
     parser.add_argument("--out-dir", default=str(TEST_DIR / "out" / "batch_mongo"))
-    parser.add_argument("--ob-host", default="7.27.43.145")
+    parser.add_argument("--ob-host", default="7.27.222.3")
     parser.add_argument("--ob-port", type=int, default=2881)
     parser.add_argument("--workload-user", default="root@sys")
     parser.add_argument("--workload-password", default="oceanbase")
     parser.add_argument("--workload-database", default="")
     parser.add_argument("--audit-user", default="root@sys")
     parser.add_argument("--audit-password", default="oceanbase")
-    parser.add_argument("--mongo-uri", default="mongodb://audit_collector:1@7.27.43.139:27017/ob_audit?authSource=ob_audit")
+    parser.add_argument("--mongo-uri", default="mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit")
     parser.add_argument("--mongo-db", default="ob_audit")
     parser.add_argument("--mongo-collection", default="audit_events")
     parser.add_argument("--mongo-query", default="{}")
@@ -98,6 +100,7 @@ def parse_args():
     parser.add_argument("--mongo-sort", default="event_seq")
     parser.add_argument("--mongo-sort-desc", action="store_true")
     parser.add_argument("--mongo-export-wait-seconds", type=float, default=5.0)
+    parser.add_argument("--mismatches-only", action="store_true", help="only print/write failed compare units")
     return parser.parse_args()
 
 
