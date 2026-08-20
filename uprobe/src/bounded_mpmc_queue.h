@@ -30,6 +30,17 @@ public:
 		return true;
 	}
 
+	// Non-blocking enqueue: returns false immediately if the queue is full or closed.
+	bool try_push(T item)
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (closed_ || queue_.size() >= capacity_)
+			return false;
+		queue_.push_back(std::move(item));
+		not_empty_.notify_one();
+		return true;
+	}
+
 	bool pop(T *item)
 	{
 		if (!item)

@@ -5,7 +5,8 @@ alwaysApply: true
 <rule>
 # Debug and Bugfix Workflow
 
-When debugging, fixing bugs, or changing code in response to broken behavior, first provide the user with a pre-change analysis before editing any code.
+When debugging, fixing bugs, or changing code in response to broken behavior, 
+first provide the user with a pre-change analysis before editing any code.
 
 Required order:
 1. State the observed problem.

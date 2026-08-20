@@ -333,6 +333,21 @@ mongodb:
   - `audit_events.ingest_time`，`expireAfterSeconds=259200`
   - `audit_pipeline_metrics.ts`，`expireAfterSeconds=86400`
 
+collector 启动时还会在 `audit_events` 上自动创建以下索引（幂等，已存在则跳过）：
+
+| 索引名 | 键（字段名） | 类型 | 用途 |
+| --- | --- | --- | --- |
+| `uniq_tenant_server_event_seq` | `{tenant_id, server_ip, event_seq}` | 唯一 | 入库去重 |
+| `ttl_ingest_time` | `{ingest_time}` | TTL + 普通有序 | 过期清理；同时支撑**纯时间范围查询** |
+| `idx_tenant_time` | `{tenant_name, ingest_time}` | 非唯一复合 | 按**租户名 + 时间范围**过滤查询 |
+| `idx_server_time` | `{server_ip, ingest_time}` | 非唯一复合 | 按 **server_ip + 时间范围**过滤查询 |
+
+说明：
+
+- 事件字段以 schema 数字键存储，索引在建立时由字段全名（`tenant_name`/`server_ip`）解析成对应数字键；`ingest_time` 是顶层命名字段可直接使用。查询时同样需按数字键或 schema 视图访问对应字段。
+- 时间条件用范围查询（`$gte`/`$lt`），由复合索引末列 `ingest_time`（或 `ttl_ingest_time`）走区间扫描，遵循 ESR（等值→排序→范围）；无需额外的时间分桶字段。
+- `idx_tenant_time` 依赖 schema 含 `tenant_name` 字段；若 schema 未包含则该索引自动跳过、不阻断启动。
+
 ### 10.2 一条记录在管道里的流向
 
 先看一条审计记录从 OB 到 MongoDB 会经过哪些环节，每个环节可能丢在哪里。字段全部是**进程启动后的累计计数**。

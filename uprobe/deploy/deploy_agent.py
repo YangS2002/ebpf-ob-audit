@@ -601,8 +601,12 @@ def stop_node(config: DeployConfig, node: Node, dry_run: bool) -> NodeResult:
     cmd = (
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -z \"$pids\" ]; then echo state=not_running; exit 0; fi; "
-        f"{sudo_kill} kill $pids; sleep 1; "
+        f"{sudo_kill} kill $pids; "
+        f"for i in $(seq 1 15); do "
+        f"sleep 1; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
+        f"if [ -z \"$left\" ]; then break; fi; "
+        f"done; "
         f"if [ -n \"$left\" ]; then {sudo_kill} kill -9 $left; fi; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -n \"$left\" ]; then echo state=failed; exit 1; else echo state=stopped; fi"

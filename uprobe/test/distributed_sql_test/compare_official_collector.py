@@ -409,10 +409,11 @@ def compare(workload_sqls, official_rows, collector_rows, report_path, max_print
 
         pass_count += 1
         if not mismatches_only:
-            sample_field = random.choice(COMPARE_FIELDS)
+            sample_fields = random.sample(COMPARE_FIELDS, min(3, len(COMPARE_FIELDS)))
             unit.append("  PASS")
-            unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
-            unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
+            for sample_field in sample_fields:
+                unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
+                unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
             report.extend(unit)
             if printed < max_print:
                 print_lines(unit, "green")
@@ -479,10 +480,11 @@ def compare_from_collector(official_rows, collector_rows, db_name, report_path, 
 
         pass_count += 1
         if not mismatches_only:
-            sample_field = random.choice(COMPARE_FIELDS)
+            sample_fields = random.sample(COMPARE_FIELDS, min(3, len(COMPARE_FIELDS)))
             unit.append("  PASS")
-            unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
-            unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
+            for sample_field in sample_fields:
+                unit.append(f"  official {sample_field}: {short_sql(official.get(sample_field, '')) if sample_field == 'query_sql' else official.get(sample_field, '')}")
+                unit.append(f"  collector {sample_field}: {short_sql(collector.get(sample_field, '')) if sample_field == 'query_sql' else collector.get(sample_field, '')}")
             report.extend(unit)
             if printed < max_print:
                 print_lines(unit, "green")

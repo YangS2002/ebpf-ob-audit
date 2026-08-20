@@ -165,8 +165,61 @@ static bool ensure_ttl_index(mongoc_client_t *client, const std::string &databas
 	return true;
 }
 
-// Upsert the schema document `{ _id: <version>, version, fields: { key -> full } }`
-// into the dedicated schema collection. Keyed by version so multiple versions
+// Non-unique compound index `{first_key:1, second_key:1}` on the events
+// collection. Idempotent: an "already exists" error is treated as success.
+static bool create_compound_index(mongoc_client_t *client, const mongodb_config &config,
+				  const char *first_key, const char *second_key,
+				  const char *name, std::string *error)
+{
+	mongoc_collection_t *collection = mongoc_client_get_collection(
+		client, config.database.c_str(), config.collection.c_str());
+	if (!collection) {
+		if (error)
+			*error = "failed to get MongoDB collection for secondary index";
+		return false;
+	}
+
+	bson_t keys;
+	bson_init(&keys);
+	BSON_APPEND_INT32(&keys, first_key, 1);
+	BSON_APPEND_INT32(&keys, second_key, 1);
+
+	bson_error_t bson_error;
+	mongoc_index_opt_t opts;
+	mongoc_index_opt_init(&opts);
+	opts.name = name;
+
+	bool ok = mongoc_collection_create_index(collection, &keys, &opts, &bson_error);
+	bson_destroy(&keys);
+	mongoc_collection_destroy(collection);
+
+	if (!ok && strstr(bson_error.message, "already exists") == nullptr) {
+		if (error)
+			*error = bson_error.message;
+		return false;
+	}
+	return true;
+}
+
+// Secondary indexes for business filter/range queries. Each is a non-unique
+// compound index ending in the top-level `ingest_time` (a real named BSON
+// DATE_TIME field, see append_event_doc) so time-range queries use the index.
+// Fields not present in the active schema are skipped rather than fatal.
+static bool ensure_secondary_indexes(mongoc_client_t *client, const mongodb_config &config,
+				     const std::unordered_map<std::string, std::string> &full_to_key,
+				     std::string *error)
+{
+	std::string tenant_name_key, server_key;
+	if (schema_key_for(full_to_key, "tenant_name", &tenant_name_key, nullptr) &&
+	    !create_compound_index(client, config, tenant_name_key.c_str(), "ingest_time", "idx_tenant_time", error))
+		return false;
+	if (schema_key_for(full_to_key, "server_ip", &server_key, nullptr) &&
+	    !create_compound_index(client, config, server_key.c_str(), "ingest_time", "idx_server_time", error))
+		return false;
+	return true;
+}
+
+// Upsert the schema document `{ _id: <version>, version, fields: { key -> full } }`// into the dedicated schema collection. Keyed by version so multiple versions
 // coexist; idempotent, so safe to run on every startup.
 static bool ensure_schema_dict(mongoc_client_t *client, const mongodb_config &config,
 			       const audit_schema &schema, std::string *error)
@@ -533,6 +586,13 @@ bool MongoSink::start(const mongodb_config &config, std::string *error)
 
 		if (!ensure_ttl_index(client, config.database, config.collection, "ingest_time", config.event_ttl_days, error) ||
 		    !ensure_ttl_index(client, config.database, config.metrics_collection, "ts", config.metrics_ttl_days, error)) {
+			mongoc_client_pool_push(impl_->pool, client);
+			mongoc_client_pool_destroy(impl_->pool);
+			impl_->pool = nullptr;
+			return false;
+		}
+
+		if (!ensure_secondary_indexes(client, config, full_to_key, error)) {
 			mongoc_client_pool_push(impl_->pool, client);
 			mongoc_client_pool_destroy(impl_->pool);
 			impl_->pool = nullptr;

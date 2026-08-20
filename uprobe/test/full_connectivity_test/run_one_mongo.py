@@ -28,7 +28,7 @@ from run_one import (
     warn,
 )
 
-DEFAULT_WORKLOAD = TEST_DIR / "workload.sql"
+DEFAULT_WORKLOAD = TEST_DIR / "big_sql_test.sql"
 DEFAULT_OUT_DIR = TEST_DIR / "out" / "single"
 
 MONGO_TO_CSV = UPROBE_DIR / "tools" / "mongo_to_csv.py"
@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--workload-database", default="")
     parser.add_argument("--audit-user", default="root@sys")
     parser.add_argument("--audit-password", default="oceanbase")
-    parser.add_argument("--ob-host", default="7.27.43.136")
+    parser.add_argument("--ob-host", default="7.27.222.3")
     parser.add_argument("--ob-port", type=int, default=2881)
     parser.add_argument("--mysql-force", action="store_true")
     parser.add_argument("--mongo-uri", default="mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit")
@@ -100,9 +100,13 @@ def write_ps_resolved_workload(args, out_dir):
     lines = []
     for item in resolved:
         if item.error:
-            lines.append(item.source_sql.rstrip(";") + ";")
+            stmt = item.source_sql.rstrip(";") + ";"
         else:
-            lines.append(normalize_sql(item.query_sql).rstrip(";") + ";")
+            stmt = normalize_sql(item.query_sql).rstrip(";") + ";"
+        # uprobe 不采集 USE <db> 这类会话命令，跳过以免误判 collector_missing。
+        if stmt.lstrip().upper().startswith("USE "):
+            continue
+        lines.append(stmt)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     ok("ps workload resolved", str(out_path))
     return out_path

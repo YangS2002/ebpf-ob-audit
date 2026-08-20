@@ -598,7 +598,12 @@ def stop_node(config: DeployConfig, node: CollectorNode, dry_run: bool) -> NodeR
     cmd = (
         f"pids=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -z \"$pids\" ]; then echo state=not_running; exit 0; fi; "
-        f"kill $pids; sleep 1; "
+        f"kill $pids; "
+        f"for i in $(seq 1 15); do "
+        f"sleep 1; "
+        f"left=$(pgrep -f {quote_arg(pattern)} || true); "
+        f"if [ -z \"$left\" ]; then break; fi; "
+        f"done; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "
         f"if [ -n \"$left\" ]; then kill -9 $left; fi; "
         f"left=$(pgrep -f {quote_arg(pattern)} || true); "

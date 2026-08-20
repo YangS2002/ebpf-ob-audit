@@ -100,7 +100,7 @@ bool MongoInsertWorkerPool::submit(const std::shared_ptr<MongoInsertTask> &task)
 {
 	if (!task)
 		return false;
-	return impl_->queue.push(task);
+	return impl_->queue.try_push(task);
 }
 
 void MongoInsertWorkerPool::worker_loop()
