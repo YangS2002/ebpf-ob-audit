@@ -55,14 +55,17 @@ struct audit_fragment_record {
 };
 
 #define AUDIT_FRAGMENT_HEADER_SIZE ((unsigned int)__builtin_offsetof(struct audit_fragment_record, payload))
-#define AUDIT_FRAGMENT_PAYLOAD_MAX 4095
+/* 单片 fragment 净荷上限 64KB-1：目标内核 5.8 不展开/不用循环，
+ * 单片一次拷贝代替 16 片循环，消除 verifier 状态爆炸。
+ * 注意：分片事件 reserve 时瞬时占用整个 ~64KB bucket。 */
+#define AUDIT_FRAGMENT_PAYLOAD_MAX 65535
 #define AUDIT_FRAGMENT_BUCKET (AUDIT_FRAGMENT_HEADER_SIZE + AUDIT_FRAGMENT_PAYLOAD_MAX + 1)
 
-/* OB 单个 SQL/params 暂按 64KB 捕获阈值。
- * main 1023B + 16 * 4095B = 66543B，覆盖 64KB。 */
-#define AUDIT_MAX_FRAGMENTS_PER_FIELD 16
+/* OB 单个 SQL/params 暂按 64KB 捕获阈值，超出截断。
+ * 每字段至多 1 片：main(1023B/255B) + 单片 65535B >= 64KB。 */
+#define AUDIT_MAX_FRAGMENTS_PER_FIELD 1
 #define AUDIT_CAPTURE_FIELD_MAX (64 * 1024)
-#define AUDIT_MAX_FRAGMENTED_FIELD_BYTES (AUDIT_FRAGMENT_PAYLOAD_MAX * AUDIT_MAX_FRAGMENTS_PER_FIELD)
+#define AUDIT_MAX_FRAGMENTED_FIELD_BYTES AUDIT_FRAGMENT_PAYLOAD_MAX
 #define AUDIT_SQL_CAPTURE_MAX AUDIT_CAPTURE_FIELD_MAX
 #define AUDIT_PARAMS_CAPTURE_MAX AUDIT_CAPTURE_FIELD_MAX
 

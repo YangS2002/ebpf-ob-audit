@@ -15,8 +15,13 @@ MongoInsertTask::MongoInsertTask(std::string agent_id, std::string server_ip, st
 	: agent_id_(std::move(agent_id)), server_ip_(std::move(server_ip)), records_(std::move(records)), events_(std::move(events)),
 	  parse_ns_(parse_ns), upload_total_ns_(upload_total_ns)
 {
-	for (auto &event : events_)
-		event.record = reinterpret_cast<const struct event *>(records_.data() + event.offset);
+	// records_ 是本任务持有的可写副本；重锚点指针到副本，并从 ob_raw 按 OB_*_OFF
+	// 抽取标量字段回填到 event(BPF 端不再解析)。mongodb_sink 随后按填好的字段建 BSON。
+	for (auto &event : events_) {
+		struct event *rec = reinterpret_cast<struct event *>(records_.data() + event.offset);
+		event_fill_scalars_from_ob_raw(rec);
+		event.record = rec;
+	}
 }
 
 void MongoInsertTask::complete(mongo_insert_result result)

@@ -459,7 +459,11 @@ static bool read_variable_event(FILE *file, std::vector<char> *buf)
 	memcpy(buf->data(), &total_size, sizeof(total_size));
 	if (fread(buf->data() + sizeof(total_size), total_size - sizeof(total_size), 1, file) != 1)
 		return false;
-	return variable_event_valid(reinterpret_cast<const event *>(buf->data()), total_size);
+	if (!variable_event_valid(reinterpret_cast<const event *>(buf->data()), total_size))
+		return false;
+	// .adt 保存 BPF 原样输出(标量未解析)，读出后按 ob_raw 回填标量供 CSV 使用。
+	event_fill_scalars_from_ob_raw(reinterpret_cast<event *>(buf->data()));
+	return true;
 }
 
 static bool load_events(FILE *file, std::vector<std::vector<char>> *events)

@@ -400,22 +400,31 @@ static void mark_pending_lost(writer_state *state, unsigned long long event_seq)
 		state->pending_lost_records++;
 }
 
-// 未分片小事件：只拷 total_size 到栈上桶大小缓冲，填 server_ip 再发。
+// 未分片小事件：直接从内核 ringbuf 拷入发送批次，省掉中间栈缓冲整拷。
 static int append_event(writer_state *state, const event *e, unsigned long long agent_receive_ns)
 {
 	if (!event_compact_size_valid(e))
 		return 0;
 	unsigned int total = e->total_size;
-	char buf[AUDIT_RINGBUF_BUCKET_MAIN];
-	if (total > sizeof(buf))
+	if (total > AUDIT_RINGBUF_BUCKET_MAIN)
 		return 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+	// perf 模式保留栈缓冲：需按序写入 before/after_submit 时间戳。
+	char buf[AUDIT_RINGBUF_BUCKET_MAIN];
 	std::memcpy(buf, e, total);
 	event *out = reinterpret_cast<event *>(buf);
-#if AUDIT_PERF_FIELDS_ENABLED
 	out->perf_agent_receive_ns = agent_receive_ns;
-#endif
 	std::memcpy(out->server_ip, state->server_ip, sizeof(out->server_ip));
 	return emit_record(state, buf, total);
+#else
+	(void)agent_receive_ns;
+	// 快路径：单次拷贝(ringbuf→批次)，拷入后由 sender 就地回填 server_ip。
+	bool submitted = state->grpc.submit(reinterpret_cast<const char *>(e), total,
+					    state->server_ip, offsetof(event, server_ip), sizeof(e->server_ip));
+	if (!submitted)
+		state->send_buffer_dropped_records++;
+	return 0;
+#endif
 }
 
 // 合并完成的变长事件：段可写，直接在段头填 server_ip 再发。
@@ -686,16 +695,37 @@ int main(int argc, char **argv)
 		if (!metrics_thread)
 			agent_log_error("event=metrics_thread_create_failed");
 
-		while (!exiting) {
-			// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
-			err = ring_buffer__poll(rb, 100);
-			if (err == -EINTR) {
-				err = 0;
-				break;
-			}
-			if (err < 0) {
-				agent_log_error("event=ring_buffer_poll_failed err=%d", err);
-				break;
+		// BPF 侧 submit 使用 BPF_RB_NO_WAKEUP：不依赖 epoll 唤醒，改为自轮询。
+		// 空闲退避：连续空轮询时睡眠从 idle_min 线性增长到 idle_max，降低空闲空转 CPU；
+		// 一旦抽到数据立即清零(0 睡，低延迟)。高负载下 consume 持续 >0，永不睡，无延迟影响。
+		{
+			// 实测(agent perf)：睡眠/唤醒的上下文切换占 agent CPU ~29%，是最大头。
+			// 稳态负载下「抽干→睡」循环频率 ≈ 1/idle_min，idle_min=1ms 即 ~1000 次/s。
+			// idle_max=5ms 对齐 gRPC flush_interval(5ms)：ringbuf 层延迟本来就被
+			// 批次 flush 兜底，更短的轮询上限没有收益，只增加 schedule churn。
+			const unsigned int idle_min_us = 1000;
+			const unsigned int idle_max_us = 5000;
+			const unsigned int idle_step_us = 500;
+			unsigned int idle_sleep_us = 0;
+			while (!exiting) {
+				int consumed = ring_buffer__consume(rb);
+				if (consumed == -EINTR) {
+					err = 0;
+					break;
+				}
+				if (consumed < 0) {
+					err = consumed;
+					agent_log_error("event=ring_buffer_consume_failed err=%d", err);
+					break;
+				}
+				if (consumed > 0) {
+					idle_sleep_us = 0;
+					continue;
+				}
+				idle_sleep_us = idle_sleep_us < idle_min_us
+							? idle_min_us
+							: (idle_sleep_us + idle_step_us > idle_max_us ? idle_max_us : idle_sleep_us + idle_step_us);
+				std::this_thread::sleep_for(std::chrono::microseconds(idle_sleep_us));
 			}
 		}
 

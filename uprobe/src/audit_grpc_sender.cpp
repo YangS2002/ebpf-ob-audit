@@ -706,71 +706,89 @@ void AuditGrpcSender::stop()
 		resolver->stop();
 }
 
-bool AuditGrpcSender::submit(char *data, size_t size)
+static bool grpc_submit_locked(AuditGrpcSender::Impl *impl, const char *data, size_t size,
+			       const char *server_ip, size_t server_ip_off, size_t server_ip_len)
 {
-	if (!data || size == 0 || !impl_->enabled)
+	if (!data || size == 0 || !impl->enabled)
 		return false;
 
-#if AUDIT_PERF_FIELDS_ENABLED
-	event *hdr = reinterpret_cast<event *>(data);
-	hdr->perf_agent_after_submit_ns = monotonic_ns();
-#endif
 #if AUDIT_GRPC_TIMING_ENABLED
 	const uint64_t submit_start_ns = monotonic_ns();
 #endif
-	std::lock_guard<std::mutex> lock(impl_->mutex);
-	if (impl_->stopping) {
-		impl_->stats.dropped_records++;
-		impl_->stats.dropped_bytes += size;
+	std::lock_guard<std::mutex> lock(impl->mutex);
+	if (impl->stopping) {
+		impl->stats.dropped_records++;
+		impl->stats.dropped_bytes += size;
 		return false;
 	}
-	if (size > impl_->config.batch_bytes) {
-		impl_->stats.dropped_records++;
-		impl_->stats.dropped_bytes += size;
-		impl_->stats.dropped_oversize_records++;
-		impl_->stats.dropped_oversize_bytes += size;
+	if (size > impl->config.batch_bytes) {
+		impl->stats.dropped_records++;
+		impl->stats.dropped_bytes += size;
+		impl->stats.dropped_oversize_records++;
+		impl->stats.dropped_oversize_bytes += size;
 		return false;
 	}
 	auto now = std::chrono::steady_clock::now();
-	if (current_batch_expired_locked(impl_.get(), now))
-		seal_current_batch_locked(impl_.get());
-	if (impl_->current_batch && impl_->current_batch->payload->size() + size > impl_->pool.batch_bytes)
-		seal_current_batch_locked(impl_.get());
-	if (!impl_->current_batch) {
-		impl_->current_batch = impl_->pool.acquire();
-		if (!impl_->current_batch) {
-			impl_->stats.dropped_records++;
-			impl_->stats.dropped_bytes += size;
-			impl_->stats.dropped_no_batch_records++;
-			impl_->stats.dropped_no_batch_bytes += size;
-			update_pool_stats_locked(impl_.get());
+	if (current_batch_expired_locked(impl, now))
+		seal_current_batch_locked(impl);
+	if (impl->current_batch && impl->current_batch->payload->size() + size > impl->pool.batch_bytes)
+		seal_current_batch_locked(impl);
+	if (!impl->current_batch) {
+		impl->current_batch = impl->pool.acquire();
+		if (!impl->current_batch) {
+			impl->stats.dropped_records++;
+			impl->stats.dropped_bytes += size;
+			impl->stats.dropped_no_batch_records++;
+			impl->stats.dropped_no_batch_bytes += size;
+			update_pool_stats_locked(impl);
 			return false;
 		}
 	}
-	bool first_record = impl_->current_batch->record_count == 0;
+	bool first_record = impl->current_batch->record_count == 0;
 	if (first_record)
-		impl_->current_batch->first_record_time = now;
-	impl_->stats.accepted_records++;
-	impl_->current_batch->payload->append(data, size);
-	impl_->current_batch->record_count++;
-	impl_->queued_records++;
-	impl_->queued_bytes += size;
-	bool sealed = impl_->current_batch->payload->size() >= impl_->pool.batch_bytes;
+		impl->current_batch->first_record_time = now;
+	impl->stats.accepted_records++;
+	// 记录追加起点，追加后就地回填 server_ip / perf 时间戳，省掉调用方中间拷贝。
+	size_t start_off = impl->current_batch->payload->size();
+	impl->current_batch->payload->append(data, size);
+	if (server_ip && server_ip_len && server_ip_off + server_ip_len <= size) {
+		char *rec = &(*impl->current_batch->payload)[start_off];
+		std::memcpy(rec + server_ip_off, server_ip, server_ip_len);
+	}
+#if AUDIT_PERF_FIELDS_ENABLED
+	event *hdr = reinterpret_cast<event *>(&(*impl->current_batch->payload)[start_off]);
+	hdr->perf_agent_after_submit_ns = monotonic_ns();
+#endif
+	impl->current_batch->record_count++;
+	impl->queued_records++;
+	impl->queued_bytes += size;
+	bool sealed = impl->current_batch->payload->size() >= impl->pool.batch_bytes;
 	if (sealed)
-		seal_current_batch_locked(impl_.get());
-	update_pool_stats_locked(impl_.get());
+		seal_current_batch_locked(impl);
+	update_pool_stats_locked(impl);
 	// seal 已 notify 就绪 batch；否则仅在新 batch 首条记录时唤醒 sender arm flush 截止时间，
 	// 避免每条记录都 notify 造成的调度/futex churn。
 	if (!sealed && first_record)
-		impl_->cond.notify_one();
+		impl->cond.notify_one();
 #if AUDIT_GRPC_TIMING_ENABLED
 	const uint64_t submit_ns = monotonic_ns() - submit_start_ns;
-	impl_->stats.submit_calls++;
-	impl_->stats.total_submit_ns += submit_ns;
-	if (submit_ns > impl_->stats.max_submit_ns)
-		impl_->stats.max_submit_ns = submit_ns;
+	impl->stats.submit_calls++;
+	impl->stats.total_submit_ns += submit_ns;
+	if (submit_ns > impl->stats.max_submit_ns)
+		impl->stats.max_submit_ns = submit_ns;
 #endif
 	return true;
+}
+
+bool AuditGrpcSender::submit(char *data, size_t size)
+{
+	return grpc_submit_locked(impl_.get(), data, size, nullptr, 0, 0);
+}
+
+bool AuditGrpcSender::submit(const char *data, size_t size, const char *server_ip,
+			    size_t server_ip_off, size_t server_ip_len)
+{
+	return grpc_submit_locked(impl_.get(), data, size, server_ip, server_ip_off, server_ip_len);
 }
 
 bool AuditGrpcSender::report_metrics(const audit_agent_accounting_snapshot &snapshot)

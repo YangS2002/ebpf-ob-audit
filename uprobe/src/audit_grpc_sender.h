@@ -88,6 +88,10 @@ public:
 	void stop();
 	bool flush();
 	bool submit(char *data, size_t size);
+	// 快路径：直接从源缓冲(内核 ringbuf)拷入发送批次，避免调用方中间栈缓冲；
+	// 拷入后在批次内就地回填 server_ip（server_ip_off 为 event 内偏移）。
+	bool submit(const char *data, size_t size, const char *server_ip,
+		    size_t server_ip_off, size_t server_ip_len);
 	bool report_metrics(const audit_agent_accounting_snapshot &snapshot);
 	bool enabled() const;
 	std::string current_collector() const;
