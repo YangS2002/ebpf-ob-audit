@@ -18,6 +18,7 @@
 #include "collector_loss_metrics.h"
 #include "collector_registry.h"
 #include "collector_timing.h"
+#include "local_ip.h"
 #include "mongodb_sink.h"
 #include "mongo_insert_worker.h"
 #include "simple_yaml.h"
@@ -213,7 +214,7 @@ private:
 struct collector_app_config {
 	std::string listen_addr = "0.0.0.0:50051";
 	std::string storage = "local";
-	bool registry_enabled = false;
+	bool registry_enabled = true;
 	collector_registry_config registry;
 	mongodb_config mongodb;
 };
@@ -259,6 +260,23 @@ static bool load_config_file(const char *path, collector_app_config *config)
 	config->mongodb.bulk_max_records = yaml.get_u32("mongodb.bulk_max_records", config->mongodb.bulk_max_records);
 	config->mongodb.bulk_max_bytes = yaml.get_u32("mongodb.bulk_max_bytes", config->mongodb.bulk_max_bytes);
 	config->mongodb.ordered_insert = yaml.get_bool("mongodb.ordered_insert", config->mongodb.ordered_insert);
+	// advertise_addr 留空时自动探测本机 IPv4 并拼接监听端口，使各机 collector 配置文件可完全一致。
+	if (config->registry.advertise_addr.empty()) {
+		std::string ip = detect_local_ipv4(endpoint_host(config->registry.etcd_endpoint));
+		if (!ip.empty()) {
+			std::string port = "50051";
+			std::string::size_type pos = config->listen_addr.rfind(':');
+			if (pos != std::string::npos)
+				port = config->listen_addr.substr(pos + 1);
+			config->registry.advertise_addr = ip + ":" + port;
+		}
+	}
+	// instance_id 未显式配置时按本机 advertise 地址派生：collector-<advertise_addr>
+	// （advertise_addr 也为空则回退 "collector"）。
+	if (config->registry.collector_id.empty())
+		config->registry.collector_id = config->registry.advertise_addr.empty()
+			? std::string("collector")
+			: ("collector-" + config->registry.advertise_addr);
 	return true;
 }
 

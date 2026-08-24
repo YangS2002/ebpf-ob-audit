@@ -1,0 +1,26 @@
+# agent 运行时默认配置（所有 agent 节点通用，无需逐机修改）。
+# 运行方式：sudo ./start_agent.sh （BPF 需要 root/CAP_BPF）。
+#
+# 只有两类值需要按环境确认：
+#   - collector.discovery.etcd_endpoints：etcd 地址（必填）
+#   - uprobe.observer_path / offset：各机相同，用默认值即可
+# server_ip 留空 → agent 启动时自动探测本机出网 IPv4；
+# agent.id 留空 → 自动派生 agent-<server_ip>。
+
+uprobe:
+  # observer 可执行文件路径；各节点部署路径一致时用此默认值。
+  observer_path: /home/yangshuo17/ob3node/bin/observer
+  # ObMySQLRequestManager::record_request 入口偏移，同版本 observer 相同。
+  offset: "0x000000000bf18950"
+
+collector:
+  discovery:
+    # 是否启用 etcd 服务发现（默认 true，可省略）。
+    enabled: true
+    # etcd 地址（必填）。
+    etcd_endpoints: http://7.27.43.145:2379
+    service_name: audit-collector
+
+agent:
+  # 本机地址，留空自动探测本机 IPv4。
+  server_ip: ""

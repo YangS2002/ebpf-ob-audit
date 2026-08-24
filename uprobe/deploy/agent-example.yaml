@@ -1,0 +1,36 @@
+# agent 运行时配置，由 deploy_agent.py 根据 agent-deploy YAML 生成。
+# 以下默认配置,在50K QPS下,3个节点的OBsever不产生任何丢失
+# 必填项: enabled: true, etcd_endpoints, observer_path, server_ip
+collector:
+  addr: "7.39.182.101:2379" 
+  discovery:
+    enabled: true
+    etcd_endpoints: "http://7.27.43.145:2379"  # 如果写了 discovery.enabled: true，则必须写 etcd_endpoints。
+    service_name: audit-collector
+    selection_policy: hash_agent
+    watch_enabled: true
+    refresh_interval_ms: 30000
+    rebuild_debounce_ms: 300
+buffer:
+  pending_ringbuf_bytes: 67108864
+  event_seq_checkpoint_path: /home/yangshuo17/ebpf-ob-audit-agent/run/event_seq.ckpt
+  event_seq_reserve_step: 1000000
+grpc:
+  batch_bytes: 1048576
+  flush_interval_ms: 1000
+  timeout_ms: 2000
+  pool_bytes: 268435456
+  upload_concurrency: 4
+  max_retries: 3
+  retry_initial_ms: 100
+  retry_max_ms: 500
+  keepalive_time_ms: 15000
+  keepalive_timeout_ms: 5000
+  keepalive_permit_without_calls: true
+uprobe:
+  observer_path: /home/oceanbase/bin/observer # 必填项
+  offset: 0x000000000bf18950 # ob版本4.2.5.5,该值不用修改
+  output_file: out.adt # 如果没有collector, 默认二进制写到本地, tools下有adt_to_csv可以转换为csv文件查看
+agent:
+  id: agent-ob1-10.191.144.76
+  server_ip: 10.191.144.76 # 必填项

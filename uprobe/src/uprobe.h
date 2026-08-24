@@ -8,10 +8,13 @@
 #define AUDIT_PERF_FIELDS_ENABLED 0
 #endif
 
+/* v7/v8: raw-record offload. BPF bulk-copies the contiguous OB audit-record
+ * fixed region into event.ob_raw and stops parsing scalars in-kernel; the
+ * collector extracts scalar fields from ob_raw by OB_AUDIT_*_OFF offset. */
 #if AUDIT_PERF_FIELDS_ENABLED
-#define AUDIT_FILE_VERSION_VALUE 6
+#define AUDIT_FILE_VERSION_VALUE 8
 #else
-#define AUDIT_FILE_VERSION_VALUE 5
+#define AUDIT_FILE_VERSION_VALUE 7
 #endif
 
 #define TASK_COMM_LEN 16
@@ -76,6 +79,10 @@
 #define OB_AUDIT_PARAMS_VALUE_PTR_OFF 1360
 #define OB_AUDIT_STMT_TYPE_OFF 1684
 #define OB_AUDIT_TRANS_STATUS_OFF 1720
+
+/* 连续定长区大小：覆盖所有用到的标量/ptr-len/时间戳偏移(最高 trans_status 1720+4)，
+ * 8 字节对齐取 1728。BPF 一次 bulk 读整段到 event.ob_raw，collector 按 OB_*_OFF 解析。 */
+#define OB_AUDIT_RAW_FIXED_SIZE 1728
 
 #define OB_EXEC_RPC_SEND_TS_OFF 8
 #define OB_EXEC_RECEIVE_TS_OFF 16
@@ -225,6 +232,11 @@ struct event {
 		char server_ip[MAX_IP_LEN];// BPF 端留空，用户态消费成功后填充本机 agent IP。
 		char sql_id[MAX_SQL_ID_LEN];//
 
+	/* OB 审计记录的连续定长区原始拷贝(BPF 一次 bulk 读)。
+	 * BPF 端不再逐字段解析标量，collector 从这里按 OB_*_OFF 抽取并回填上面的标量字段。
+	 * 注意：payload 必须紧跟其后，event_payload_offset() 依赖 offsetof(payload)。 */
+	unsigned char ob_raw[OB_AUDIT_RAW_FIXED_SIZE];
+
 	char payload[AUDIT_EVENT_PAYLOAD_SIZE];
 };
 
@@ -285,6 +297,55 @@ static inline const char *event_params_value(const struct event *e)
 	return event_query_sql(e) + e->query_sql_payload_len;
 }
 
+/* collector 侧：从 BPF bulk 拷入的 ob_raw 定长区按 OB_*_OFF 抽取标量字段并回填。
+ * 复刻原 BPF handle_uprobe 的读取语义(含 elapsed/execute 派生回退)。
+ * 不触碰：event_seq/framing/flags/payload 长度(BPF 已填)与 server_ip(agent/collector 填)。 */
+static inline void event_fill_scalars_from_ob_raw(struct event *e)
+{
+	const unsigned char *r = e->ob_raw;
+	auto rd_i64 = [r](unsigned int off) { long long v; std::memcpy(&v, r + off, sizeof(v)); return v; };
+	auto rd_u64 = [r](unsigned int off) { unsigned long long v; std::memcpy(&v, r + off, sizeof(v)); return v; };
+	auto rd_i32 = [r](unsigned int off) { int v; std::memcpy(&v, r + off, sizeof(v)); return v; };
+
+	e->ret_code = rd_i32(OB_AUDIT_STATUS_OFF);
+	std::memcpy(&e->trace_id, r + OB_AUDIT_TRACE_ID_OFF, sizeof(e->trace_id));
+	e->request_id = rd_u64(OB_AUDIT_REQUEST_ID_OFF);
+	e->session_id = rd_u64(OB_AUDIT_SESSION_ID_OFF);
+	e->proxy_session_id = rd_u64(OB_AUDIT_PROXY_SESSION_ID_OFF);
+	e->tenant_id = rd_u64(OB_AUDIT_TENANT_ID_OFF);
+	e->effective_tenant_id = rd_u64(OB_AUDIT_EFFECTIVE_TENANT_ID_OFF);
+	e->user_id = rd_u64(OB_AUDIT_USER_ID_OFF);
+	e->db_id = rd_u64(OB_AUDIT_DB_ID_OFF);
+	e->affected_rows = rd_u64(OB_AUDIT_AFFECTED_ROWS_OFF);
+	e->return_rows = rd_u64(OB_AUDIT_RETURN_ROWS_OFF);
+	e->transaction_hash = rd_u64(OB_AUDIT_TRANS_ID_OFF);
+	e->plan_type = (enum ObPhyPlanType)rd_i32(OB_AUDIT_PLAN_TYPE_OFF);
+	e->stmt_type = rd_i32(OB_AUDIT_STMT_TYPE_OFF);
+	e->trans_status = (enum ObTransStatus)rd_i32(OB_AUDIT_TRANS_STATUS_OFF);
+	std::memcpy(e->sql_id, r + OB_AUDIT_SQL_ID_OFF, sizeof(e->sql_id));
+
+	long long receive_ts = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_RECEIVE_TS_OFF);
+	long long process_executor_ts = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_PROCESS_EXECUTOR_TS_OFF);
+	long long executor_end_ts = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_EXECUTOR_END_TS_OFF);
+	long long multistmt_start_ts = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_MULTI_STMT_START_TS_OFF);
+	long long elapsed_t = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_ELAPSED_T_OFF);
+	long long executor_t = rd_i64(OB_AUDIT_EXEC_TIMESTAMP_OFF + OB_EXEC_EXECUTOR_T_OFF);
+	e->request_timestamp = receive_ts;
+	e->elapsed_time = elapsed_t;
+	e->execute_time = executor_t;
+	if (e->elapsed_time <= 0 && executor_end_ts > 0) {
+		if (multistmt_start_ts > 0)
+			e->elapsed_time = executor_end_ts - multistmt_start_ts;
+		else if (receive_ts > 0)
+			e->elapsed_time = executor_end_ts - receive_ts;
+	}
+	if (e->execute_time <= 0 && executor_end_ts > 0 && process_executor_ts > 0)
+		e->execute_time = executor_end_ts - process_executor_ts;
+
+	std::memcpy(e->user_client_ip, r + OB_AUDIT_USER_CLIENT_ADDR_OFF, sizeof(e->user_client_ip));
+	std::memcpy(e->client_ip, r + OB_AUDIT_CLIENT_ADDR_OFF, sizeof(e->client_ip));
+}
+
 static inline bool read_compact_event(FILE *file, struct event *e)
 {
 	unsigned int total_size = 0;
@@ -296,7 +357,11 @@ static inline bool read_compact_event(FILE *file, struct event *e)
 	e->total_size = total_size;
 	if (fread((char *)e + sizeof(total_size), total_size - sizeof(total_size), 1, file) != 1)
 		return false;
-	return event_compact_size_valid(e) != 0;
+	if (event_compact_size_valid(e) == 0)
+		return false;
+	// .adt 记录保存的是 BPF 原样输出(标量未解析)，读出后按 ob_raw 回填标量。
+	event_fill_scalars_from_ob_raw(e);
+	return true;
 }
 #endif
 

@@ -26,6 +26,7 @@ extern "C" {
 #include "audit_accounting.h"
 #include "audit_grpc_sender.h"
 #include "audit_loss_metrics.h"
+#include "local_ip.h"
 #include "ring_buffer/ring_buffer.h"
 #include "simple_yaml.h"
 
@@ -64,7 +65,7 @@ struct app_config {
 	std::string collector_discovery_etcd_endpoints;
 	std::string collector_discovery_service_name;
 	std::string collector_discovery_selection_policy;
-	bool collector_discovery = false;
+	bool collector_discovery = true;
 	bool collector_discovery_watch_enabled = true;
 	uint32_t collector_discovery_refresh_interval_ms = 30000;
 	uint32_t collector_discovery_rebuild_debounce_ms = 300;
@@ -82,6 +83,8 @@ struct app_config {
 	bool grpc_keepalive_permit_without_calls = true;
 	std::string event_seq_checkpoint_path;
 	unsigned long long event_seq_reserve_step = DEFAULT_EVENT_SEQ_RESERVE_STEP;
+	std::string observer_path;
+	std::string offset_text;
 };
 
 struct writer_state {
@@ -164,6 +167,14 @@ static bool load_config(const char *path, app_config *config)
 	config->grpc_keepalive_permit_without_calls = yaml.get_bool("grpc.keepalive_permit_without_calls", config->grpc_keepalive_permit_without_calls);
 	config->event_seq_checkpoint_path = yaml.get_string("buffer.event_seq_checkpoint_path", config->event_seq_checkpoint_path);
 	config->event_seq_reserve_step = yaml.get_u64("buffer.event_seq_reserve_step", config->event_seq_reserve_step);
+	config->observer_path = yaml.get_string("uprobe.observer_path", config->observer_path);
+	config->offset_text = yaml.get_string("uprobe.offset", config->offset_text);
+	// server_ip 留空时自动探测本机出网 IPv4（优先按 etcd 端点选路），使各机 agent 配置文件可完全一致。
+	if (config->server_ip_text.empty())
+		config->server_ip_text = detect_local_ipv4(endpoint_host(config->collector_discovery_etcd_endpoints));
+	// agent_id 未显式配置时按本机地址派生：agent-<server_ip>（server_ip 也为空则回退 "agent"）。
+	if (config->agent_id.empty())
+		config->agent_id = config->server_ip_text.empty() ? std::string("agent") : ("agent-" + config->server_ip_text);
 	return true;
 }
 
@@ -223,7 +234,7 @@ static bool bpf_seq_set(uprobe_bpf *skel, unsigned long long value)
 static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 {
 	audit_grpc_config grpc_config;
-	grpc_config.agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	grpc_config.agent_id = config.agent_id;
 	grpc_config.server_ip = config.server_ip_text;
 	grpc_config.collector_addr = config.collector_addr;
 	grpc_config.file_version = AUDIT_FILE_VERSION;
@@ -258,7 +269,7 @@ static void print_startup_status(const char *target, unsigned long long offset,
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
 	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_pool_bytes=%llu grpc_upload_concurrency=%u grpc_max_retries=%u grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
-	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
+	       config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       state.pending.capacity(),
 	       config.grpc_batch_bytes,
@@ -400,22 +411,31 @@ static void mark_pending_lost(writer_state *state, unsigned long long event_seq)
 		state->pending_lost_records++;
 }
 
-// 未分片小事件：只拷 total_size 到栈上桶大小缓冲，填 server_ip 再发。
+// 未分片小事件：直接从内核 ringbuf 拷入发送批次，省掉中间栈缓冲整拷。
 static int append_event(writer_state *state, const event *e, unsigned long long agent_receive_ns)
 {
 	if (!event_compact_size_valid(e))
 		return 0;
 	unsigned int total = e->total_size;
-	char buf[AUDIT_RINGBUF_BUCKET_MAIN];
-	if (total > sizeof(buf))
+	if (total > AUDIT_RINGBUF_BUCKET_MAIN)
 		return 0;
+#if AUDIT_PERF_FIELDS_ENABLED
+	// perf 模式保留栈缓冲：需按序写入 before/after_submit 时间戳。
+	char buf[AUDIT_RINGBUF_BUCKET_MAIN];
 	std::memcpy(buf, e, total);
 	event *out = reinterpret_cast<event *>(buf);
-#if AUDIT_PERF_FIELDS_ENABLED
 	out->perf_agent_receive_ns = agent_receive_ns;
-#endif
 	std::memcpy(out->server_ip, state->server_ip, sizeof(out->server_ip));
 	return emit_record(state, buf, total);
+#else
+	(void)agent_receive_ns;
+	// 快路径：单次拷贝(ringbuf→批次)，拷入后由 sender 就地回填 server_ip。
+	bool submitted = state->grpc.submit(reinterpret_cast<const char *>(e), total,
+					    state->server_ip, offsetof(event, server_ip), sizeof(e->server_ip));
+	if (!submitted)
+		state->send_buffer_dropped_records++;
+	return 0;
+#endif
 }
 
 // 合并完成的变长事件：段可写，直接在段头填 server_ip 再发。
@@ -571,15 +591,22 @@ static unsigned long long parse_offset(const char *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3 || argc > 5) {
-		fprintf(stderr, "Usage: %s <target-path> <offset> [config-file]\n", argv[0]);
+	if (argc > 5) {
+		fprintf(stderr, "Usage: %s [config-file]\n", argv[0]);
+		fprintf(stderr, "       %s <target-path> <offset> [config-file]\n", argv[0]);
 		fprintf(stderr, "       %s <target-path> <offset> <ignored-output-file> <config-file>\n", argv[0]);
 		return 1;
 	}
 
-	const char *target = argv[1];
-	unsigned long long offset = parse_offset(argv[2]);
-	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "agent.yaml");
+	// argc>=3：CLI 显式给出 target+offset，覆盖配置文件（兼容现有部署脚本）。
+	// argc<=2：配置文件驱动，target/offset 来自 uprobe.observer_path/uprobe.offset；
+	//          argv[1]（若有）为配置文件路径。
+	const bool cli_target = argc >= 3;
+	const char *config_file;
+	if (cli_target)
+		config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "agent.yaml");
+	else
+		config_file = argc >= 2 ? argv[1] : "agent.yaml";
 	const char *log_file = getenv("UPROBE_LOG_FILE");
 	if (!log_file || !*log_file)
 		log_file = "agent.log";
@@ -593,6 +620,18 @@ int main(int argc, char **argv)
 	std::thread *metrics_thread = nullptr;
 	load_config(config_file, &config);
 
+	// observer_path 为必填项：CLI 优先，否则取 uprobe.observer_path；两者皆空则报错退出。
+	std::string target_str = cli_target ? std::string(argv[1]) : config.observer_path;
+	if (target_str.empty()) {
+		fprintf(stderr, "observer_path is required: set uprobe.observer_path in %s or pass <target-path> on CLI\n", config_file);
+		agent_log_error("event=observer_path_missing config=%s", config_file);
+		return 1;
+	}
+	const char *target = target_str.c_str();
+	unsigned long long offset = cli_target
+		? parse_offset(argv[2])
+		: (config.offset_text.empty() ? 0ULL : parse_offset(config.offset_text.c_str()));
+
 	std::unique_ptr<writer_state> state(new (std::nothrow) writer_state(config.pending_ringbuf_bytes));
 	if (!state || !state->pending.valid()) {
 		agent_log_error("event=pending_ringbuf_alloc_failed bytes=%zu", config.pending_ringbuf_bytes);
@@ -603,7 +642,7 @@ int main(int argc, char **argv)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state->server_ip, config.server_ip_text.c_str());
-	state->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	state->agent_id = config.agent_id;
 	state->server_ip_text = config.server_ip_text;
 	if (!init_grpc_sender(&state->grpc, config)) {
 		agent_log_error("event=grpc_sender_start_failed");
@@ -686,16 +725,37 @@ int main(int argc, char **argv)
 		if (!metrics_thread)
 			agent_log_error("event=metrics_thread_create_failed");
 
-		while (!exiting) {
-			// 等待ringbuf事件，没有事件每100ms返回一次，检查exiting标志
-			err = ring_buffer__poll(rb, 100);
-			if (err == -EINTR) {
-				err = 0;
-				break;
-			}
-			if (err < 0) {
-				agent_log_error("event=ring_buffer_poll_failed err=%d", err);
-				break;
+		// BPF 侧 submit 使用 BPF_RB_NO_WAKEUP：不依赖 epoll 唤醒，改为自轮询。
+		// 空闲退避：连续空轮询时睡眠从 idle_min 线性增长到 idle_max，降低空闲空转 CPU；
+		// 一旦抽到数据立即清零(0 睡，低延迟)。高负载下 consume 持续 >0，永不睡，无延迟影响。
+		{
+			// 实测(agent perf)：睡眠/唤醒的上下文切换占 agent CPU ~29%，是最大头。
+			// 稳态负载下「抽干→睡」循环频率 ≈ 1/idle_min，idle_min=1ms 即 ~1000 次/s。
+			// idle_max=5ms 对齐 gRPC flush_interval(5ms)：ringbuf 层延迟本来就被
+			// 批次 flush 兜底，更短的轮询上限没有收益，只增加 schedule churn。
+			const unsigned int idle_min_us = 1000;
+			const unsigned int idle_max_us = 5000;
+			const unsigned int idle_step_us = 500;
+			unsigned int idle_sleep_us = 0;
+			while (!exiting) {
+				int consumed = ring_buffer__consume(rb);
+				if (consumed == -EINTR) {
+					err = 0;
+					break;
+				}
+				if (consumed < 0) {
+					err = consumed;
+					agent_log_error("event=ring_buffer_consume_failed err=%d", err);
+					break;
+				}
+				if (consumed > 0) {
+					idle_sleep_us = 0;
+					continue;
+				}
+				idle_sleep_us = idle_sleep_us < idle_min_us
+							? idle_min_us
+							: (idle_sleep_us + idle_step_us > idle_max_us ? idle_max_us : idle_sleep_us + idle_step_us);
+				std::this_thread::sleep_for(std::chrono::microseconds(idle_sleep_us));
 			}
 		}
 
