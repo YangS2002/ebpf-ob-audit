@@ -692,10 +692,97 @@ def print_summary(results: List[NodeResult]) -> None:
         print(f"{status:6} {result.action:12} {result.name:8} {result.ip:15} {result.detail}")
 
 
+def render_start_script_for_node(node: Node) -> str:
+    observer = node.observer_path or "<observer-path>"
+    offset = node.offset or "<offset>"
+    output_file = node.output_file or "out.adt"
+    incomplete = "" if node.observer_path and node.offset else "\necho 'startup command incomplete: set observer_path and offset in conf/agent.yaml' >&2\nexit 1\n"
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
+export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
+mkdir -p "$DEPLOY_HOME/logs"
+mkdir -p "$DEPLOY_HOME/run"
+rm -f "$DEPLOY_HOME"/logs/*
+export UPROBE_LOG_FILE="$DEPLOY_HOME/agent.log"
+: > "$UPROBE_LOG_FILE"
+{incomplete}exec "$DEPLOY_HOME/bin/uprobe" "{observer}" "{offset}" "$DEPLOY_HOME/{output_file}" "$DEPLOY_HOME/conf/agent.yaml"
+"""
+
+
+def render_install_note_agent(node: Node, archive_name: str) -> str:
+    dh = node.deploy_home
+    return "\n".join([
+        f"# eBPF OB Audit agent 手动部署  node={node.name} ip={node.ip}",
+        "# 前置: 内核 >=5.8; root/CAP_BPF; 目标机存在 observer 二进制。",
+        "",
+        "1) 上传到目标机:",
+        f"   scp {archive_name} <user>@{node.ip}:/tmp/",
+        "2) 解包到部署目录:",
+        f"   mkdir -p {dh} && tar -xzf /tmp/{archive_name} -C {dh}",
+        "3) 核对 conf/agent.yaml: agent.server_ip / uprobe.observer_path / uprobe.offset /",
+        "   collector.discovery.etcd_endpoints / collector.discovery.service_name (etcd 模式)。",
+        "4) 启动 (需 root 加载 BPF、attach uprobe):",
+        f"   cd {dh} && sudo nohup ./run/start_agent.sh >/dev/null 2>&1 &",
+        f"5) 日志: tail -f {dh}/agent.log",
+        f"6) 停止: sudo pkill -f '{dh}/bin/uprobe'",
+        "",
+    ])
+
+
+def build_lib_cache(binary: Path, work_dir: Path) -> Path:
+    lib_cache = work_dir / "_libcache"
+    if lib_cache.exists():
+        shutil.rmtree(lib_cache)
+    lib_cache.mkdir(parents=True)
+    collect_libraries(binary, lib_cache)
+    return lib_cache
+
+
+def package_node(config: DeployConfig, node: Node, binary: Path, lib_cache: Path, work_dir: Path) -> NodeResult:
+    root = work_dir / f"agent-{node.name}-{node.ip}"
+    if root.exists():
+        shutil.rmtree(root)
+    for subdir in ("bin", "lib", "run", "conf", "logs"):
+        (root / subdir).mkdir(parents=True)
+    shutil.copy2(binary, root / "bin" / "uprobe")
+    for lib in lib_cache.iterdir():
+        shutil.copy2(lib, root / "lib" / lib.name)
+    write_text(root / "run" / "start_agent.sh", render_start_script_for_node(node), 0o755)
+    write_text(root / "conf" / "agent.yaml", render_agent_yaml(node))
+    archive = work_dir / f"uprobe-agent-{node.name}-{node.ip}.tar.gz"
+    write_text(root / "INSTALL.txt", render_install_note_agent(node, archive.name))
+    if archive.exists():
+        archive.unlink()
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(root, arcname=".")
+    return NodeResult(node.name, node.ip, "package", True, str(archive))
+
+
+def package_all(config: DeployConfig, build_dir: Path, skip_build: bool, continue_on_failure: bool) -> List[NodeResult]:
+    validate_agent_runtime(config)
+    build_agent(skip_build)
+    binary = verify_agent_binary()
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lib_cache = build_lib_cache(binary, build_dir)
+    results: List[NodeResult] = []
+    for node in config.nodes:
+        try:
+            result = package_node(config, node, binary, lib_cache, build_dir)
+            print(f"PACKAGE OK {node.name} {node.ip}: {result.detail}")
+            results.append(result)
+        except DeployError as exc:
+            print(f"PACKAGE FAIL {node.name} {node.ip}: {exc}", file=sys.stderr)
+            results.append(NodeResult(node.name, node.ip, "package", False, str(exc)))
+            if not continue_on_failure:
+                break
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build, package, deploy, start, stop, clean, and check uprobe agents over SSH.")
     parser.add_argument("-c", "--config", required=True, help="OBD-like deploy yaml path")
-    parser.add_argument("--action", choices=["deploy", "deploy-start", "start", "stop", "status", "clean", "restart"], default="deploy", help="remote action")
+    parser.add_argument("--action", choices=["deploy", "deploy-start", "start", "stop", "status", "clean", "restart", "package"], default="deploy", help="remote action; 'package' builds self-contained per-node tarballs locally (no SSH)")
     parser.add_argument("--skip-build", action="store_true", help="skip local make build")
     parser.add_argument("--dry-run", action="store_true", help="print commands without modifying remote machines")
     parser.add_argument("--continue-on-failure", action="store_true", help="continue remaining nodes after a node fails")
@@ -742,6 +829,10 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action == "package":
+            results = package_all(config, build_dir, args.skip_build, args.continue_on_failure)
+            print_summary(results)
+            return 0 if results and all(result.ok for result in results) else 1
         if args.action in ("start", "deploy-start"):
             validate_agent_runtime(config)
         if config.password:

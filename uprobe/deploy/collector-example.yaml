@@ -1,0 +1,35 @@
+# collector 运行时配置，由 deploy_collector.py 根据 collector-deploy YAML 生成。
+# 请不要手工修改远端该文件；需要变更时修改部署 YAML 的 global、节点字段或 override。
+collector:
+  listen_addr: "0.0.0.0:50051" # 必填项 ,监听地址,agent连接到这个端口,要保证放行
+  registry:
+    enabled: true
+    etcd_endpoints: "http://7.27.43.145:2379" # 必填项 ,etcd 服务器地址
+    service_name: audit-collector
+    instance_id: collector-50051
+    advertise_addr: "10.191.78.154:50051" # 必填项 本机地址,也是注册到etcd的地址
+    lease_ttl_sec: 10
+    keepalive_interval_sec: 3
+storage:
+  type: mongodb
+mongodb:
+  uri: "mongodb://ocadmocean163:23XEvPer8_7zx@10.200.67.239:30000,10.204.43.200:30000/admin" # 必填项
+  database: ob_audit
+  collection: audit_events
+  metrics_collection: audit_pipeline_metrics # 丢失等统计信息.
+  event_ttl_days: 3
+  metrics_ttl_days: 1
+  app_name: ebpf-ob-audit-collector
+  write_concern: w1
+  connect_timeout_ms: 2000
+  server_selection_timeout_ms: 3000
+  socket_timeout_ms: 30000
+  pool_min_size: 1
+  pool_max_size: 4
+  insert_concurrency: 4
+  bulk_max_records: 1000
+  bulk_max_bytes: 4194304
+  ordered_insert: false
+  schema_collection: audit_schemas
+  schema_file_path: audit_schema.json
+  write_concern_wtimeout_ms: 2000

@@ -18,6 +18,7 @@ uprobe/test/*.adt
 *.txt
 uprobe/.deploy_output
 uprobe/.deploy_output_collector
+uprobe/.deploy_bundle
 uprobe/.output
 *.pyc
 uprobe/test/distributed_sql_test/out

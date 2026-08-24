@@ -26,6 +26,7 @@ extern "C" {
 #include "audit_accounting.h"
 #include "audit_grpc_sender.h"
 #include "audit_loss_metrics.h"
+#include "local_ip.h"
 #include "ring_buffer/ring_buffer.h"
 #include "simple_yaml.h"
 
@@ -64,7 +65,7 @@ struct app_config {
 	std::string collector_discovery_etcd_endpoints;
 	std::string collector_discovery_service_name;
 	std::string collector_discovery_selection_policy;
-	bool collector_discovery = false;
+	bool collector_discovery = true;
 	bool collector_discovery_watch_enabled = true;
 	uint32_t collector_discovery_refresh_interval_ms = 30000;
 	uint32_t collector_discovery_rebuild_debounce_ms = 300;
@@ -82,6 +83,8 @@ struct app_config {
 	bool grpc_keepalive_permit_without_calls = true;
 	std::string event_seq_checkpoint_path;
 	unsigned long long event_seq_reserve_step = DEFAULT_EVENT_SEQ_RESERVE_STEP;
+	std::string observer_path;
+	std::string offset_text;
 };
 
 struct writer_state {
@@ -164,6 +167,14 @@ static bool load_config(const char *path, app_config *config)
 	config->grpc_keepalive_permit_without_calls = yaml.get_bool("grpc.keepalive_permit_without_calls", config->grpc_keepalive_permit_without_calls);
 	config->event_seq_checkpoint_path = yaml.get_string("buffer.event_seq_checkpoint_path", config->event_seq_checkpoint_path);
 	config->event_seq_reserve_step = yaml.get_u64("buffer.event_seq_reserve_step", config->event_seq_reserve_step);
+	config->observer_path = yaml.get_string("uprobe.observer_path", config->observer_path);
+	config->offset_text = yaml.get_string("uprobe.offset", config->offset_text);
+	// server_ip 留空时自动探测本机出网 IPv4（优先按 etcd 端点选路），使各机 agent 配置文件可完全一致。
+	if (config->server_ip_text.empty())
+		config->server_ip_text = detect_local_ipv4(endpoint_host(config->collector_discovery_etcd_endpoints));
+	// agent_id 未显式配置时按本机地址派生：agent-<server_ip>（server_ip 也为空则回退 "agent"）。
+	if (config->agent_id.empty())
+		config->agent_id = config->server_ip_text.empty() ? std::string("agent") : ("agent-" + config->server_ip_text);
 	return true;
 }
 
@@ -223,7 +234,7 @@ static bool bpf_seq_set(uprobe_bpf *skel, unsigned long long value)
 static bool init_grpc_sender(AuditGrpcSender *sender, const app_config &config)
 {
 	audit_grpc_config grpc_config;
-	grpc_config.agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	grpc_config.agent_id = config.agent_id;
 	grpc_config.server_ip = config.server_ip_text;
 	grpc_config.collector_addr = config.collector_addr;
 	grpc_config.file_version = AUDIT_FILE_VERSION;
@@ -258,7 +269,7 @@ static void print_startup_status(const char *target, unsigned long long offset,
 {
 	agent_log_info("event=startup config=%s target=%s offset=0x%llx", config_file, target, offset);
 	agent_log_info("event=agent_config agent_id=%s server_ip=%s pending_ringbuf_bytes=%zu grpc_batch_bytes=%u grpc_flush_interval_ms=%u grpc_timeout_ms=%u grpc_pool_bytes=%llu grpc_upload_concurrency=%u grpc_max_retries=%u grpc_retry_initial_ms=%u grpc_retry_max_ms=%u discovery=%s",
-	       config.agent_id.empty() ? "default-agent" : config.agent_id.c_str(),
+	       config.agent_id.c_str(),
 	       config.server_ip_text.empty() ? "<empty>" : config.server_ip_text.c_str(),
 	       state.pending.capacity(),
 	       config.grpc_batch_bytes,
@@ -580,15 +591,22 @@ static unsigned long long parse_offset(const char *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3 || argc > 5) {
-		fprintf(stderr, "Usage: %s <target-path> <offset> [config-file]\n", argv[0]);
+	if (argc > 5) {
+		fprintf(stderr, "Usage: %s [config-file]\n", argv[0]);
+		fprintf(stderr, "       %s <target-path> <offset> [config-file]\n", argv[0]);
 		fprintf(stderr, "       %s <target-path> <offset> <ignored-output-file> <config-file>\n", argv[0]);
 		return 1;
 	}
 
-	const char *target = argv[1];
-	unsigned long long offset = parse_offset(argv[2]);
-	const char *config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "agent.yaml");
+	// argc>=3：CLI 显式给出 target+offset，覆盖配置文件（兼容现有部署脚本）。
+	// argc<=2：配置文件驱动，target/offset 来自 uprobe.observer_path/uprobe.offset；
+	//          argv[1]（若有）为配置文件路径。
+	const bool cli_target = argc >= 3;
+	const char *config_file;
+	if (cli_target)
+		config_file = argc >= 5 ? argv[4] : (argc >= 4 ? argv[3] : "agent.yaml");
+	else
+		config_file = argc >= 2 ? argv[1] : "agent.yaml";
 	const char *log_file = getenv("UPROBE_LOG_FILE");
 	if (!log_file || !*log_file)
 		log_file = "agent.log";
@@ -602,6 +620,18 @@ int main(int argc, char **argv)
 	std::thread *metrics_thread = nullptr;
 	load_config(config_file, &config);
 
+	// observer_path 为必填项：CLI 优先，否则取 uprobe.observer_path；两者皆空则报错退出。
+	std::string target_str = cli_target ? std::string(argv[1]) : config.observer_path;
+	if (target_str.empty()) {
+		fprintf(stderr, "observer_path is required: set uprobe.observer_path in %s or pass <target-path> on CLI\n", config_file);
+		agent_log_error("event=observer_path_missing config=%s", config_file);
+		return 1;
+	}
+	const char *target = target_str.c_str();
+	unsigned long long offset = cli_target
+		? parse_offset(argv[2])
+		: (config.offset_text.empty() ? 0ULL : parse_offset(config.offset_text.c_str()));
+
 	std::unique_ptr<writer_state> state(new (std::nothrow) writer_state(config.pending_ringbuf_bytes));
 	if (!state || !state->pending.valid()) {
 		agent_log_error("event=pending_ringbuf_alloc_failed bytes=%zu", config.pending_ringbuf_bytes);
@@ -612,7 +642,7 @@ int main(int argc, char **argv)
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 	fill_ipv4_string(state->server_ip, config.server_ip_text.c_str());
-	state->agent_id = config.agent_id.empty() ? "default-agent" : config.agent_id;
+	state->agent_id = config.agent_id;
 	state->server_ip_text = config.server_ip_text;
 	if (!init_grpc_sender(&state->grpc, config)) {
 		agent_log_error("event=grpc_sender_start_failed");

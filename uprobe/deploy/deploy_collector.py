@@ -671,10 +671,99 @@ def print_summary(results: List[NodeResult]) -> None:
         print(f"{status:6} {result.action:12} {result.name:12} {result.ip:15} {result.detail}")
 
 
+def render_collector_start_for_node(node: CollectorNode) -> str:
+    conf_rel = f"conf/collector-{node.listen_port}.yaml"
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+DEPLOY_HOME=$(cd "$(dirname "$0")/.." && pwd)
+CONF="$DEPLOY_HOME/{conf_rel}"
+export LD_LIBRARY_PATH="$DEPLOY_HOME/lib:${{LD_LIBRARY_PATH:-}}"
+cd "$DEPLOY_HOME"
+mkdir -p "$DEPLOY_HOME/logs" "$DEPLOY_HOME/run"
+LOG_FILE="$DEPLOY_HOME/logs/collector.log"
+echo "[{node.instance_id} port={node.listen_port}] event=collector_start config=$CONF log=$LOG_FILE" >> "$LOG_FILE"
+"$DEPLOY_HOME/bin/audit_collector" --config "$CONF" 2>&1 | awk -v prefix="[{node.instance_id} port={node.listen_port}] " '{{ print prefix $0; fflush(); }}' >> "$LOG_FILE"
+"""
+
+
+def render_install_note_collector(node: CollectorNode, archive_name: str) -> str:
+    dh = node.deploy_home
+    conf_rel = f"conf/collector-{node.listen_port}.yaml"
+    return "\n".join([
+        f"# eBPF OB Audit collector 手动部署  instance={node.instance_id} ip={node.ip} port={node.listen_port}",
+        "# 前置: 目标机可达 MongoDB 与 etcd (etcd 注册模式)。",
+        "",
+        "1) 上传到目标机:",
+        f"   scp {archive_name} <user>@{node.ip}:/tmp/",
+        "2) 解包到部署目录:",
+        f"   mkdir -p {dh} && tar -xzf /tmp/{archive_name} -C {dh}",
+        f"3) 核对 {conf_rel}: collector.listen_addr / mongodb.uri /",
+        "   collector.registry.etcd_endpoints / service_name / advertise_addr (agent 可达地址)。",
+        "4) 启动:",
+        f"   cd {dh} && nohup ./run/start_collector.sh >/dev/null 2>&1 &",
+        f"5) 日志: tail -f {dh}/logs/collector.log",
+        f"6) 停止: pkill -f 'audit_collector --config {conf_rel}'",
+        "",
+    ])
+
+
+def build_lib_cache(binary: Path, work_dir: Path) -> Path:
+    lib_cache = work_dir / "_libcache"
+    if lib_cache.exists():
+        shutil.rmtree(lib_cache)
+    lib_cache.mkdir(parents=True)
+    collect_libraries(binary, lib_cache)
+    return lib_cache
+
+
+def package_node(node: CollectorNode, binary: Path, lib_cache: Path, work_dir: Path) -> NodeResult:
+    root = work_dir / f"collector-{node.name}-{node.listen_port}"
+    if root.exists():
+        shutil.rmtree(root)
+    for subdir in ("bin", "lib", "run", "conf", "logs"):
+        (root / subdir).mkdir(parents=True)
+    shutil.copy2(binary, root / "bin" / "audit_collector")
+    schema_file = UPROBE_DIR / "audit_schema.json"
+    if not schema_file.exists():
+        raise DeployError(f"schema file not found: {schema_file}")
+    shutil.copy2(schema_file, root / "audit_schema.json")
+    for lib in lib_cache.iterdir():
+        shutil.copy2(lib, root / "lib" / lib.name)
+    write_text(root / "run" / "start_collector.sh", render_collector_start_for_node(node), 0o755)
+    write_text(root / "conf" / f"collector-{node.listen_port}.yaml", render_collector_yaml(node))
+    archive = work_dir / f"uprobe-collector-{node.name}-{node.listen_port}.tar.gz"
+    write_text(root / "INSTALL.txt", render_install_note_collector(node, archive.name))
+    if archive.exists():
+        archive.unlink()
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(root, arcname=".")
+    return NodeResult(node.name, node.ip, "package", True, str(archive))
+
+
+def package_all(config: DeployConfig, build_dir: Path, skip_build: bool, continue_on_failure: bool) -> List[NodeResult]:
+    validate_collector_runtime(config)
+    build_collector(skip_build)
+    binary = verify_collector_binary()
+    build_dir.mkdir(parents=True, exist_ok=True)
+    lib_cache = build_lib_cache(binary, build_dir)
+    results: List[NodeResult] = []
+    for node in config.collectors:
+        try:
+            result = package_node(node, binary, lib_cache, build_dir)
+            print(f"PACKAGE OK {node.name} {node.ip}: {result.detail}")
+            results.append(result)
+        except DeployError as exc:
+            print(f"PACKAGE FAIL {node.name} {node.ip}: {exc}", file=sys.stderr)
+            results.append(NodeResult(node.name, node.ip, "package", False, str(exc)))
+            if not continue_on_failure:
+                break
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build, package, deploy, start, stop, clean, check, and clear audit collector logs over SSH.")
     parser.add_argument("-c", "--config", required=True, help="collector deploy yaml path")
-    parser.add_argument("--action", choices=["deploy", "deploy-start", "start", "stop", "logs", "clean", "restart", "clear-logs"], default="deploy", help="remote action")
+    parser.add_argument("--action", choices=["deploy", "deploy-start", "start", "stop", "logs", "clean", "restart", "clear-logs", "package"], default="deploy", help="remote action; 'package' builds self-contained per-instance tarballs locally (no SSH)")
     parser.add_argument("--skip-build", action="store_true", help="skip local make build")
     parser.add_argument("--dry-run", action="store_true", help="print commands without modifying remote machines")
     parser.add_argument("--continue-on-failure", action="store_true", help="continue remaining nodes after a node fails")
@@ -723,6 +812,10 @@ def main() -> int:
     results: List[NodeResult] = []
     try:
         config = parse_config(config_path)
+        if args.action == "package":
+            results = package_all(config, build_dir, args.skip_build, args.continue_on_failure)
+            print_summary(results)
+            return 0 if results and all(result.ok for result in results) else 1
         if args.action in ("start", "deploy-start"):
             validate_collector_runtime(config)
         if config.password:

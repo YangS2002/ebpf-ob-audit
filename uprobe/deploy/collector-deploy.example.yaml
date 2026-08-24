@@ -62,10 +62,10 @@ collector:
       ip: 7.27.43.145
       listen_port: 50051
       instance_id: collector-50051
-    - name: collector-50052
-      ip: 7.27.43.145
-      listen_port: 50052
-      instance_id: collector-50052
+    # - name: collector-50052
+    #   ip: 7.27.43.145
+    #   listen_port: 50052
+    #   instance_id: collector-50052
     # - name: collector-50053
     #   ip: 7.27.43.139
     #   listen_port: 50053

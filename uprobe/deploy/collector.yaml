@@ -1,0 +1,31 @@
+# collector 运行时默认配置（所有 collector 节点通用，无需逐机修改）。
+# 运行方式：./start_collector.sh
+#
+# advertise_addr 留空 → 启动时自动探测本机 IPv4 并拼接监听端口；
+# instance_id 留空 → 自动派生 collector-<advertise_addr>。
+# 只有 etcd 地址与 mongodb.uri 需按环境确认。
+
+collector:
+  listen_addr: 0.0.0.0:50051
+  registry:
+    # 是否注册到 etcd 供 agent 发现（默认 true，可省略）。
+    enabled: true
+    # etcd 地址（必填）。
+    etcd_endpoints: http://7.27.43.145:2379
+    service_name: audit-collector
+    lease_ttl_sec: 10
+    keepalive_interval_sec: 3
+    # 本机对外地址，留空自动探测 <本机IPv4>:<listen_port>。
+    advertise_addr: ""
+
+storage:
+  # 落库后端；要写 MongoDB 必须显式设为 mongodb（默认 local 仅落本地文件）。
+  type: mongodb
+
+mongodb:
+  # MongoDB 连接串（必填，含凭据无法给默认值）。
+  uri: mongodb://audit_collector:1@7.27.43.145:27017/ob_audit?authSource=ob_audit
+  database: ob_audit
+  collection: audit_events
+  # 字段编码 schema 文件，随包位于 deploy_home 根目录。
+  schema_file_path: audit_schema.json
