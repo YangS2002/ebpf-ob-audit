@@ -1,0 +1,660 @@
+
+SQL #1 CREATE DATABASE IF NOT EXISTS eb...
+  event_seq=1196927182 trace_id=YB42071BDE03-00065985E74C75FB-0-0
+  PASS
+  official execute_time: 4820
+  collector execute_time: 4820
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+
+SQL #2 DROP TABLE IF EXISTS dist_order_...
+  event_seq=1196927184 trace_id=YB42071BDE03-00065985E74C75FE-0-0
+  PASS
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official affected_rows: 0
+  collector affected_rows: 0
+  official trace_id: YB42071BDE03-00065985E74C75FE-0-0
+  collector trace_id: YB42071BDE03-00065985E74C75FE-0-0
+
+SQL #3 DROP TABLE IF EXISTS dist_order
+  event_seq=1196927185 trace_id=YB42071BDE03-00065985E74C75FF-0-0
+  PASS
+  official user_id: 200001
+  collector user_id: 200001
+  official tenant_name: sys
+  collector tenant_name: sys
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+
+SQL #4 DROP TABLE IF EXISTS dist_custom...
+  event_seq=1196927188 trace_id=YB42071BDE03-00065985E74C7600-0-0
+  PASS
+  official tenant_id: 1
+  collector tenant_id: 1
+  official plan_type: 0
+  collector plan_type: 0
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #5 DROP TABLE IF EXISTS dist_range_...
+  event_seq=1196927189 trace_id=YB42071BDE03-00065985E74C7603-0-0
+  PASS
+  official trace_id: YB42071BDE03-00065985E74C7603-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7603-0-0
+  official sql_id: AF3697FC63729AA8F90C8D9BD1D9A2CB
+  collector sql_id: AF3697FC63729AA8F90C8D9BD1D9A2CB
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+
+SQL #6 DROP TABLE IF EXISTS dist_tx_cas...
+  event_seq=1196927190 trace_id=YB42071BDE03-00065985E74C7604-0-0
+  PASS
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+  official trace_id: YB42071BDE03-00065985E74C7604-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7604-0-0
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+
+SQL #7 DROP TABLE IF EXISTS dist_unique...
+  event_seq=1196927193 trace_id=YB42071BDE03-00065985E74C7605-0-0
+  PASS
+  official ret_code: 0
+  collector ret_code: 0
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #8 CREATE TABLE dist_customer ( cus...
+  event_seq=1196927194 trace_id=YB42071BDE03-00065985E74C7608-0-0
+  PASS
+  official return_rows: 0
+  collector return_rows: 0
+  official db_id: 500038
+  collector db_id: 500038
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+
+SQL #9 CREATE TABLE dist_order ( order_...
+  event_seq=1196927195 trace_id=YB42071BDE03-00065985E74C7609-0-0
+  PASS
+  official plan_type: 0
+  collector plan_type: 0
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+  official user_id: 200001
+  collector user_id: 200001
+
+SQL #10 CREATE TABLE dist_order_item (it...
+  event_seq=1196927196 trace_id=YB42071BDE03-00065985E74C760A-0-0
+  PASS
+  official db_id: 500038
+  collector db_id: 500038
+  official affected_rows: 0
+  collector affected_rows: 0
+  official sid: 3221614899
+  collector sid: 3221614899
+
+SQL #11 CREATE TABLE dist_range_case (id...
+  event_seq=1196927197 trace_id=YB42071BDE03-00065985E74C760B-0-0
+  PASS
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official trace_id: YB42071BDE03-00065985E74C760B-0-0
+  collector trace_id: YB42071BDE03-00065985E74C760B-0-0
+
+SQL #12 CREATE TABLE dist_tx_case ( id B...
+  event_seq=1196927198 trace_id=YB42071BDE03-00065985E74C760C-0-0
+  PASS
+  official ret_code: 0
+  collector ret_code: 0
+  official db_id: 500038
+  collector db_id: 500038
+  official return_rows: 0
+  collector return_rows: 0
+
+SQL #13 CREATE TABLE dist_unique_case ( ...
+  event_seq=1196927199 trace_id=YB42071BDE03-00065985E74C760D-0-0
+  PASS
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+  official user_id: 200001
+  collector user_id: 200001
+  official ret_code: 0
+  collector ret_code: 0
+
+SQL #14 INSERT INTO dist_customer (custo...
+  event_seq=1196927200 trace_id=YB42071BDE03-00065985E74C760E-0-0
+  PASS
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+  official sid: 3221614899
+  collector sid: 3221614899
+  official execute_time: 1389
+  collector execute_time: 1389
+
+SQL #15 INSERT INTO dist_order (order_id...
+  event_seq=1196927201 trace_id=YB42071BDE03-00065985E74C760F-0-0
+  PASS
+  official sql_id: E739D8248480403177E7AA0F0BD3BA0A
+  collector sql_id: E739D8248480403177E7AA0F0BD3BA0A
+  official trans_status: Enable committable transaction
+  collector trans_status: Enable committable transaction
+  official db_id: 500038
+  collector db_id: 500038
+
+SQL #16 INSERT INTO dist_order_item (ite...
+  event_seq=1196927202 trace_id=YB42071BDE03-00065985E74C7610-0-0
+  PASS
+  official sid: 3221614899
+  collector sid: 3221614899
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+
+SQL #17 INSERT INTO dist_range_case (id,...
+  event_seq=1196927205 trace_id=YB42071BDE03-00065985E74C7611-0-0
+  PASS
+  official trace_id: YB42071BDE03-00065985E74C7611-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7611-0-0
+  official ret_code: 0
+  collector ret_code: 0
+  official params_value: 
+  collector params_value: 
+
+SQL #18 INSERT INTO dist_tx_case (id, k,...
+  event_seq=1196927206 trace_id=YB42071BDE03-00065985E74C7614-0-0
+  PASS
+  official tenant_id: 1
+  collector tenant_id: 1
+  official user_id: 200001
+  collector user_id: 200001
+  official sql_id: BEA18D3F4A7C7DE70A69735E4BC1B6E1
+  collector sql_id: BEA18D3F4A7C7DE70A69735E4BC1B6E1
+
+SQL #19 INSERT INTO dist_unique_case (id...
+  event_seq=1196927207 trace_id=YB42071BDE03-00065985E74C7615-0-0
+  PASS
+  official tenant_name: sys
+  collector tenant_name: sys
+  official return_rows: 0
+  collector return_rows: 0
+  official trans_status: Enable committable transaction
+  collector trans_status: Enable committable transaction
+
+SQL #20 SELECT customer_id, name, city F...
+  event_seq=1196927208 trace_id=YB42071BDE03-00065985E74C7616-0-0
+  PASS
+  official execute_time: 81
+  collector execute_time: 81
+  official affected_rows: 0
+  collector affected_rows: 0
+  official db_id: 500038
+  collector db_id: 500038
+
+SQL #21 SELECT customer_id, name, city F...
+  event_seq=1196927209 trace_id=YB42071BDE03-00065985E74C7617-0-0
+  PASS
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+  official user_name: root
+  collector user_name: root
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+
+SQL #22 SELECT customer_id, name FROM di...
+  event_seq=1196927210 trace_id=YB42071BDE03-00065985E74C7618-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official user_name: root
+  collector user_name: root
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #23 SELECT id, k, c FROM dist_range_...
+  event_seq=1196927211 trace_id=YB42071BDE03-00065985E74C7619-0-0
+  PASS
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official tenant_name: sys
+  collector tenant_name: sys
+
+SQL #24 SELECT COUNT(*) FROM dist_custom...
+  event_seq=1196927212 trace_id=YB42071BDE03-00065985E74C761A-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official user_name: root
+  collector user_name: root
+  official return_rows: 1
+  collector return_rows: 1
+
+SQL #25 SELECT tenant_key, COUNT(*), SUM...
+  event_seq=1196927213 trace_id=YB42071BDE03-00065985E74C761B-0-0
+  PASS
+  official plan_type: 3
+  collector plan_type: 3
+  official db_id: 500038
+  collector db_id: 500038
+  official execute_time: 4719
+  collector execute_time: 4719
+
+SQL #26 SELECT order_id, amount FROM dis...
+  event_seq=1196927214 trace_id=YB42071BDE03-00065985E74C761C-0-0
+  PASS
+  official return_rows: 3
+  collector return_rows: 3
+  official tenant_name: sys
+  collector tenant_name: sys
+  official tenant_id: 1
+  collector tenant_id: 1
+
+SQL #27 SELECT DISTINCT tenant_key FROM ...
+  event_seq=1196927215 trace_id=YB42071BDE03-00065985E74C761D-0-0
+  PASS
+  official sid: 3221614899
+  collector sid: 3221614899
+  official sql_id: A6DF732E0A6E16E3035A35108AA79AD2
+  collector sql_id: A6DF732E0A6E16E3035A35108AA79AD2
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+
+SQL #28 SELECT o.order_id, c.name, o.amo...
+  event_seq=1196927216 trace_id=YB42071BDE03-00065985E74C761E-0-0
+  PASS
+  official db_id: 500038
+  collector db_id: 500038
+  official execute_time: 5354
+  collector execute_time: 5354
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+
+SQL #29 SELECT o.order_id, c.name, i.sku...
+  event_seq=1196927217 trace_id=YB42071BDE03-00065985E74C761F-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official affected_rows: 0
+  collector affected_rows: 0
+
+SQL #30 SELECT customer_id, name FROM di...
+  event_seq=1196927218 trace_id=YB42071BDE03-00065985E74C7620-0-0
+  PASS
+  official stmt_type: SELECT
+  collector stmt_type: SELECT
+  official db_id: 500038
+  collector db_id: 500038
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #31 SELECT order_id, amount FROM dis...
+  event_seq=1196927219 trace_id=YB42071BDE03-00065985E74C7621-0-0
+  PASS
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+  official tenant_name: sys
+  collector tenant_name: sys
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #32 SELECT customer_id AS id FROM di...
+  event_seq=1196927220 trace_id=YB42071BDE03-00065985E74C7622-0-0
+  PASS
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official ret_code: 0
+  collector ret_code: 0
+
+SQL #33 UPDATE dist_customer SET status ...
+  event_seq=1196927221 trace_id=YB42071BDE03-00065985E74C7623-0-0
+  PASS
+  official ret_code: 0
+  collector ret_code: 0
+  official sql_id: CF79947F591F5DC7B43A6933547CB338
+  collector sql_id: CF79947F591F5DC7B43A6933547CB338
+  official execute_time: 295
+  collector execute_time: 295
+
+SQL #34 UPDATE dist_order SET order_stat...
+  event_seq=1196927222 trace_id=YB42071BDE03-00065985E74C7624-0-0
+  PASS
+  official execute_time: 2939
+  collector execute_time: 2939
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official trans_status: Enable committable transaction
+  collector trans_status: Enable committable transaction
+
+SQL #35 DELETE FROM dist_order_item WHER...
+  event_seq=1196927223 trace_id=YB42071BDE03-00065985E74C7625-0-0
+  PASS
+  official params_value: 
+  collector params_value: 
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official elapsed_time: 3172
+  collector elapsed_time: 3172
+
+SQL #36 DELETE FROM dist_order_item WHER...
+  event_seq=1196927224 trace_id=YB42071BDE03-00065985E74C7626-0-0
+  PASS
+  official tenant_name: sys
+  collector tenant_name: sys
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official db_id: 500038
+  collector db_id: 500038
+
+SQL #37 INSERT INTO dist_range_case (id,...
+  event_seq=1196927225 trace_id=YB42071BDE03-00065985E74C7627-0-0
+  PASS
+  official stmt_type: INSERT
+  collector stmt_type: INSERT
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+  official user_id: 200001
+  collector user_id: 200001
+
+SQL #38 INSERT INTO dist_unique_case (id...
+  event_seq=1196927226 trace_id=YB42071BDE03-00065985E74C7628-0-0
+  PASS
+  official elapsed_time: 2961
+  collector elapsed_time: 2961
+  official sid: 3221614899
+  collector sid: 3221614899
+  official user_name: root
+  collector user_name: root
+
+SQL #39 REPLACE INTO dist_unique_case (i...
+  event_seq=1196927227 trace_id=YB42071BDE03-00065985E74C7629-0-0
+  PASS
+  official user_id: 200001
+  collector user_id: 200001
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+  official execute_time: 774
+  collector execute_time: 774
+
+SQL #40 BEGIN
+  event_seq=1196927228 trace_id=YB42071BDE03-00065985E74C762A-0-0
+  PASS
+  official execute_time: 25
+  collector execute_time: 25
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+  official tenant_id: 1
+  collector tenant_id: 1
+
+SQL #41 UPDATE dist_tx_case SET k = k + ...
+  event_seq=1196927229 trace_id=YB42071BDE03-00065985E74C762B-0-0
+  PASS
+  official stmt_type: UPDATE
+  collector stmt_type: UPDATE
+  official trace_id: YB42071BDE03-00065985E74C762B-0-0
+  collector trace_id: YB42071BDE03-00065985E74C762B-0-0
+  official sql_id: B2954E212F4EB2533F68372D3DE14436
+  collector sql_id: B2954E212F4EB2533F68372D3DE14436
+
+SQL #42 UPDATE dist_tx_case SET k = k + ...
+  event_seq=1196927230 trace_id=YB42071BDE03-00065985E74C762C-0-0
+  PASS
+  official trace_id: YB42071BDE03-00065985E74C762C-0-0
+  collector trace_id: YB42071BDE03-00065985E74C762C-0-0
+  official user_id: 200001
+  collector user_id: 200001
+  official db_id: 500038
+  collector db_id: 500038
+
+SQL #43 INSERT INTO dist_tx_case (id, k,...
+  event_seq=1196927231 trace_id=YB42071BDE03-00065985E74C762D-0-0
+  PASS
+  official user_id: 200001
+  collector user_id: 200001
+  official affected_rows: 1
+  collector affected_rows: 1
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+
+SQL #44 COMMIT
+  event_seq=1196927232 trace_id=YB42071BDE03-00065985E74C762E-0-0
+  PASS
+  official db_id: 500038
+  collector db_id: 500038
+  official user_id: 200001
+  collector user_id: 200001
+  official elapsed_time: 182
+  collector elapsed_time: 182
+
+SQL #45 BEGIN
+  event_seq=1196927233 trace_id=YB42071BDE03-00065985E74C762F-0-0
+  PASS
+  official execute_time: 18
+  collector execute_time: 18
+  official affected_rows: 0
+  collector affected_rows: 0
+  official sid: 3221614899
+  collector sid: 3221614899
+
+SQL #46 UPDATE dist_tx_case SET c = 'tx_...
+  event_seq=1196927234 trace_id=YB42071BDE03-00065985E74C7630-0-0
+  PASS
+  official tenant_name: sys
+  collector tenant_name: sys
+  official elapsed_time: 1993
+  collector elapsed_time: 1993
+  official affected_rows: 1
+  collector affected_rows: 1
+
+SQL #47 ROLLBACK
+  event_seq=1196927235 trace_id=YB42071BDE03-00065985E74C7631-0-0
+  PASS
+  official db_id: 500038
+  collector db_id: 500038
+  official sql_id: 2805522DD41E1B57DA11967AC5FA258C
+  collector sql_id: 2805522DD41E1B57DA11967AC5FA258C
+  official stmt_type: END_TRANS
+  collector stmt_type: END_TRANS
+
+SQL #48 PREPARE ps_dist_point_select FRO...
+  event_seq=1196927236 trace_id=YB42071BDE03-00065985E74C7632-0-0
+  PASS
+  official user_name: root
+  collector user_name: root
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+
+SQL #49 SET @dist_customer_id = 1001
+  event_seq=1196927237 trace_id=YB42071BDE03-00065985E74C7633-0-0
+  PASS
+  official plan_type: 0
+  collector plan_type: 0
+  official execute_time: 65
+  collector execute_time: 65
+  official trace_id: YB42071BDE03-00065985E74C7633-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7633-0-0
+
+SQL #50 SELECT customer_id, name FROM di...
+  event_seq=1196927238 trace_id=YB42071BDE03-00065985E74C7634-0-0
+  PASS
+  official execute_time: 73
+  collector execute_time: 73
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official affected_rows: 0
+  collector affected_rows: 0
+
+SQL #51 DEALLOCATE PREPARE ps_dist_point...
+  event_seq=1196927239 trace_id=YB42071BDE03-00065985E74C7635-0-0
+  PASS
+  official elapsed_time: 140
+  collector elapsed_time: 140
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+  official params_value: 
+  collector params_value: 
+
+SQL #52 PREPARE ps_dist_multi_partition_...
+  event_seq=1196927240 trace_id=YB42071BDE03-00065985E74C7636-0-0
+  PASS
+  official tenant_id: 1
+  collector tenant_id: 1
+  official stmt_type: SELECT
+  collector stmt_type: SELECT
+  official elapsed_time: 604
+  collector elapsed_time: 604
+
+SQL #53 SET @dist_begin_id = 1, @dist_en...
+  event_seq=1196927241 trace_id=YB42071BDE03-00065985E74C7637-0-0
+  PASS
+  official plan_type: 0
+  collector plan_type: 0
+  official execute_time: 65
+  collector execute_time: 65
+  official elapsed_time: 134
+  collector elapsed_time: 134
+
+SQL #54 SELECT id, k, c FROM dist_range_...
+  event_seq=1196927242 trace_id=YB42071BDE03-00065985E74C7638-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official trace_id: YB42071BDE03-00065985E74C7638-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7638-0-0
+  official sid: 3221614899
+  collector sid: 3221614899
+
+SQL #55 DEALLOCATE PREPARE ps_dist_multi...
+  event_seq=1196927243 trace_id=YB42071BDE03-00065985E74C7639-0-0
+  PASS
+  official params_value: 
+  collector params_value: 
+  official trace_id: YB42071BDE03-00065985E74C7639-0-0
+  collector trace_id: YB42071BDE03-00065985E74C7639-0-0
+  official tenant_id: 1
+  collector tenant_id: 1
+
+SQL #56 PREPARE ps_dist_update FROM 'UPD...
+  event_seq=1196927244 trace_id=YB42071BDE03-00065985E74C763A-0-0
+  PASS
+  official elapsed_time: 722
+  collector elapsed_time: 722
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official db_id: 500038
+  collector db_id: 500038
+
+SQL #57 SET @dist_delta = 1, @dist_tenan...
+  event_seq=1196927245 trace_id=YB42071BDE03-00065985E74C763B-0-0
+  PASS
+  official params_value: 
+  collector params_value: 
+  official plan_type: 0
+  collector plan_type: 0
+  official db_name: ebpf_audit_dist_test
+  collector db_name: ebpf_audit_dist_test
+
+SQL #58 UPDATE dist_order SET order_stat...
+  event_seq=1196927246 trace_id=YB42071BDE03-00065985E74C763C-0-0
+  PASS
+  official tenant_id: 1
+  collector tenant_id: 1
+  official user_client_ip: 7.27.43.145
+  collector user_client_ip: 7.27.43.145
+  official affected_rows: 3
+  collector affected_rows: 3
+
+SQL #59 DEALLOCATE PREPARE ps_dist_updat...
+  event_seq=1196927247 trace_id=YB42071BDE03-00065985E74C763D-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official plan_type: 0
+  collector plan_type: 0
+  official user_name: root
+  collector user_name: root
+
+SQL #60 PREPARE ps_dist_join FROM 'SELEC...
+  event_seq=1196927248 trace_id=YB42071BDE03-00065985E74C763E-0-0
+  PASS
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+  official user_name: root
+  collector user_name: root
+  official tenant_name: sys
+  collector tenant_name: sys
+
+SQL #61 SET @dist_amount = 1000
+  event_seq=1196927249 trace_id=YB42071BDE03-00065985E74C763F-0-0
+  PASS
+  official sql_id: 7AAF803B5DCF1BD5A512BD9633EA72D9
+  collector sql_id: 7AAF803B5DCF1BD5A512BD9633EA72D9
+  official sid: 3221614899
+  collector sid: 3221614899
+  official stmt_type: VARIABLE_SET
+  collector stmt_type: VARIABLE_SET
+
+SQL #62 SELECT o.order_id, c.name FROM d...
+  event_seq=1196927250 trace_id=YB42071BDE03-00065985E74C7640-0-0
+  PASS
+  official return_rows: 4
+  collector return_rows: 4
+  official affected_rows: 0
+  collector affected_rows: 0
+  official sid: 3221614899
+  collector sid: 3221614899
+
+SQL #63 DEALLOCATE PREPARE ps_dist_join
+  event_seq=1196927251 trace_id=YB42071BDE03-00065985E74C7641-0-0
+  PASS
+  official trans_status: Transaction not opened
+  collector trans_status: Transaction not opened
+  official user_id: 200001
+  collector user_id: 200001
+  official ret_code: 0
+  collector ret_code: 0
+
+SQL #64 SELECT customer_id, status FROM ...
+  event_seq=1196927252 trace_id=YB42071BDE03-00065985E74C7642-0-0
+  PASS
+  official sql_id: 4B1ECEAF2FE8C7790EA2DF172F70F103
+  collector sql_id: 4B1ECEAF2FE8C7790EA2DF172F70F103
+  official effective_tenant_id: 1
+  collector effective_tenant_id: 1
+  official client_ip: 7.27.43.145
+  collector client_ip: 7.27.43.145
+
+SQL #65 SELECT order_id, order_status FR...
+  event_seq=1196927253 trace_id=YB42071BDE03-00065985E74C7643-0-0
+  PASS
+  official elapsed_time: 4571
+  collector elapsed_time: 4571
+  official db_id: 500038
+  collector db_id: 500038
+  official svr_ip: 7.27.222.3
+  collector svr_ip: 7.27.222.3
+
+SQL #66 SELECT id, k, c FROM dist_tx_cas...
+  event_seq=1196927254 trace_id=YB42071BDE03-00065985E74C7644-0-0
+  PASS
+  official stmt_type: SELECT
+  collector stmt_type: SELECT
+  official elapsed_time: 23351
+  collector elapsed_time: 23351
+  official execute_time: 3468
+  collector execute_time: 3468

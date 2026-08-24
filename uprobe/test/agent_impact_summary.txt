@@ -1,0 +1,48 @@
+==========================================================================================
+eBPF uprobe Agent 影响评估  (rw sysbench 512t/1800s/30x1M  -  middle-4 runs/group (test1+test2)  -  host=observer-row mean over 3 DB nodes)
+样本: 每组按 QPS 去最高/最低, 保留中间求均值
+PURE 组 : rw-512-test1/pure/round2-try02, rw-512-test2/pure/round1-try01, rw-512-test2/pure/round2-try02, rw-512-test2/pure/round3-try03
+AGENT组 : rw-512-test2/agent/round2-try03, rw-512-test2/agent/round3-try04, rw-512-test1/agent/round3-try04, rw-512-test2/agent/round1-try01
+==========================================================================================
+指标                                    PURE        AGENT       Δ(a-p)         Δ%
+------------------------------------------------------------------------------------------
+【业务吞吐/延迟 (sysbench)】
+QPS                                 54121.57     51645.98     -2475.59     -4.57%   queries/s
+TPS                                  2706.08      2582.30      -123.78     -4.57%   txn/s
+延迟 avg                               189.19       198.20        +9.02     +4.77%   ms
+延迟 99th                              480.31       484.56        +4.25     +0.88%   ms
+延迟 max(噪声大)                       3017.20      4260.53     +1243.33     +41.21%  ms
+
+【DB主机 CPU (3台均值, %)】
+cpu_user                               53.73        52.40        -1.34     -2.49%   %
+cpu_system(sys)                        16.92        17.61        +0.69     +4.06%   %  <== eBPF开销主要落点
+cpu_iowait                              1.57         1.64        +0.06     +4.09%   %
+cpu_idle                               13.95        14.77        +0.82     +5.90%   %
+
+【DB主机 磁盘IO (3台均值)】
+disk_read                              26.50        28.99        +2.49     +9.39%   MB/s
+disk_write                             61.01        59.97        -1.05     -1.72%   MB/s
+disk_read_iops                        387.57       443.64       +56.07    +14.47%   IOPS
+disk_write_iops                      4241.61      4178.72       -62.88     -1.48%   IOPS
+disk_util_sum                         144.41       143.69        -0.72     -0.50%   %
+
+【DB主机 网络 (3台均值)】
+net_rx                                 16.21        15.46        -0.75     -4.62%   MB/s
+net_tx                                 49.52        82.34       +32.82    +66.28%   MB/s
+
+【OceanBase observer 进程】
+observer CPU                          836.93       780.67       -56.26     -6.72%   % (多核累加)
+observer sysCPU                       296.83       300.88        +4.06     +1.37%   %
+observer RSS                         9090.75      9047.29       -43.45     -0.48%   MB
+
+【Agent(uprobe) 进程自身开销】(仅AGENT)
+agent CPU                                  -         8.48
+agent userCPU                              -         6.05
+agent sysCPU                               -         4.20
+agent RSS                                  -       220.01   MB
+
+【派生: CPU 成本效率】
+  PURE : 主机忙碌=86.05%  每1kQPS消耗主机CPU=1.5899%/kQPS
+  AGENT: 主机忙碌=85.23%  每1kQPS消耗主机CPU=1.6502%/kQPS
+  单位QPS的CPU成本变化: +3.79%
+==========================================================================================

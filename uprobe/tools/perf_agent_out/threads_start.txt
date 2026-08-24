@@ -1,0 +1,31 @@
+# thread snapshot @ start
+    TID %CPU COMMAND
+2255139  1.8 uprobe
+2255145  0.0 default-executo
+2255146  0.0 resolver-execut
+2255147  0.0 grpc_global_tim
+2255148  0.0 event_engine
+2255149  0.0 event_engine
+2255150  0.0 event_engine
+2255151  0.0 event_engine
+2255152  0.0 event_engine
+2255153  0.0 event_engine
+2255154  0.0 event_engine
+2255155  0.0 event_engine
+2255156  0.0 event_engine
+2255157  0.0 event_engine
+2255158  0.0 event_engine
+2255159  0.0 event_engine
+2255160  0.0 event_engine
+2255161  0.0 event_engine
+2255162  0.0 event_engine
+2255163  0.0 event_engine
+2255164  0.0 timer_manager
+2255166  0.0 uprobe
+2255167  0.1 uprobe
+2255168  0.1 uprobe
+2255169  0.1 uprobe
+2255170  0.1 uprobe
+2255171  0.0 uprobe
+2255172  0.0 grpc_global_tim
+2255174  0.0 uprobe

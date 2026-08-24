@@ -15,7 +15,7 @@ uprobe/test/*.adt
 *.dat
 *.tsv
 *.adt
-*.txt
+
 uprobe/.deploy_output
 uprobe/.deploy_output_collector
 uprobe/.deploy_bundle

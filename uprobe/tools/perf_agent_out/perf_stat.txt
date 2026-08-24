@@ -1,0 +1,14 @@
+
+ Performance counter stats for process id '2255139':
+
+           1315.82 msec task-clock                       #    0.044 CPUs utilized          
+             30458      context-switches                 #   23.148 K/sec                  
+               159      cpu-migrations                   #  120.837 /sec                   
+                 0      page-faults                      #    0.000 /sec                   
+   <not supported>      cycles                                                      
+   <not supported>      instructions                                                
+   <not supported>      branches                                                    
+   <not supported>      branch-misses                                               
+
+      30.003852612 seconds time elapsed
+
